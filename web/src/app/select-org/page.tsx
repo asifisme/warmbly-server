@@ -17,19 +17,22 @@
 
 import React from "react";
 import { Navigate, useNavigate } from "react-router-dom";
-import { LogOutIcon, Loader2Icon, MailIcon, PlusIcon, UsersIcon } from "lucide-react";
+import { LogOutIcon, Loader2Icon, MailIcon, PlusIcon, UsersIcon, Trash2Icon } from "lucide-react";
 import toast from "react-hot-toast";
 import getToken from "@/lib/helper/getToken";
 import useOrganizations from "@/lib/api/hooks/app/organizations/useOrganizations";
 import useMyInvitations from "@/lib/api/hooks/app/organizations/useMyInvitations";
 import useAcceptInvitation from "@/lib/api/hooks/app/organizations/useAcceptInvitation";
 import useSwitchOrganization from "@/lib/api/hooks/app/organizations/useSwitchOrganization";
+import useScheduleOrganizationDeletion from "@/lib/api/hooks/app/dangerzone/useScheduleOrganizationDeletion";
 import useLogout from "@/lib/api/hooks/auth/useLogout";
 import useUser from "@/lib/api/hooks/auth/useUser";
 import useAuthConfig from "@/lib/api/hooks/auth/useAuthConfig";
+import useBrand from "@/hooks/useBrand";
 import { useAppStore } from "@/stores";
 import { Logo } from "@/components/svg";
 import { NewWorkspaceDialog } from "@/components/app/organizations/NewWorkspaceDialog";
+import ScheduleDeletionModal from "@/app/app/settings/danger/ScheduleDeletionModal";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
 
@@ -67,7 +70,9 @@ export default function SelectOrgPage() {
 
 function SelectOrgPageInner() {
     const navigate = useNavigate();
+    const brand = useBrand();
     const [createOpen, setCreateOpen] = React.useState(false);
+    const [deleteTarget, setDeleteTarget] = React.useState<{ id: string; name: string } | null>(null);
 
     const orgs = useOrganizations();
     const invites = useMyInvitations();
@@ -86,6 +91,7 @@ function SelectOrgPageInner() {
 
     const accept = useAcceptInvitation();
     const switchOrg = useSwitchOrganization();
+    const scheduleDeletion = useScheduleOrganizationDeletion();
     const logout = useLogout();
 
     async function onLogout() {
@@ -143,7 +149,7 @@ function SelectOrgPageInner() {
                         style={{ fontFamily: "var(--font-display)" }}
                         className="font-bold text-[13px] tracking-tight text-slate-900 shrink-0"
                     >
-                        Warmbly
+                        {brand.name}
                     </span>
                     <div className="h-4 w-px bg-slate-200 shrink-0" />
                     <span className="text-[10px] uppercase tracking-[0.14em] text-slate-400 font-medium min-w-0 truncate">
@@ -212,9 +218,7 @@ function SelectOrgPageInner() {
                                 </div>
                             )}
 
-                            {/* Existing memberships — informative rows. Role +
-                                plan + how long ago you joined replace the
-                                opaque "id slice + Open →" filler. */}
+                            {/* Existing memberships */}
                             {orgList.length > 0 && (
                                 <div className="mb-5">
                                     <div className="text-[10px] uppercase tracking-[0.14em] text-slate-400 font-medium mb-1.5 flex items-center gap-1.5">
@@ -226,63 +230,80 @@ function SelectOrgPageInner() {
                                         {orgList.map((o) => {
                                             const isCurrent = currentOrg?.id === o.id;
                                             return (
-                                                <button
+                                                <div
                                                     key={o.id}
-                                                    type="button"
-                                                    onClick={() => onPickExisting(o.id)}
-                                                    disabled={switchOrg.isPending}
-                                                    className={`w-full px-3 py-2.5 flex items-center gap-2.5 transition-colors text-left disabled:opacity-50 ${
+                                                    className={`group w-full px-3 py-2.5 flex items-center gap-2.5 transition-colors ${
                                                         isCurrent
                                                             ? "bg-sky-50/60 hover:bg-sky-50"
                                                             : "hover:bg-slate-50/80"
                                                     }`}
                                                 >
-                                                    <div className="size-7 rounded bg-slate-900 text-white flex items-center justify-center text-[10px] font-semibold shrink-0">
-                                                        {initials(o.name)}
-                                                    </div>
-                                                    <div className="min-w-0 flex-1">
-                                                        <div className="flex items-center gap-1.5">
-                                                            <span className="text-[12.5px] font-medium text-slate-900 truncate">
-                                                                {o.name}
-                                                            </span>
-                                                            {isCurrent && (
-                                                                <span className="text-[9.5px] uppercase tracking-[0.1em] text-sky-700 bg-sky-100 px-1 rounded-sm font-semibold">
-                                                                    Current
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => onPickExisting(o.id)}
+                                                        disabled={switchOrg.isPending}
+                                                        className="flex-1 min-w-0 flex items-center gap-2.5 text-left disabled:opacity-50"
+                                                    >
+                                                        <div className="size-7 rounded bg-slate-900 text-white flex items-center justify-center text-[10px] font-semibold shrink-0">
+                                                            {initials(o.name)}
+                                                        </div>
+                                                        <div className="min-w-0 flex-1">
+                                                            <div className="flex items-center gap-1.5">
+                                                                <span className="text-[12.5px] font-medium text-slate-900 truncate">
+                                                                    {o.name}
                                                                 </span>
-                                                            )}
-                                                        </div>
-                                                        <div className="text-[11px] text-slate-500 truncate flex items-center gap-1.5">
-                                                            <span className="uppercase tracking-[0.08em]">
-                                                                {o.role}
-                                                            </span>
-                                                            {showPlan && o.plan && (
-                                                                <>
-                                                                    <span className="text-slate-300">·</span>
-                                                                    <span>{o.plan}</span>
-                                                                </>
-                                                            )}
-                                                            {o.created_at && (
-                                                                <>
-                                                                    <span className="text-slate-300">·</span>
-                                                                    <span className="font-mono tabular-nums text-slate-400">
-                                                                        joined {relativeAge(o.created_at)}
+                                                                {isCurrent && (
+                                                                    <span className="text-[9.5px] uppercase tracking-[0.1em] text-sky-700 bg-sky-100 px-1 rounded-sm font-semibold">
+                                                                        Current
                                                                     </span>
-                                                                </>
-                                                            )}
+                                                                )}
+                                                            </div>
+                                                            <div className="text-[11px] text-slate-500 truncate flex items-center gap-1.5">
+                                                                <span className="uppercase tracking-[0.08em]">
+                                                                    {o.role}
+                                                                </span>
+                                                                {showPlan && o.plan && (
+                                                                    <>
+                                                                        <span className="text-slate-300">·</span>
+                                                                        <span>{o.plan}</span>
+                                                                    </>
+                                                                )}
+                                                                {o.created_at && (
+                                                                    <>
+                                                                        <span className="text-slate-300">·</span>
+                                                                        <span className="font-mono tabular-nums text-slate-400">
+                                                                            joined {relativeAge(o.created_at)}
+                                                                        </span>
+                                                                    </>
+                                                                )}
+                                                            </div>
                                                         </div>
-                                                    </div>
-                                                    <span className="text-[11px] text-slate-400 shrink-0">
-                                                        {isCurrent ? "Resume →" : "Open →"}
-                                                    </span>
-                                                </button>
+                                                        <span className="text-[11px] text-slate-400 shrink-0 mr-1">
+                                                            {isCurrent ? "Resume →" : "Open →"}
+                                                        </span>
+                                                    </button>
+                                                    {o.role === "owner" && (
+                                                        <button
+                                                            type="button"
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                setDeleteTarget({ id: o.id, name: o.name });
+                                                            }}
+                                                            title={`Delete ${o.name}`}
+                                                            aria-label={`Delete ${o.name}`}
+                                                            className="size-7 rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50 inline-flex items-center justify-center transition-colors shrink-0 opacity-70 group-hover:opacity-100"
+                                                        >
+                                                            <Trash2Icon className="w-3.5 h-3.5" />
+                                                        </button>
+                                                    )}
+                                                </div>
                                             );
                                         })}
                                     </div>
                                 </div>
                             )}
 
-                            {/* Create new — single action button. Same dialog
-                                the OrgSwitcher uses; no inline form anymore. */}
+                            {/* Create new */}
                             <button
                                 type="button"
                                 onClick={() => setCreateOpen(true)}
@@ -295,11 +316,7 @@ function SelectOrgPageInner() {
                     )}
                 </div>
 
-                {/* Identity + escape hatch. Sits inside the card on a
-                    muted slate strip so the user always has a visible
-                    way out of this screen — important because before
-                    a workspace is picked there's no sidebar, no nav,
-                    no other surface that exposes "log out". */}
+                {/* Identity + escape hatch */}
                 {user && (
                     <div className="px-4 h-10 border-t border-slate-200 bg-slate-50/60 flex items-center gap-2">
                         <span className="text-[11px] text-slate-500 truncate flex-1 min-w-0">
@@ -320,6 +337,39 @@ function SelectOrgPageInner() {
             </div>
 
             <NewWorkspaceDialog open={createOpen} onClose={() => setCreateOpen(false)} />
+
+            {deleteTarget && (
+                <ScheduleDeletionModal
+                    open={!!deleteTarget}
+                    onClose={() => setDeleteTarget(null)}
+                    title={`Delete "${deleteTarget.name}"`}
+                    body={
+                        <p>
+                            Are you sure you want to delete <strong>"{deleteTarget.name}"</strong>? All mailboxes, campaigns, and contacts in this workspace will be scheduled for deletion.
+                        </p>
+                    }
+                    confirmationHint={deleteTarget.name}
+                    graceDays={30}
+                    submitLabel="Delete workspace"
+                    onSubmit={async ({ confirmation, reason }) => {
+                        await switchOrg.mutateAsync(deleteTarget.id);
+                        await scheduleDeletion.mutateAsync({ confirmation, reason });
+                        toast.success(`"${deleteTarget.name}" scheduled for deletion`);
+                        const fresh = await orgs.refetch();
+                        const list = fresh.data ?? [];
+                        setOrganizations(list);
+                        if (currentOrg?.id === deleteTarget.id) {
+                            const next = list.find((x) => x.id !== deleteTarget.id);
+                            if (next) {
+                                setCurrentOrganization(next);
+                                await switchOrg.mutateAsync(next.id).catch(() => undefined);
+                            } else {
+                                setCurrentOrganization(null);
+                            }
+                        }
+                    }}
+                />
+            )}
         </div>
     );
 }
