@@ -17,14 +17,13 @@
 
 import React from "react";
 import { Navigate, useNavigate } from "react-router-dom";
-import { LogOutIcon, Loader2Icon, MailIcon, PlusIcon, UsersIcon, Trash2Icon, MoreHorizontalIcon } from "lucide-react";
+import { LogOutIcon, Loader2Icon, MailIcon, PlusIcon, UsersIcon } from "lucide-react";
 import toast from "react-hot-toast";
 import getToken from "@/lib/helper/getToken";
 import useOrganizations from "@/lib/api/hooks/app/organizations/useOrganizations";
 import useMyInvitations from "@/lib/api/hooks/app/organizations/useMyInvitations";
 import useAcceptInvitation from "@/lib/api/hooks/app/organizations/useAcceptInvitation";
 import useSwitchOrganization from "@/lib/api/hooks/app/organizations/useSwitchOrganization";
-import useScheduleOrganizationDeletion from "@/lib/api/hooks/app/dangerzone/useScheduleOrganizationDeletion";
 import useLogout from "@/lib/api/hooks/auth/useLogout";
 import useUser from "@/lib/api/hooks/auth/useUser";
 import useAuthConfig from "@/lib/api/hooks/auth/useAuthConfig";
@@ -32,13 +31,6 @@ import useBrand from "@/hooks/useBrand";
 import { useAppStore } from "@/stores";
 import { Logo } from "@/components/svg";
 import { NewWorkspaceDialog } from "@/components/app/organizations/NewWorkspaceDialog";
-import {
-    PopoverMenu,
-    PopoverMenuTrigger,
-    PopoverMenuContent,
-    PopoverMenuItem,
-} from "@/components/ui/popover-menu";
-import ScheduleDeletionModal from "@/app/app/settings/danger/ScheduleDeletionModal";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
 
@@ -78,7 +70,6 @@ function SelectOrgPageInner() {
     const navigate = useNavigate();
     const brand = useBrand();
     const [createOpen, setCreateOpen] = React.useState(false);
-    const [deleteTarget, setDeleteTarget] = React.useState<{ id: string; name: string } | null>(null);
 
     const orgs = useOrganizations();
     const invites = useMyInvitations();
@@ -97,7 +88,6 @@ function SelectOrgPageInner() {
 
     const accept = useAcceptInvitation();
     const switchOrg = useSwitchOrganization();
-    const scheduleDeletion = useScheduleOrganizationDeletion();
     const logout = useLogout();
 
     async function onLogout() {
@@ -232,28 +222,22 @@ function SelectOrgPageInner() {
                                         Your workspaces
                                         <span className="font-mono tabular-nums">{orgList.length}</span>
                                     </div>
-                                    <div className="border border-slate-200 rounded-md overflow-hidden divide-y divide-slate-200/60">
+                                    <div className="space-y-1.5">
                                         {orgList.map((o) => {
                                             const isCurrent = currentOrg?.id === o.id;
                                             return (
-                                                <div
+                                                <button
                                                     key={o.id}
-                                                    className={`group w-full px-3 py-2.5 flex items-center gap-2.5 transition-colors ${
-                                                        isCurrent
-                                                            ? "bg-sky-50/60 hover:bg-sky-50"
-                                                            : "hover:bg-slate-50/80"
-                                                    }`}
+                                                    type="button"
+                                                    onClick={() => onPickExisting(o.id)}
+                                                    disabled={switchOrg.isPending}
+                                                    className="w-full h-14 px-3 rounded-md border border-slate-200 hover:border-slate-300 bg-white hover:bg-slate-50/70 flex items-center justify-between gap-3 text-left transition-colors disabled:opacity-50"
                                                 >
-                                                    <button
-                                                        type="button"
-                                                        onClick={() => onPickExisting(o.id)}
-                                                        disabled={switchOrg.isPending}
-                                                        className="flex-1 min-w-0 flex items-center gap-2.5 text-left disabled:opacity-50"
-                                                    >
+                                                    <div className="flex items-center gap-2.5 min-w-0">
                                                         <div className="size-7 rounded bg-slate-900 text-white flex items-center justify-center text-[10px] font-semibold shrink-0">
                                                             {initials(o.name)}
                                                         </div>
-                                                        <div className="min-w-0 flex-1">
+                                                        <div className="min-w-0">
                                                             <div className="flex items-center gap-1.5">
                                                                 <span className="text-[12.5px] font-medium text-slate-900 truncate">
                                                                     {o.name}
@@ -284,42 +268,19 @@ function SelectOrgPageInner() {
                                                                 )}
                                                             </div>
                                                         </div>
-                                                        <span className="text-[11px] text-slate-400 shrink-0 mr-1">
-                                                            {isCurrent ? "Resume →" : "Open →"}
-                                                        </span>
-                                                    </button>
-                                                    {o.role === "owner" && (
-                                                        <PopoverMenu align="end">
-                                                            <PopoverMenuTrigger asChild>
-                                                                <button
-                                                                    type="button"
-                                                                    onClick={(e) => e.stopPropagation()}
-                                                                    title="Workspace options"
-                                                                    aria-label={`Options for ${o.name}`}
-                                                                    className="size-7 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 inline-flex items-center justify-center transition-colors shrink-0 opacity-70 group-hover:opacity-100"
-                                                                >
-                                                                    <MoreHorizontalIcon className="w-4 h-4" />
-                                                                </button>
-                                                            </PopoverMenuTrigger>
-                                                            <PopoverMenuContent minWidth={160}>
-                                                                <PopoverMenuItem
-                                                                    onSelect={() => setDeleteTarget({ id: o.id, name: o.name })}
-                                                                    icon={<Trash2Icon className="w-3.5 h-3.5" />}
-                                                                    danger
-                                                                >
-                                                                    Delete workspace
-                                                                </PopoverMenuItem>
-                                                            </PopoverMenuContent>
-                                                        </PopoverMenu>
-                                                    )}
-                                                </div>
+                                                    </div>
+                                                    <span className="text-[11px] text-slate-400 shrink-0">
+                                                        {isCurrent ? "Resume →" : "Open →"}
+                                                    </span>
+                                                </button>
                                             );
                                         })}
                                     </div>
                                 </div>
                             )}
 
-                            {/* Create new */}
+                            {/* Create new — single action button. Same dialog
+                                the OrgSwitcher uses; no inline form anymore. */}
                             <button
                                 type="button"
                                 onClick={() => setCreateOpen(true)}
@@ -332,7 +293,11 @@ function SelectOrgPageInner() {
                     )}
                 </div>
 
-                {/* Identity + escape hatch */}
+                {/* Identity + escape hatch. Sits inside the card on a
+                    muted slate strip so the user always has a visible
+                    way out of this screen — important because before
+                    a workspace is picked there's no sidebar, no nav,
+                    no other surface that exposes "log out". */}
                 {user && (
                     <div className="px-4 h-10 border-t border-slate-200 bg-slate-50/60 flex items-center gap-2">
                         <span className="text-[11px] text-slate-500 truncate flex-1 min-w-0">
@@ -353,39 +318,6 @@ function SelectOrgPageInner() {
             </div>
 
             <NewWorkspaceDialog open={createOpen} onClose={() => setCreateOpen(false)} />
-
-            {deleteTarget && (
-                <ScheduleDeletionModal
-                    open={!!deleteTarget}
-                    onClose={() => setDeleteTarget(null)}
-                    title={`Delete "${deleteTarget.name}"`}
-                    body={
-                        <p>
-                            Are you sure you want to delete <strong>"{deleteTarget.name}"</strong>? All mailboxes, campaigns, and contacts in this workspace will be scheduled for deletion.
-                        </p>
-                    }
-                    confirmationHint={deleteTarget.name}
-                    graceDays={30}
-                    submitLabel="Delete workspace"
-                    onSubmit={async ({ confirmation, reason }) => {
-                        await switchOrg.mutateAsync(deleteTarget.id);
-                        await scheduleDeletion.mutateAsync({ confirmation, reason });
-                        toast.success(`"${deleteTarget.name}" scheduled for deletion`);
-                        const fresh = await orgs.refetch();
-                        const list = fresh.data ?? [];
-                        setOrganizations(list);
-                        if (currentOrg?.id === deleteTarget.id) {
-                            const next = list.find((x) => x.id !== deleteTarget.id);
-                            if (next) {
-                                setCurrentOrganization(next);
-                                await switchOrg.mutateAsync(next.id).catch(() => undefined);
-                            } else {
-                                setCurrentOrganization(null);
-                            }
-                        }
-                    }}
-                />
-            )}
         </div>
     );
 }
