@@ -114,6 +114,10 @@ const (
 	PlacementSpacingSecondsDefault     = 60 // gap between two probes from one sender
 	PlacementSpacingSecondsMin         = 5
 	PlacementSpacingSecondsMax         = 600
+	PlacementQuickSpacingSeconds       = 8  // the gap in a quick test, so it sends in minutes
+	PlacementCreditsPerTestDefault     = 25 // price of a test past the free allowance
+	PlacementCreditsPerTestMax         = 10_000
+	PlacementFamiliesMax               = 32  // provider families one test may name
 	PlacementClassifyTimeoutMinutes    = 120 // after the send, a copy not seen in the seed is missing
 	PlacementRunningPerOrgMax          = 3   // tests one workspace may have in flight at once
 	PlacementSeedsPerWorkspaceMax      = 50  // a workspace's own seed mailboxes
@@ -459,6 +463,16 @@ const (
 	MailboxImportLeaseSeconds       = 120
 	MailboxImportCredentialDays     = 7
 	MailboxImportRetentionDays      = 30
+
+	// Contact import (background job): uploads still waiting on a mapping are
+	// dropped after ContactImportDraftHours, finished imports and their rows
+	// after ContactImportRetentionDays. A run renews its lease every chunk, and
+	// a workspace may hold ContactImportMaxActive drafts and runs at once.
+	ContactImportDraftHours    = 24
+	ContactImportRetentionDays = 30
+	ContactImportLeaseSeconds  = 120
+	ContactImportMaxAttempts   = 3
+	ContactImportMaxActive     = 10
 
 	// Daily creation throttles. The total caps above stop "you have
 	// 5000 campaigns on this org" — the throttles below stop "you

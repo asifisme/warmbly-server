@@ -118,6 +118,14 @@ The three `/campaigns/:id/leads/:contactId/…` calls hold one contact's flow in
 | POST | `/contacts/export` | `READ_CONTACTS` |
 | POST | `/contacts/import/preview` | `WRITE_CONTACTS` |
 | POST | `/contacts/import/commit` | `BULK_CONTACTS` |
+| POST | `/contacts/imports` | `WRITE_CONTACTS` |
+| GET | `/contacts/imports` | `READ_CONTACTS` |
+| GET | `/contacts/imports/:id` | `READ_CONTACTS` |
+| PATCH | `/contacts/imports/:id` | `WRITE_CONTACTS` |
+| POST | `/contacts/imports/:id/analyze` | `WRITE_CONTACTS` |
+| POST | `/contacts/imports/:id/start` | `BULK_CONTACTS` |
+| POST | `/contacts/imports/:id/cancel` | `BULK_CONTACTS` |
+| GET | `/contacts/imports/:id/failed.csv` | `READ_CONTACTS` |
 | GET | `/contacts/:id/notes` | `READ_CONTACTS` |
 | POST | `/contacts/:id/notes` | `WRITE_CONTACTS` |
 | PATCH | `/contacts/:id/notes/:noteId` | `WRITE_CONTACTS` |
@@ -278,7 +286,7 @@ The `agent-drafts` endpoints back the [inbox agent](/guides/inbox-agent/): the a
 
 Analytics reads use the selected workspace for JWT callers and the key's workspace for API-key callers. This includes warmup and usage totals, so teammates see the same workspace history regardless of which member connected a mailbox or created a campaign.
 
-`GET /analytics/inbox-tagging` accepts `limit`, opaque `cursor`, and `needs_review` query parameters and returns `data`, aggregate `summary`, and `pagination`. Each row carries `actions`, the list of what the verdict was allowed to do (`hold`, `stop`, `task`, `suppress`), and `summary.acted` counts the rows that did anything. Invalid cursors, limits, or booleans return `400`.
+`GET /analytics/inbox-tagging` accepts `limit`, opaque `cursor`, and `needs_review` query parameters and returns `data`, aggregate `summary`, and `pagination`. Each row carries `actions`, the list of what the verdict was allowed to do (`hold`, `stop`, `task`, `suppress`), and `summary.acted` counts the rows that did anything. `return_date` (`YYYY-MM-DD`, or `null`) is the out-of-office return date the model was asked to confirm, with its answer under `answers.return_date`. Invalid cursors, limits, or booleans return `400`.
 
 ### Inbox placement tests
 

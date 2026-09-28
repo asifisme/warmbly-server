@@ -18,7 +18,7 @@ The data is split into groups. Every export includes **Workspace**; the rest are
 | Group | Contents |
 |-------|----------|
 | Workspace | The organization, members, roles, teams, mailboxes, mailbox tags, the column mappings saved by [mailbox imports](/guides/mailbox-import/), inbox vendor connections, [root redirects](/guides/sending-domains/#root-redirects), API keys, webhooks, and settings, including the website tracking site key. Always included |
-| Contacts | Contacts, categories, segments with their manual overrides, forms with their images, submissions, personalized link tickets and funnel events, notes, activities, and the suppression list |
+| Contacts | Contacts, categories, the column mappings saved by [contact imports](/guides/contacts-crm/#importing), segments with their manual overrides, forms with their images, submissions, personalized link tickets and funnel events, notes, activities, and the suppression list |
 | Campaigns | Campaigns, folders, sequences, senders, linked segments, attachments, the email image library, per-campaign settings, each lead's step progress with its per-link clicks and per-event opens, [placement monitors](/guides/placement-tests/#campaign-placement-monitors), and the [unsubscribe links](/guides/unsubscribe/) already in recipients' inboxes |
 | CRM | Pipelines, deals, tasks, and meeting bookings |
 | Automations | Automations, connected integrations, and lead sync sources |
@@ -97,7 +97,7 @@ Some things belong to an instance rather than to a workspace, so they are not ap
 | Cold rotation state | Whether a mailbox is resting or held in reserve is this instance's decision about sending it watched. Every mailbox arrives in normal rotation and earns its way out again |
 | Cold sending ramps | How far a mailbox had eased into cold volume raises its cap, and the destination never watched it send. Mailboxes re-graduate from their warmup maturity, which costs a few days and errs toward sending less |
 | Seed inboxes | Which mailboxes are placement seed inboxes is this instance's choice of test inboxes, and an archive must not add mailboxes to another instance's seed panel. Every mailbox arrives as an ordinary one; mark your own seed inboxes again on the destination |
-| Placement test sends | Copies of a test that had not been sent yet stay behind, so the destination never sends to the source instance's seeds. Tests and their results arrive as a record. A campaign's placement monitor keeps its settings and next run, but not the record of its last run |
+| Placement test sends | Copies of a test that had not been sent yet stay behind, so the destination never sends to the source instance's seeds. Tests and their results arrive as a record, without what a test cost in credits, since the credit ledger does not travel. A campaign's placement monitor keeps its settings and next run, but not the record of its last run |
 | Scheduled deletions | A pending deletion from the source must never follow the workspace to its new home |
 | Failure and delivery counters | A webhook endpoint's failure streak and auto-disable state, and whether a notification's email already went out, describe what happened on the source. They start fresh, so an endpoint is not pre-disabled on the new instance and a notification is not re-sent |
 | Sends still in flight | A campaign step handed to a worker on the source has no worker on the destination to report back, so it arrives queued and is sent there instead of waiting forever. Steps already sent keep their history |
@@ -129,6 +129,8 @@ If you have shell access to the source, `warmblyctl org export` writes the same 
 A few things belong to the instance rather than the workspace and are left out on purpose: the instance's link to Warmbly Cloud and which mailboxes it enrolled in the hosted pool ([Warmbly Cloud](/guides/warmbly-cloud/)), linked self-hosted instances on a cloud workspace, Google Workspace and Microsoft 365 admin grants, live sessions, in-flight OAuth handshakes and the organization's wrapped data key. Reconnect to Warmbly Cloud and make each admin grant again after the move.
 
 [Mailbox imports](/guides/mailbox-import/) do not travel either, finished or running: an import is work the source instance is doing, and its rows hold credentials in flight. The mailboxes an import connected are ordinary mailboxes and move with the Workspace group, and the saved column mappings come too, so the same file maps itself on the destination. Let a running import finish before exporting: rows it has not connected yet are not in the archive.
+
+[Contact imports](/guides/contacts-crm/#importing) do not travel, finished or running, for the same reason: an import is work the source instance is doing. The contacts it created are ordinary contacts and move with the Contacts group, and the saved column mappings come with them. Let a running import finish before exporting, or the rows it has not reached are not in the archive.
 
 Reply and forward drafts kept in your browser are also excluded. Finish or copy them before moving to another instance. See [reply drafts](/guides/unibox/#reply-drafts).
 
