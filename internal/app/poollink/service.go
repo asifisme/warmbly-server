@@ -61,6 +61,9 @@ type Service interface {
 
 	Enroll(ctx context.Context, inst *models.PoolLinkInstance, req models.PoolLinkEnrollRequest) (*models.PoolLinkMailboxState, *errx.Error)
 	ListMailboxes(ctx context.Context, inst *models.PoolLinkInstance) ([]models.PoolLinkMailboxState, *errx.Error)
+	// ListStanding is the warmup standing of every enrolled mailbox, which the
+	// instance polls so its own send gates hold the cloud's verdict.
+	ListStanding(ctx context.Context, inst *models.PoolLinkInstance) ([]models.PoolLinkMailboxStanding, *errx.Error)
 	GetMailbox(ctx context.Context, inst *models.PoolLinkInstance, remoteID uuid.UUID) (*models.PoolLinkMailboxState, *errx.Error)
 	PatchMailbox(ctx context.Context, inst *models.PoolLinkInstance, remoteID uuid.UUID, patch models.PoolLinkMailboxPatch) (*models.PoolLinkMailboxState, *errx.Error)
 	Unenroll(ctx context.Context, inst *models.PoolLinkInstance, remoteID uuid.UUID) *errx.Error
@@ -320,7 +323,7 @@ func (s *service) Plan(ctx context.Context, orgID uuid.UUID) (models.PoolLinkPla
 		return plan, nil
 	}
 	plan.ManageURL = config.AppBaseURL() + "/app/settings/billing"
-	paid, xerr := s.gate.IsPaidOrganization(ctx, orgID)
+	paid, xerr := s.gate.HasPremiumWarmup(ctx, orgID)
 	if xerr != nil {
 		return plan, xerr
 	}
@@ -532,6 +535,14 @@ func (s *service) ListMailboxes(ctx context.Context, inst *models.PoolLinkInstan
 			continue
 		}
 		out = append(out, *state)
+	}
+	return out, nil
+}
+
+func (s *service) ListStanding(ctx context.Context, inst *models.PoolLinkInstance) ([]models.PoolLinkMailboxStanding, *errx.Error) {
+	out, err := s.repo.ListStanding(ctx, inst.ID)
+	if err != nil {
+		return nil, errx.InternalError()
 	}
 	return out, nil
 }
