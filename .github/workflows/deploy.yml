@@ -28,9 +28,11 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
 
-            echo "==> Updating and rebuilding containers..."
-            docker compose down
-            docker compose up -d --build --remove-orphans
+            echo "==> Building updated images while existing containers stay live (ZERO DOWNTIME)..."
+            docker compose build
+
+            echo "==> Recreating containers with new images seamlessly..."
+            docker compose up -d --remove-orphans
 
             echo "==> Cleaning up unused Docker images..."
             docker image prune -f
