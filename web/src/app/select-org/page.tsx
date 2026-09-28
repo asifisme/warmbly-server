@@ -17,7 +17,7 @@
 
 import React from "react";
 import { Navigate, useNavigate } from "react-router-dom";
-import { LogOutIcon, Loader2Icon, MailIcon, PlusIcon, UsersIcon, Trash2Icon } from "lucide-react";
+import { LogOutIcon, Loader2Icon, MailIcon, PlusIcon, UsersIcon, Trash2Icon, MoreHorizontalIcon } from "lucide-react";
 import toast from "react-hot-toast";
 import getToken from "@/lib/helper/getToken";
 import useOrganizations from "@/lib/api/hooks/app/organizations/useOrganizations";
@@ -32,6 +32,12 @@ import useBrand from "@/hooks/useBrand";
 import { useAppStore } from "@/stores";
 import { Logo } from "@/components/svg";
 import { NewWorkspaceDialog } from "@/components/app/organizations/NewWorkspaceDialog";
+import {
+    PopoverMenu,
+    PopoverMenuTrigger,
+    PopoverMenuContent,
+    PopoverMenuItem,
+} from "@/components/ui/popover-menu";
 import ScheduleDeletionModal from "@/app/app/settings/danger/ScheduleDeletionModal";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
@@ -283,18 +289,28 @@ function SelectOrgPageInner() {
                                                         </span>
                                                     </button>
                                                     {o.role === "owner" && (
-                                                        <button
-                                                            type="button"
-                                                            onClick={(e) => {
-                                                                e.stopPropagation();
-                                                                setDeleteTarget({ id: o.id, name: o.name });
-                                                            }}
-                                                            title={`Delete ${o.name}`}
-                                                            aria-label={`Delete ${o.name}`}
-                                                            className="size-7 rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50 inline-flex items-center justify-center transition-colors shrink-0 opacity-70 group-hover:opacity-100"
-                                                        >
-                                                            <Trash2Icon className="w-3.5 h-3.5" />
-                                                        </button>
+                                                        <PopoverMenu align="end">
+                                                            <PopoverMenuTrigger asChild>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={(e) => e.stopPropagation()}
+                                                                    title="Workspace options"
+                                                                    aria-label={`Options for ${o.name}`}
+                                                                    className="size-7 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 inline-flex items-center justify-center transition-colors shrink-0 opacity-70 group-hover:opacity-100"
+                                                                >
+                                                                    <MoreHorizontalIcon className="w-4 h-4" />
+                                                                </button>
+                                                            </PopoverMenuTrigger>
+                                                            <PopoverMenuContent minWidth={160}>
+                                                                <PopoverMenuItem
+                                                                    onSelect={() => setDeleteTarget({ id: o.id, name: o.name })}
+                                                                    icon={<Trash2Icon className="w-3.5 h-3.5" />}
+                                                                    danger
+                                                                >
+                                                                    Delete workspace
+                                                                </PopoverMenuItem>
+                                                            </PopoverMenuContent>
+                                                        </PopoverMenu>
                                                     )}
                                                 </div>
                                             );
