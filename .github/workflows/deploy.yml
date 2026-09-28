@@ -3,7 +3,7 @@ name: Deploy to VPS
 on:
   push:
     branches:
-      - main
+      - res
   workflow_dispatch:
 
 jobs:
@@ -24,9 +24,9 @@ jobs:
             echo "==> Navigating to project directory..."
             cd /var/www/warmbly
 
-            echo "==> Fetching latest changes from main branch..."
-            git fetch origin main
-            git reset --hard origin/main
+            echo "==> Fetching latest changes from res branch..."
+            git fetch origin res
+            git reset --hard origin/res
 
             echo "==> Building updated images while existing containers stay live (ZERO DOWNTIME)..."
             docker compose build
