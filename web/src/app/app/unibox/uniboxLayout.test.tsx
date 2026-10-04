@@ -26,6 +26,7 @@ import {
     UNIBOX_LIST_MIN_WIDTH,
 } from "@/stores/slices/uiSlice";
 import {
+    findThreadRow,
     installLayoutShims,
     mount,
     resetScrollTops,
@@ -103,8 +104,9 @@ async function drag(fromX: number, toX: number) {
 }
 
 async function openThread(subject: string) {
+    const row = await findThreadRow(subject);
     await act(async () => {
-        fireEvent.click(screen.getByText(subject).closest('[role="button"]')!);
+        fireEvent.click(row);
     });
     await settle();
 }
@@ -134,7 +136,7 @@ describe("unibox desktop layout (#473)", SUITE, () => {
         await mount("/app/unibox/all");
         await settle();
         await openThread("Subject 4");
-        expect(screen.getByPlaceholderText(/Write your reply/)).toHaveValue("My older reply");
+        expect(await screen.findByPlaceholderText(/Write your reply/, undefined, { timeout: 10_000 })).toHaveValue("My older reply");
         await act(async () => fireEvent.click(screen.getByLabelText("Close composer, keeping the draft")));
         await settle();
         expect(screen.queryByPlaceholderText(/Write your reply/)).toBeNull();
@@ -199,12 +201,64 @@ describe("unibox desktop layout (#473)", SUITE, () => {
             await mount("/app/unibox/all");
             await settle();
 
-            const search = screen.getByPlaceholderText(/^Search/i);
+            const search = await screen.findByPlaceholderText(/^Search/i, undefined, { timeout: 10_000 });
             await act(async () => {
                 fireEvent.keyDown(search, { key: "b" });
             });
 
             expect(useAppStore.getState().navCollapsed).toBe(false);
+        });
+
+        // Issue #742: the tip is held shut while expanded, and Radix only
+        // reports changes against that, so a hover there used to report the
+        // open and never the close. Collapsing then showed every such tip.
+        it("opens no tips on collapse for rows hovered while expanded", async () => {
+            await mount("/app/unibox/all");
+            await settle();
+
+            const rows = Array.from(document.querySelectorAll<HTMLAnchorElement>('aside a[data-slot="tooltip-trigger"]')).slice(0, 3);
+            expect(rows).toHaveLength(3);
+            const tips = () => document.querySelectorAll('[data-slot="tooltip-content"]');
+            const hover = async (row: HTMLElement) => {
+                await act(async () => {
+                    fireEvent.pointerMove(row);
+                });
+                await settle();
+                await act(async () => {
+                    fireEvent.pointerLeave(row);
+                });
+            };
+
+            for (const row of rows) await hover(row);
+            await settle();
+            expect(tips()).toHaveLength(0);
+
+            await act(async () => {
+                fireEvent.keyDown(document.body, { key: "b" });
+            });
+            await settle();
+            expect(useAppStore.getState().navCollapsed).toBe(true);
+            expect(tips()).toHaveLength(0);
+
+            // The rail itself still names a row on hover.
+            await act(async () => {
+                fireEvent.pointerMove(rows[0]);
+            });
+            await settle();
+            expect(tips()).toHaveLength(1);
+
+            // And a tip left open in the rail does not come back after a round
+            // trip through the expanded sidebar.
+            await act(async () => {
+                fireEvent.keyDown(document.body, { key: "b" });
+            });
+            await settle();
+            await act(async () => {
+                fireEvent.keyDown(document.body, { key: "b" });
+            });
+            await settle();
+            expect(useAppStore.getState().navCollapsed).toBe(true);
+            expect(tips()).toHaveLength(0);
         });
     });
 

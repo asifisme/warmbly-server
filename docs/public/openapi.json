@@ -6215,7 +6215,7 @@
       "get": {
         "operationId": "campaigns_send_plan",
         "summary": "Today's sending plan",
-        "description": "What the campaign sends today and every limit that decided it, worked out through the scheduler's own gates. Nothing is stored or written. Scope READ_CAMPAIGNS, org permission view_campaigns.",
+        "description": "What the campaign sends today and every limit that decided it, worked out through the scheduler's own gates. An active campaign is served from a snapshot computed in the background (`computed_at` says when, `stale` says a refresh is pending); a campaign with no snapshot yet is computed on the request. Scope READ_CAMPAIGNS, org permission view_campaigns.",
         "tags": [
           "campaigns"
         ],
@@ -10328,7 +10328,7 @@
       "patch": {
         "operationId": "unibox_mark_seen",
         "summary": "Mark messages seen",
-        "description": "Marks messages as read or unread, org-wide. Name them with `email_ids`, whole conversations with `thread_ids`, or sweep a folder with `folder`. Up to 500 ids of each per call.",
+        "description": "Marks messages as read or unread, org-wide. Name them with `email_ids`, whole conversations with `thread_ids`, or sweep a folder with `folder`. Up to 500 ids of each per call. Read covers every message a conversation holds; unread marks only its newest received message. A sent or draft copy is never marked unread.",
         "tags": [
           "unibox"
         ],
@@ -10410,7 +10410,7 @@
       "patch": {
         "operationId": "unibox_move_folder",
         "summary": "Move conversations between folders",
-        "description": "Re-files messages into Inbox, Archive or Trash, org-wide. Name them with `email_ids`, whole conversations with `thread_ids`, or both; up to 500 of each. Prefer `thread_ids`: filing part of a conversation leaves it listed.\n\nThis is a move in Warmbly only. The copy at the mail provider stays where it is, and a later sync will not undo the move: Warmbly tracks the provider's own placement separately and follows it only when the provider itself moves the message. `sent`, `drafts` and `spam` are placements the provider reaches, so they are rejected here with a `400`.",
+        "description": "Re-files messages into Inbox, Archive or Trash, org-wide. Name them with `email_ids`, whole conversations with `thread_ids`, or both; up to 500 of each. Prefer `thread_ids`: filing part of a conversation leaves it listed.\n\nThe move is then relayed to each mailbox with `relay_folder_moves` on (the default): after the response and best-effort, the provider's copy is archived, moved to its trash, or put back in its inbox. A later sync will not undo a filing either way: Warmbly tracks the provider's own placement separately and follows it only when the provider itself moves the message. `sent`, `drafts` and `spam` are placements the provider reaches, so they are rejected here with a `400`.",
         "tags": [
           "unibox"
         ],
@@ -17410,10 +17410,42 @@
           "analytics"
         ],
         "summary": "List account statuses",
-        "description": "Health and usage status of every email account the caller owns. Returned under a data envelope (no cursor; all accounts included). Accounts that fail to build are skipped.",
+        "description": "Health and usage status of the caller's email accounts, one bounded page at a time, under a data plus pagination envelope with an opaque cursor. Per-mailbox reads are batched across the page, so a page's cost does not grow with the total inventory, and a workspace with more mailboxes than one page reaches the rest through next_cursor instead of having them silently dropped.",
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "email_ids",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated mailbox UUIDs to return the status of (up to 200). Use this to ask only for the mailboxes a page shows. A foreign-workspace id matches nothing. Invalid or over-limit returns 400.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Page size when walking the whole inventory. Invalid returns 400.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 1000
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque keyset cursor from a previous response's pagination.next_cursor. Invalid returns 400.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -18797,6 +18829,217 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/IntegrationSyncRunList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/integrations/connections/{id}/signing-key": {
+      "put": {
+        "operationId": "integrations_connections_set_signing_key",
+        "summary": "Set the inbound signing key",
+        "description": "Sets the key a Calendly or Cal.com connection's inbound deliveries must be signed with (Calendly's `Calendly-Webhook-Signature`, Cal.com's `X-Cal-Signature-256`). Once set, a delivery without a valid signature is refused with `401`. An empty `signing_key` removes it, so the inbound URL alone authenticates deliveries again. The key is stored encrypted and never returned; `display_fields.inbound_signing` reports whether one is set. Requires `manage_settings` for JWT callers.",
+        "tags": [
+          "integrations"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Connection id."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IntegrationSigningKeyUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated connection.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "connection"
+                  ],
+                  "properties": {
+                    "connection": {
+                      "$ref": "#/components/schemas/IntegrationConnection"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request: the connection is not a Calendly or Cal.com connection, or `signing_key` is 1 to 7 characters or longer than 512. An empty `signing_key` is accepted and removes the key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/integrations/connections/{id}/rotate-inbound-url": {
+      "post": {
+        "operationId": "integrations_connections_rotate_inbound_url",
+        "summary": "Rotate the inbound webhook URL",
+        "description": "Mints a new inbound webhook URL for a Calendly or Cal.com connection. The previous URL stops working immediately, so paste the new one into the provider. Requires `manage_settings` for JWT callers.",
+        "tags": [
+          "integrations"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Connection id."
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The new inbound URL.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "inbound_webhook_url"
+                  ],
+                  "properties": {
+                    "inbound_webhook_url": {
+                      "type": "string",
+                      "description": "Path of the new inbound URL, relative to the API host."
+                    }
+                  }
                 }
               }
             }
@@ -26552,6 +26795,14 @@
                       "type": "string"
                     },
                     "description": "A listed domain's own redirect website, keyed by domain, in place of redirect_url."
+                  },
+                  "served_by": {
+                    "type": "string",
+                    "enum": [
+                      "instance",
+                      "cloud"
+                    ],
+                    "description": "Where a redirect no vendor forwards is served from: this instance, or Warmbly Cloud on a self-hosted instance linked to it. Omitted keeps each domain's current choice."
                   }
                 }
               }
@@ -26815,7 +27066,7 @@
       "put": {
         "operationId": "sending_domains_set_redirect",
         "summary": "Set a root redirect",
-        "description": "Records the redirect and checks DNS once. Idempotent: a repeat keeps the same ownership value. Requires a user session token (not an API key) and the manage_emails organization permission.",
+        "description": "Records the redirect and checks it once: DNS, then a visit to the domain once DNS verifies, or Warmbly Cloud's verdict when Cloud serves it. Idempotent: a repeat keeps the same ownership value. Requires a user session token (not an API key) and the manage_emails organization permission.",
         "tags": [
           "mailboxes"
         ],
@@ -26851,6 +27102,14 @@
                   "include_www": {
                     "type": "boolean",
                     "default": true
+                  },
+                  "served_by": {
+                    "type": "string",
+                    "enum": [
+                      "instance",
+                      "cloud"
+                    ],
+                    "description": "Where the redirect is served from: this instance, or Warmbly Cloud on a self-hosted instance linked to it. Omitted keeps the current choice; a new redirect is served by this instance."
                   }
                 }
               }
@@ -28154,6 +28413,10 @@
             "type": "boolean",
             "description": "SMTP/IMAP mailboxes only: file a copy of each sent message in the mailbox's Sent folder. Ignored for Gmail and Outlook, whose APIs file their own copy."
           },
+          "relay_folder_moves": {
+            "type": "boolean",
+            "description": "Whether filing a conversation with PATCH /unibox/folder also moves it in the mailbox: Archive, Delete (to the mailbox's trash) and Move to inbox. Defaults to true."
+          },
           "tracking_domain": {
             "type": "string"
           },
@@ -28380,6 +28643,10 @@
           "save_to_sent": {
             "type": "boolean",
             "description": "SMTP/IMAP mailboxes only: file a copy of each sent message in the mailbox's Sent folder. Ignored for Gmail and Outlook, whose APIs file their own copy."
+          },
+          "relay_folder_moves": {
+            "type": "boolean",
+            "description": "Whether filing a conversation with PATCH /unibox/folder also moves it in the mailbox: Archive, Delete (to the mailbox's trash) and Move to inbox. Defaults to true."
           },
           "warmup": {
             "type": "boolean",
@@ -30273,13 +30540,14 @@
       },
       "CampaignSendPlan": {
         "type": "object",
-        "description": "Today's sending plan for a campaign, derived through the scheduler's gates on every read.",
+        "description": "Today's sending plan for a campaign, derived through the scheduler's gates and served from a background snapshot for an active campaign.",
         "required": [
           "campaign_id",
           "status",
           "day",
           "timezone",
           "computed_at",
+          "stale",
           "configured_ceiling",
           "projected_today",
           "sent_today",
@@ -30307,7 +30575,12 @@
           },
           "computed_at": {
             "type": "string",
-            "format": "date-time"
+            "format": "date-time",
+            "description": "When this plan was computed. For a snapshot, the moment it was last walked."
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "True when the snapshot has been outrun by an edit, a start or stop, or a new budget day, or has grown older than the snapshot's maximum age even though nothing changed, and a refreshed plan is already being computed. Always false for a plan computed on the request."
           },
           "configured_ceiling": {
             "type": "integer",
@@ -33291,6 +33564,11 @@
           "seen": {
             "type": "boolean"
           },
+          "answers_mailbox_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Thread reads only: the workspace mailbox that sent the email this message replies to, when another mailbox holds it (a shared reply inbox). Absent otherwise."
+          },
           "body_plain": {
             "type": "string"
           },
@@ -35970,6 +36248,15 @@
                 "$ref": "#/components/schemas/EngagementOrigin"
               }
             ]
+          },
+          "sender_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The mailbox the step was sent from. A reply credits it even when the reply landed in another mailbox named by its Reply-To."
+          },
+          "sender_email": {
+            "type": "string",
+            "description": "The address of the sending mailbox, its send-as alias when it has one."
           }
         }
       },
@@ -36947,6 +37234,19 @@
                 "description": "What the ramp alone would send today."
               }
             }
+          },
+          "send_failure": {
+            "type": "object",
+            "description": "Present while the mailbox's newest warmup send, within the last 24 hours, failed and no later send was confirmed delivered. message is the failure reason: the mail server's answer when it gave one, otherwise why the send could not be made (for example the mailbox is not loaded on its worker).",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
           }
         }
       },
@@ -37014,9 +37314,10 @@
       },
       "AccountStatusList": {
         "type": "object",
-        "description": "All of the caller's account statuses under a data envelope (no cursor).",
+        "description": "One page of account statuses under the standard data plus pagination envelope. next_cursor is an opaque token for the next page, or null on the last.",
         "required": [
-          "data"
+          "data",
+          "pagination"
         ],
         "properties": {
           "data": {
@@ -37024,6 +37325,9 @@
             "items": {
               "$ref": "#/components/schemas/AccountStatus"
             }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
           }
         }
       },
@@ -37854,6 +38158,19 @@
             "items": {
               "$ref": "#/components/schemas/IntegrationSyncRun"
             }
+          }
+        }
+      },
+      "IntegrationSigningKeyUpdate": {
+        "type": "object",
+        "required": [
+          "signing_key"
+        ],
+        "properties": {
+          "signing_key": {
+            "type": "string",
+            "maxLength": 512,
+            "description": "Calendly signing key or Cal.com webhook secret, 8 to 512 characters. Empty removes the key."
           }
         }
       },
@@ -41159,6 +41476,54 @@
             "items": {
               "$ref": "#/components/schemas/DomainDNSRecord"
             }
+          },
+          "served_by": {
+            "type": "string",
+            "enum": [
+              "instance",
+              "cloud"
+            ]
+          },
+          "serve_host": {
+            "type": "string",
+            "description": "The tracking host that answers for the domain, which a proxy in front of it routes the domain to."
+          },
+          "reach": {
+            "type": "object",
+            "description": "The last visit to the domain, made once DNS verifies. Absent before then.",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "ok",
+                  "not_reaching",
+                  "https_error",
+                  "unreachable"
+                ]
+              },
+              "hint": {
+                "type": "string",
+                "enum": [
+                  "not_routed",
+                  "host_header",
+                  "wrong_target",
+                  "certificate",
+                  "no_listener",
+                  "settling"
+                ]
+              },
+              "detail": {
+                "type": "string"
+              },
+              "proxy": {
+                "type": "string",
+                "description": "The web server that answered in Warmbly's place, when it named itself: traefik, nginx, caddy, apache, cloudflare, iis or litespeed."
+              },
+              "checked_at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
           }
         }
       },
@@ -43037,9 +43402,10 @@
                 "type": "string",
                 "enum": [
                   "vendor",
-                  "dns"
+                  "dns",
+                  "cloud"
                 ],
-                "description": "vendor when the vendor forwards the root, dns when this instance serves the redirect once DNS proves the domain."
+                "description": "vendor when the vendor forwards the root, dns when this instance serves the redirect once DNS proves the domain, cloud when Warmbly Cloud serves it for this linked instance."
               },
               "verified": {
                 "type": "boolean"

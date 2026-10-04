@@ -91,7 +91,8 @@ Fields are named by their JSON key, with nested fields as a dotted path (`inner.
 |--------|---------|
 | `invalid_lead_status` | `POST /contacts/search` or `POST /contacts/export` was given a `lead_status` that is not one of the documented values |
 | `invalid_sort_by` | `POST /contacts/search`, `POST /contacts/export` or a bulk action's `all` selection was given a `sort_by` of the form `custom:<key>` whose key could never be a custom-field name (letters, numbers, underscores, spaces or dashes) |
-| `invalid_column`, `duplicate_column`, `too_many_columns`, `invalid_sort` | `PUT /me/views/:view` was given a column id that view cannot render, the same column twice, more than 64 columns, or a sort that names neither a sortable contact column nor a well-formed `custom:<key>` |
+| `invalid_column`, `duplicate_column`, `too_many_columns`, `invalid_sort` | `PUT /me/views/:view` was given a column id that view cannot render, the same column twice, more than 64 columns, or a sort that names neither a sortable contact column nor a well-formed `custom:<key>` (`unibox_rail` has no columns or sort at all) |
+| `invalid_layout` | `PUT /me/views/:view` was given a `layout` on a view that has none, or a `unibox_rail` layout with an unknown field, an empty or over-long key (200 bytes), more than 500 keys in a list or 32 sections, or a favorite name over 40 characters |
 | `invalid_mail_host` | `POST /contacts/search`, `POST /contacts/export` or a bulk action's `all` selection was given a `mail_hosts` entry that is not a documented provider value |
 | `invalid_engagement` | `POST /contacts/search` or `POST /contacts/export` was given an `engagement` that is not one of the documented values |
 | `lead_filter_requires_campaign` | `lead_status` or `engagement` was set without exactly one `campaign_ids` entry; both filters describe a contact inside one campaign |
@@ -208,8 +209,14 @@ The [inbox vendor](/guides/mailbox-import/#import-from-an-inbox-vendor) routes (
 | `sending_domain_not_in_workspace` | 404 | The workspace has no mailbox on this domain. Also `400` when no domain was given |
 | `sending_domain_shared_provider` | 400 | The domain belongs to a shared email provider, such as `gmail.com`, and cannot be redirected |
 | `domain_redirect_invalid_target` | 400 | `target_url` (or a vendor forwarding `url`) is not an `http` or `https` address on a host, carries credentials, is longer than 2,048 characters, or points back at the same domain or its `www`. An import's `redirects` option answers the same. Also returned by `vendor-tracking` when `host` is not a subdomain of the domain |
-| `domain_redirect_taken` | 409 | Another workspace on this instance already serves a verified redirect for this domain. The redirect is saved but does not verify |
-| `sending_domain_bulk_invalid` | 400 | A bulk setup named no domain, more than 100, neither a `tracking_label` nor a `redirect_url`, or a `tracking_label` that is not one DNS label |
+| `domain_redirect_taken` | 409 | Another workspace on this instance already serves a verified redirect for this domain, or already has Warmbly Cloud serve it. The redirect is saved but does not verify. On Warmbly Cloud's linked-instance API, the linked workspace already has its own redirect for the domain |
+| `domain_redirect_linked` | 409 | On Warmbly Cloud: this domain's redirect is served for a linked self-hosted instance, and only that instance changes it |
+| `domain_redirect_cloud_unavailable` | 409 | `served_by` is `cloud`, but this instance is not linked to Warmbly Cloud, or Cloud does not serve redirects for it |
+| `domain_redirect_cloud_unreachable` | 503 | Warmbly Cloud could not be reached while saving, moving or removing a redirect it serves, so nothing changed. Retry |
+| `domain_redirect_limit` | 409 | Warmbly Cloud already serves 200 redirects for this linked instance |
+| `pool_link_redirect_not_found` | 404 | On Warmbly Cloud's linked-instance API: Cloud serves no redirect for this domain for the calling instance |
+| `pool_link_cleartext_mailbox` | 422 | Enrolling a mailbox in [Warmbly Cloud](/guides/warmbly-cloud/), or updating its credential there: SMTP or IMAP uses security `none`. Cloud reaches the mail server over the internet and needs TLS or STARTTLS on both legs. Switch the mailbox to TLS, or keep warming it on the instance |
+| `sending_domain_bulk_invalid` | 400 | A bulk setup named no domain, more than 100, neither a `tracking_label` nor a `redirect_url`, a `tracking_label` that is not one DNS label, or a `served_by` other than `instance` or `cloud` |
 | `tracking_host_not_configured` | 400 | This instance has no tracking host (`TRACKING_DOMAIN`), so it cannot serve a tracking domain or a redirect |
 
 ```json
@@ -390,6 +397,7 @@ Signup and invitation refusals carry their own `code`, so a client can branch on
 | `reauth_required` | 403 | The action needs a proof of identity newer than the session. Confirm with `POST /v1/auth/reauth`, then retry |
 | `reauth_no_factor` | 400 | The account has neither a password nor two-factor authentication, so there is nothing to confirm with. Enrol one first |
 | `admin_mfa_required` | 403 | An admin route was reached by a session that did not present a second factor. Turn on 2FA or add a passkey, then sign in again |
+| `passkey_user_verification_required` | 400 | A passkey sign-in came from an authenticator that did not verify the user with a PIN or biometric. Set a PIN on the security key, or sign in another way |
 | `two_fa_invalid_code` | 400 | The authenticator or recovery code did not match. Wait for a fresh code and try again; the login challenge allows five attempts per pending session |
 | `password_changed_sign_in_again` | 409 | `POST /auth/me/password` stored the new password but could not issue the calling device a new session. Every earlier token is invalid; discard them and sign in again with the new password |
 
@@ -447,8 +455,11 @@ Returned when the requested resource doesn't exist.
 
 | `code` | Meaning |
 |--------|---------|
-| `unknown_view` | `/me/views/:view` was given a view name other than `contacts` or `campaign_leads` |
+| `unknown_view` | `/me/views/:view` was given a view name other than `contacts`, `campaign_leads` or `unibox_rail` |
 | `lead_cc_contact_not_found` | [Set a lead's CC](/api/reference/campaigns/#set-a-leads-cc) named a contact that is not in the workspace |
+| `slack_not_connected` | A [Slack](/guides/slack/) route was called for a workspace that has not connected Slack, or whose connection was removed. Connect it under **Integrations > Slack** |
+| `slack_link_invalid` | The Slack link code is unknown, expired or already used. Ask the bot for a new link button (`/warmbly link`) |
+| `slack_not_linked` | `PATCH /integrations/slack/link` from a member who has not linked a Slack account in this workspace |
 
 ### 409 Conflict
 
@@ -593,6 +604,25 @@ A `503` whose `code` is `ai_not_configured` is not transient and retrying will n
 **How to fix:**
 - Set `AI_PROVIDER` and `AI_API_KEY` in the `.env` at your install root, then restart. See the [configuration reference](/development/configuration/)
 - Hide the AI affordance in your client rather than retrying: nothing about the request will make it succeed
+
+#### `slack_not_configured`
+
+A `503` whose `code` is `slack_not_configured` is not transient and retrying will not help. The instance is not set up for [Slack](/guides/slack/), which only happens on a self-hosted install. The three Slack request URLs (`/api/v1/integrations/slack/events`, `/interactivity` and `/commands`) answer it whenever `SLACK_SIGNING_SECRET` is unset.
+
+```json
+{
+  "error": "Service Unavailable",
+  "message": "Slack is not set up on this Warmbly instance.",
+  "code": "slack_not_configured",
+  "request_id": "4bbbd1b2-8f86-47dd-8a7f-9476501ad20e"
+}
+```
+
+**How to fix:**
+- Create the instance's Slack app and set `SLACK_OAUTH_CLIENT_ID`, `SLACK_OAUTH_CLIENT_SECRET` and `SLACK_SIGNING_SECRET` on the backend and the consumer, then restart. See [Slack app](/development/slack-app/)
+- In a client, read `app_configured` and `interactive_configured` from `GET /integrations/slack/status` and hide the Slack affordances rather than retrying
+
+Those request URLs answer `401` `unauthorized` to a request whose Slack signature does not verify. Linking a Slack account to a workspace you are not a member of is `403` `forbidden`.
 
 #### `mailbox_allowance_reached`
 

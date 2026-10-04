@@ -56,6 +56,8 @@ const labelMap: Record<string, string> = {
     workers: "Workers",
     credentials: "Credentials",
     audit: "Audit",
+    slack: "Slack",
+    link: "Link account",
     leads: "Leads",
     preferences: "Preferences",
     schedule: "Schedule",
@@ -115,7 +117,7 @@ export function AppHeader({ onMenu }: { onMenu?: () => void }) {
                 <span
                     style={{ fontFamily: "var(--font-display)" }}
                     className={cn(
-                        "font-extrabold text-[15.5px] tracking-tight text-slate-900",
+                        "wb-title font-extrabold text-[15.5px] tracking-tight text-slate-900",
                         navCollapsed ? "hidden" : "hidden md:inline",
                     )}
                 >

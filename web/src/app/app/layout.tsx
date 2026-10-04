@@ -21,6 +21,11 @@ import PermissionDeniedModal from "@/components/app/modals/PermissionDeniedModal
 export default function RootAppLayout() {
     const token = getToken();
     if (!token) {
+        // A Slack link code is single-use and short-lived, so it survives sign-in.
+        if (window.location.pathname === "/app/slack/link") {
+            const next = encodeURIComponent(window.location.pathname + window.location.search);
+            return <Navigate to={`/auth/login?next=${next}`} replace />;
+        }
         return <Navigate to="/auth/login" replace />;
     }
 

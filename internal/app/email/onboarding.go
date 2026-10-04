@@ -61,8 +61,11 @@ func (s *emailService) OAuthStart(ctx context.Context, userID string, orgID *uui
 	}
 
 	opts := append(authCodeOptions(provider, loginHintOrEmpty(loginHint)), oauth2.S256ChallengeOption(verifier))
-	url := cfg.AuthCodeURL(state, opts...)
-	return &models.EmailOnboardingStartResponse{URL: url, State: state}, nil
+	resp := &models.EmailOnboardingStartResponse{URL: cfg.AuthCodeURL(state, opts...), State: state}
+	if provider == models.InboxProviderOutlook {
+		resp.AdminConsentURL = outlookAdminApprovalURL(cfg)
+	}
+	return resp, nil
 }
 
 // guardInboxLimit refuses a connect that would take the workspace past its
@@ -106,7 +109,7 @@ func (s *emailService) guardInboxLimit(ctx context.Context, orgID *uuid.UUID) (*
 // OAuthFinish validates the state, exchanges the code for tokens, fetches the
 // inbox owner, and persists a new email account — or, when the state carries an
 // account id (OAuthReauth), renews that mailbox's tokens in place instead.
-func (s *emailService) OAuthFinish(ctx context.Context, userID, code, state string) (*models.Email, bool, *errx.Error) {
+func (s *emailService) OAuthFinish(ctx context.Context, userID, code, state string, authorize FinishAuthorizer) (*models.Email, bool, *errx.Error) {
 	ctx, cancel := detach(ctx, connectBudget)
 	defer cancel()
 	if code = strings.TrimSpace(code); code == "" {
@@ -122,6 +125,15 @@ func (s *emailService) OAuthFinish(ctx context.Context, userID, code, state stri
 	}
 	if sess.UserID != userID {
 		return nil, false, errx.ErrEmailOnboardState
+	}
+	if sess.OrganizationID == nil {
+		return nil, false, errx.ErrNoOrganization
+	}
+	if authorize == nil {
+		return nil, false, errx.ErrForbidden
+	}
+	if xerr := authorize(ctx, *sess.OrganizationID, sess.EmailAccountID != nil); xerr != nil {
+		return nil, false, xerr
 	}
 
 	// A reauth adds no mailbox, so an org over its inbox cap can still fix one.

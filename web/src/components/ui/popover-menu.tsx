@@ -44,6 +44,7 @@ import React, {
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { cn } from "@/lib/utils";
+import useClickOutside from "@/hooks/useClickOutside";
 
 interface MenuCtx {
     id: string;
@@ -217,6 +218,9 @@ export function PopoverMenuContent({
             observer?.disconnect();
         };
     }, [open, side, align, sideOffset, triggerRef, anchorPoint, setOpen]);
+
+    // A press outside, Escape (innermost first), or another menu opening closes it.
+    useClickOutside(open, () => setOpen(false), [triggerRef, ref]);
 
     // Keyboard: focus lands on the panel (never over an autofocused input), and
     // closing hands it back to whatever held it before, if it is still there.

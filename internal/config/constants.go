@@ -194,6 +194,15 @@ const (
 	// rather than walk a million-row list.
 	CampaignPlacementCandidates = 200
 
+	// CampaignRoutedCandidateChunk is how many ordered candidate leads one
+	// FindRoutedPairs pass hydrates and routes at a time. The ordered candidate
+	// ids are enumerated cheaply up front; the expensive per-lead history and
+	// classification joins then run one chunk at a time, so a pass that fills
+	// its batch early stops instead of paying for the campaign's whole audience.
+	// Kept comfortably above CampaignPlacementCandidates so the common case
+	// (plenty sendable) finishes in a single chunk.
+	CampaignRoutedCandidateChunk = 1000
+
 	// WarmupReputationLedgerDays is how long the standing of a removed mailbox
 	// is held against its address, counted from the later of its removal and
 	// the end of its block. Long enough that removing and re-adding a mailbox
@@ -397,6 +406,16 @@ const (
 	UniboxLimitMax     = 100
 	UniboxLimitDefault = 50
 
+	// Account-status list paging (GET /analytics/accounts). The default and
+	// ceiling match the 1000-row cap this endpoint used to apply silently, so a
+	// caller with no more mailboxes than that sees the same page; beyond it the
+	// overflow is reachable through next_cursor instead of being dropped.
+	AccountStatusLimitDefault = 1000
+	AccountStatusLimitMax     = 1000
+	// AccountStatusMaxIDs bounds an email_ids request, so a page view asks only
+	// for the mailboxes it shows.
+	AccountStatusMaxIDs = 200
+
 	// ContactMailHostBatchSize is how many contacts one provider sweep pass
 	// reads; lookups are per distinct domain, so a pass costs far fewer.
 	ContactMailHostBatchSize = 2000
@@ -545,10 +564,11 @@ const (
 	PoolLinkPollIntervalSeconds  = 3
 	PoolLinkPlanID               = "00000000-0000-0000-0000-000000000002"
 	PoolLinkPlanPriceUSD         = 15
-	WarmupPoolTierFallbackFloor  = 25 // below this many recipients outside its workspace (or its warmup max, if higher), a premium sender borrows that many proven free mailboxes
-	WarmupPoolBorrowSeasonedDays = 14 // a borrowed free mailbox this long in the pool ranks ahead of a newer one
-	WarmupPoolFallbackMinAgeDays = 3  // a free mailbox must have been a pool member this long before premium may borrow it, or write back to one
-	WarmupPoolReturnVisitDays    = 14 // a proven free mailbox may write back to a paying mailbox that wrote to it this recently
+	PoolLinkRedirectLimit        = 200 // root redirects Warmbly Cloud serves for one linked instance
+	WarmupPoolTierFallbackFloor  = 25  // below this many recipients outside its workspace (or its warmup max, if higher), a premium sender borrows that many proven free mailboxes
+	WarmupPoolBorrowSeasonedDays = 14  // a borrowed free mailbox this long in the pool ranks ahead of a newer one
+	WarmupPoolFallbackMinAgeDays = 3   // a free mailbox must have been a pool member this long before premium may borrow it, or write back to one
+	WarmupPoolReturnVisitDays    = 14  // a proven free mailbox may write back to a paying mailbox that wrote to it this recently
 	// What one inbox may receive from the pool in a day: WarmupInboundDailyMultiple
 	// times its own daily sends, never below the floor (a recipient-only mailbox
 	// sends nothing) and never above the ceiling. A recipient at its cap is left

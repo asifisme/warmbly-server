@@ -74,6 +74,11 @@ func Run(
 	// Generic per-automation inbound trigger: the token in the path is the
 	// credential, resolving to one automation that runs with the JSON body.
 	r.POST("/api/v1/integrations/inbound/automation/:token", h.InboundAutomation)
+	// Slack app request URLs. No session: every request is verified against
+	// SLACK_SIGNING_SECRET before its body is parsed.
+	r.POST("/api/v1/integrations/slack/events", h.SlackEvents)
+	r.POST("/api/v1/integrations/slack/interactivity", h.SlackInteractivity)
+	r.POST("/api/v1/integrations/slack/commands", h.SlackCommands)
 
 	// OAuth 2.1 authorization-server discovery (RFC 8414): public + unversioned.
 	r.GET("/.well-known/oauth-authorization-server", h.OAuthServerMetadata)
@@ -162,7 +167,7 @@ func Run(
 	{
 		internal.GET("/dek/:orgID", h.InternalGetDEK)
 		internal.PUT("/dek/:orgID", h.InternalPutDEK)
-		internal.DELETE("/dek/:orgID", h.InternalDeleteDEK)
+		// No DELETE: a lost DEK is unrecoverable, so nothing holding this token may remove one.
 
 		// Click-link tickets: the tracking service resolves /c/<id> redirects
 		// here instead of touching Postgres (read-only, heavily cached there).
@@ -484,7 +489,7 @@ func Run(
 		// CombinedAuthMiddleware sets the same context keys for both; the usage
 		// middleware records one log row per API-key request (JWT skipped).
 		protected := base.Group("")
-		protected.Use(m.CombinedAuthMiddleware(), m.APIKeyUsageMiddleware(), m.IdempotencyMiddleware())
+		protected.Use(m.CombinedAuthMiddleware(), m.APIKeyUsageMiddleware(), m.IdempotencyMiddleware(), h.ForgetUniboxOverviewOnWrite)
 		{
 			emails := protected.Group("/emails")
 			emails.Use(m.RateLimitMiddleware(models.RateLimitWrite))
@@ -624,12 +629,30 @@ func Run(
 
 			// Integration OAuth handshake is JWT-only — it writes user-encrypted
 			// provider tokens via the SPA popup flow, same as mailbox onboarding.
+			// Connecting is a settings change, the same bar as POST /integrations/connections.
 			integrationsOAuth := jwtOnly.Group("/integrations/oauth")
-			integrationsOAuth.Use(m.RequireOrganization(), m.RateLimitMiddleware(models.RateLimitWrite))
+			integrationsOAuth.Use(m.RequireOrganization(), m.RequirePermission(models.PermManageSettings), m.RateLimitMiddleware(models.RateLimitWrite))
 			{
 				integrationsOAuth.POST("/start", h.StartIntegrationOAuth)
 				integrationsOAuth.POST("/finish", h.FinishIntegrationOAuth)
 				integrationsOAuth.POST("/reauth/:id", h.ReauthIntegration)
+			}
+
+			// Slack panel. Link preview and confirm carry no org: the link code
+			// names it, and confirming requires membership of that org.
+			slackPanel := jwtOnly.Group("/integrations/slack")
+			slackPanel.Use(m.RateLimitMiddleware(models.RateLimitWrite))
+			{
+				slackRead := m.RequireAnyAccess(models.APIPermIntegrations, models.PermManageSettings, models.PermUseIntegrations)
+				slackWrite := m.RequireAccess(models.PermManageSettings, models.APIPermIntegrations)
+				slackPanel.GET("/status", m.RequireOrganization(), h.GetSlackStatus)
+				slackPanel.GET("/channels", m.RequireOrganization(), slackRead, h.ListSlackChannels)
+				slackPanel.PUT("/settings", m.RequireOrganization(), slackWrite, h.UpdateSlackSettings)
+				slackPanel.GET("/link/:code", h.PreviewSlackLink)
+				slackPanel.POST("/link", h.ConfirmSlackLink)
+				slackPanel.PATCH("/link", m.RequireOrganization(), h.UpdateMySlackLink)
+				slackPanel.DELETE("/link", m.RequireOrganization(), h.DeleteMySlackLink)
+				slackPanel.DELETE("/links/:id", m.RequireOrganization(), slackWrite, h.RemoveSlackLink)
 			}
 
 			// Template preview/validation (no campaign id; can't be a static sibling
@@ -1129,6 +1152,8 @@ func Run(
 				integrations.PUT("/connections/:id/field-mappings", write, h.ReplaceConnectionFieldMappings)
 				integrations.GET("/connections/:id/runs", read, h.ListConnectionSyncRuns)
 				integrations.GET("/connections/:id/webhook-secret", write, h.GetConnectionWebhookSecret)
+				integrations.PUT("/connections/:id/signing-key", write, h.SetConnectionSigningKey)
+				integrations.POST("/connections/:id/rotate-inbound-url", write, h.RotateConnectionInboundURL)
 				integrations.POST("/connections/:id/test", write, h.TestConnection)
 				integrations.POST("/connections/:id/push", operate, h.PushContactsToIntegration)
 				integrations.GET("/bookings", read, h.ListMeetingBookings)
@@ -1543,6 +1568,12 @@ func Run(
 				poolLinkInstance.POST("/placement/tests", h.PoolLinkStartPlacement)
 				poolLinkInstance.GET("/placement/tests/:testId", h.PoolLinkPlacementVerdicts)
 				poolLinkInstance.POST("/placement/tests/:testId/sends", h.PoolLinkPlacementSends)
+				// Root redirects served here for the linked instance.
+				poolLinkInstance.GET("/redirects", h.PoolLinkListRedirects)
+				poolLinkInstance.GET("/redirects/:domain", h.PoolLinkGetRedirect)
+				poolLinkInstance.PUT("/redirects/:domain", h.PoolLinkPutRedirect)
+				poolLinkInstance.POST("/redirects/:domain/verify", h.PoolLinkVerifyRedirect)
+				poolLinkInstance.DELETE("/redirects/:domain", h.PoolLinkDeleteRedirect)
 			}
 
 			// Self-hosted side: Settings > Warmbly Cloud.
