@@ -45,6 +45,10 @@ Google's scopes nest, so `gmail.modify` already covers reading, sending, composi
 
 A consent screen lets you untick individual permissions. Warmbly checks what was actually granted and refuses a half-granted mailbox at connect time, naming the missing permission, rather than storing one that looks connected and fails on its first send days later.
 
+#### When Microsoft asks for admin approval
+
+Many Microsoft 365 organizations let only an administrator approve a new app, and then Microsoft answers the sign-in with **Need admin approval** instead of its consent screen. Mailboxes bought from an inbox provider are usually in such an organization, run by the provider. Nothing you choose in Warmbly changes that, but one approval fixes it for everyone: after a first try, the **Sign in one mailbox** panel shows an approval link. Send it to the organization's administrator (for a provider's mailboxes, the provider). It approves exactly the four permissions above for the whole organization, and afterwards every mailbox in it signs in on its own, with no administrator involved. On a self-hosted instance, the operator verifying the publisher of their Microsoft app removes this step for most organizations; see [Outlook and Microsoft 365](/development/deployment-guide/#outlook-and-microsoft-365).
+
 **IMAP / SMTP** needs host, port, username, and password for each direction:
 
 ```text
@@ -62,13 +66,15 @@ Each side also has a **security** setting, which is what decides how the connect
 
 If port 465 never answers (many hosting networks block outbound 465 while 587 stays open), the worker dials 587 with STARTTLS on the same server alongside it and uses whichever connects first. A connect that succeeds that way is stored with port 587 and STARTTLS, and the mailbox settings show that. A refusal or a name that does not resolve is an answer from the network, not silence: one that arrives before 587 has been dialled is reported as is, and the fallback is only for a port that never answers.
 
+A server that accepts submission only on 465 has no 587 to fall back to. When the worker's own network is the one blocking 465 (it learns that from several servers leaving 465 silent while answering on 587), the mailbox's error says so: the block is on the sending side, your server needs no change, and sending resumes on its own once the port is open. Turning on submission on 587 with STARTTLS at your server gets the mailbox sending sooner.
+
 The form picks TLS or STARTTLS from the port as you type, so standard setups need no thought. It never picks **None**, on any port: dropping encryption is always something you ask for. Change the mode yourself when your server is unusual: any port from 1 to 65535 works, so a submission relay on `2525` or IMAP on a custom port is fine as long as the security setting matches what the server actually speaks.
 
 Encryption is not optional over a network. Warmbly will not send credentials over an unencrypted connection to anything but this machine, which is why **None** only appears once the host is `localhost`, an address in `127.0.0.0/8`, or `::1`, and only on a [self-hosted instance](/development/install/). See [local mail relays](#local-mail-relays-proton-bridge) below.
 
 If a mailbox fails to connect with a server-unreachable error and the host and port are definitely right, the security setting is the first thing to check. A server expecting STARTTLS looks unreachable to a client attempting implicit TLS, and vice versa.
 
-The error says which step failed and what the server or the network answered, so the two cases read differently: `dial smtp.example.com:465: connect: connection refused` never reached the server, `dial smtp.example.com:465: tls: first record does not look like a TLS handshake` reached a server that does not speak implicit TLS on that port, and `mail from: 451 4.7.1 try again later` is the server deferring a message. A connection that is refused or times out on `465` while `587` works is a network between the sender and the server that does not allow implicit TLS submission; switching that mailbox to `587` with STARTTLS is the fix.
+The error says which step failed and what the server or the network answered, so the two cases read differently: `dial smtp.example.com:465: connect: connection refused` never reached the server, `dial smtp.example.com:465: tls: first record does not look like a TLS handshake` reached a server that does not speak implicit TLS on that port, and `mail from: 451 4.7.1 try again later` is the server deferring a message. A connection that is refused or times out on `465` while `587` works is a network between the sender and the server that does not allow implicit TLS submission; switching that mailbox to `587` with STARTTLS is the fix. An error that starts with "Warmbly's sending network currently blocks outbound port 465" is that block on the worker's side, not a fault on your server.
 
 When a mail server goes down or stops answering, the mailbox is not deactivated. Warmbly says so once in the drawer, retries on a widening interval, and picks up where it left off when the server comes back. Nothing that arrived meanwhile is skipped, and the error clears itself on the first pass that reaches the server again.
 
@@ -236,13 +242,34 @@ SMTP mailboxes get a **Keep a copy of sent mail** toggle, on by default. SMTP su
 
 Turn it off when your provider already saves its own copy of anything submitted over SMTP, which Gmail, Fastmail and Zoho do, or the folder ends up with two of every message. Gmail and Outlook mailboxes connected with OAuth never show the toggle: their APIs file the copy themselves. Warmup mail is never filed, since it would bury your real sent mail.
 
-The same tab sets the **display name**, **reply-to** (empty uses the mailbox address), **signature** in plain text and HTML, and **tags** for grouping. Tags belong to the workspace: one anybody creates is there for every teammate, on every mailbox. A new display name is on the From header of the next message the mailbox sends, campaign, reply or warmup alike; nothing needs to be reconnected.
+### Filing in the mailbox
+
+**Mirror Archive and Delete** is on by default for every mailbox. With it on, Archive, Delete and Move to inbox in the [unibox](/guides/unibox/#filing-in-the-mailbox-too) move the message in the mailbox too: Gmail gains or loses its Inbox label or goes to Trash, Outlook moves it to Archive, Deleted Items or Inbox, and an IMAP mailbox moves it between its Archive, Trash and INBOX folders. Delete always lands in the mailbox's own trash, never a permanent delete. Turn it off to keep filing inside Warmbly for this mailbox; the conversation still leaves the unibox view you filed it from, and the mailbox keeps it where it was.
+
+The same tab sets the **display name**, **reply-to** (empty uses the mailbox address, see [a shared reply inbox](#a-shared-reply-inbox)), **signature** in plain text and HTML, and **tags** for grouping. Tags belong to the workspace: one anybody creates is there for every teammate, on every mailbox. A new display name is on the From header of the next message the mailbox sends, campaign, reply or warmup alike; nothing needs to be reconnected.
 
 The HTML signature is placed in a block of its own one line below the body, so it arrives without the stack of blank lines above it that Apple Mail and Outlook used to show. Put any extra spacing you want inside the signature itself. On a body laid out in HTML it goes inside the container the email was built in, so it lines up with the copy it signs off rather than sitting under it at the left edge of the window (the same placement as the [opt-out line](/guides/unsubscribe/#where-it-appears)). The plain-text signature follows the body after a single blank line.
 
 The signature editor has four views. **HTML** is the visual surface with bold, italic, underline, links and images. The `</>` button next to it swaps that for the raw markup, which is sent exactly as written, so a table-based signature from another tool can be pasted in whole. **Preview** renders it the way a mail client will, in its own frame. **Plain** holds the plain-text version, generated from the HTML while **Sync** is on.
 
 A signature carrying a `<style>` block, a whole HTML document, or an event handler is always edited as markup and the visual toggle is greyed out. The visual surface works by putting the markup into the page, and a signature is workspace data your teammates also see, so that markup is never given a live element to run in. Preview is how you look at it. Any `<style>` block in a signature is inlined onto the elements it matches when the email sends, the same as a campaign body.
+
+### A shared reply inbox
+
+**Reply-to** puts a `Reply-To` header on the mailbox's campaign mail, unibox replies, test sends and placement tests, so answers land in another address instead of the one that sent them. Leave it empty, or set it to the mailbox's own address, and no header is added. Warmup mail never carries it: the warmup exchange reads its replies back in the mailbox that sent them.
+
+Point several sending mailboxes at one mailbox you have connected here, one that only receives, and every reply collects in one place while Warmbly keeps track of who sent what:
+
+- the reply counts for the campaign. It stops the sequence when **Stop on reply** is on, runs the reply branch of the email it answers, and is credited to the mailbox that sent that email, in campaign stats and in the dashboard's recent activity ("Reply from lead@acme.com to alex@yourco.com")
+- a reply from someone copied on the lead's emails counts for the lead, as it would at the sending mailbox
+- in the unibox the message shows which mailbox's email it answers, and **Reply** starts from that mailbox, as does a reply the [inbox agent](/guides/inbox-agent/) drafts, so the contact keeps hearing from the address they wrote to. Your answer carries the same reply-to, so their next reply comes back to the shared inbox too. See [choosing the sending mailbox](/guides/unibox/#choosing-the-sending-mailbox)
+- the `campaign.reply_received` webhook names both: `email_account_id` is the mailbox the reply landed in and `sender_email_account_id` the one that sent the email it answers
+
+Replies are only tracked where Warmbly can read them. A reply-to naming an address that is not a mailbox in this workspace still routes replies there, but none of it is counted, and the field says so. The reply inbox has to be in the same workspace as the mailboxes pointing at it.
+
+Keep the reply-to on the sending domain where you can. A `Reply-To` on a different domain from the `From` is a mild spam signal to some filters, and one on the same domain is not.
+
+Reply-to only applies to mail sent after it is set: an email sent before carried no header, so an answer to it still arrives at the mailbox that sent it.
 
 ### Sending identity
 
@@ -332,7 +359,11 @@ A mailbox marked as a [placement seed inbox](/guides/placement-tests/#your-own-s
 
 ## Pausing and disconnecting
 
-A mailbox can be set inactive (`PATCH /emails/{id}` with `status`) when you want it to stop without losing its settings, its history, or its place in the fleet.
+A mailbox can be switched off when you want it to stop without losing its settings, its history, or its place in the fleet. Use **Switch off** on its row's **More** menu, the **Mailbox on** switch on its **Settings** tab, or the selection bar for several at once. Over the API it is `PATCH /emails/{id}` with `status` set to `inactive`, and `active` turns it back on.
+
+Off means the whole mailbox: it sends no campaign mail, sends and receives no warmup, and syncs nothing, whatever its warmup setting says. The list shows it as **Off**, and its warmup column reads **Stopped** when warmup is still set to run. To stop cold sending while the mailbox keeps warming, which is what a mailbox recovering from spam placement needs, use [Hold from campaigns](#holding-a-mailbox-yourself) instead.
+
+A switched-off mailbox is turned back on the same ways: **Switch back on** on the row's **More** menu or its warmup menu, the **Switch back on** button at the top of its Overview tab, the **Mailbox on** switch, or **Switch on** in the selection bar. Warmup that was set to run starts again straight away. To bring a mailbox back for warmup only, turn on **Hold from campaigns** on its Overview tab before switching it on, so campaigns cannot pick it in between. A mailbox whose provider access was revoked shows **Reconnect** rather than **Off**, and is turned back on by reconnecting it.
 
 Switching it off takes effect immediately: the machine syncing it is told to drop it, so it stops importing mail and stops being picked for campaign sends and warmup within seconds rather than at that machine's next restart. Warmup pool membership is dropped, and any warmup chain it had winds down on its next step. A campaign email already handed over is answered as a failure and the step is retried later on a mailbox that is still active, so nobody receives it twice and no lead is stranded.
 
@@ -420,7 +451,7 @@ The Accounts list groups mailboxes as **Healthy** (sending normally), **Warming*
 
 The **Inbox** column is the share of the mailbox's warmup mail that reached partners' inboxes at Google, Microsoft and Yahoo over the last seven days (smaller mail hosts run their own filters and are never counted), and the score is capped at it, so a mailbox landing some mail in spam no longer reads `100`. Click it, or open the drawer's **Deliverability** tab, for the day-by-day history and the split per provider. See [seeing where warmup lands](/guides/warmup/#seeing-where-warmup-lands).
 
-The detail drawer runs a live `SPF`, `DKIM`, and `DMARC` check on your sending domain. Confirm it is green before sending; major providers require alignment for bulk and cold mail. A domain that stays Failing eventually stops cold sending and warmup from every mailbox on it, so fix the records and press **Re-check** to clear it straight away. DKIM reads **Not verified** rather than Missing when no key answers, because its selector is not something DNS can be asked for; that never gates sending. See [Deliverability](/guides/deliverability/) for the grace period and exactly what is stopped.
+The detail drawer runs a live `SPF`, `DKIM`, and `DMARC` check on your sending domain. Confirm it is green before sending; major providers require alignment for bulk and cold mail. A domain that stays Failing eventually stops cold sending and warmup from every mailbox on it, so fix the records and press **Check** to clear it straight away; for anyone who can manage mailboxes, the check records its verdict. A lookup DNS did not answer shows the records as Not verified and is never held against the domain. DKIM reads **Not verified** rather than Missing when no key answers, because its selector is not something DNS can be asked for; that never gates sending. See [Deliverability](/guides/deliverability/) for the grace period and exactly what is stopped.
 
 Underneath, health moves through `healthy`, `watch`, `throttled`, `quarantined`, and `blocked`. These feed warmup pool selection, which only picks healthy mailboxes as partners, so an unhealthy one can be lowered in volume, removed from the pool, or blocked entirely. A blocked mailbox shows the reason and any appeal option on the Warmup tab, and must requalify on a fresh probation sample rather than waiting out the clock.
 

@@ -522,7 +522,9 @@ Auth: **Scope** `READ_EMAILS` · **Org permission** `view_campaigns`
 
 `dmarc_inherited` is `true` when the sending domain has no DMARC record of its own and is covered by its organizational domain's policy, which is how a dedicated sending subdomain normally works; `dmarc_domain` then names the domain the record was read from, and `dmarc_policy` reports its `sp=` value when it publishes one. SPF never inherits, so it must be published on the exact sending domain.
 
-`lookup_error` is `true` when DNS could not answer, and `reserved` is `true` for a special-use domain (`.test`, `.invalid`, `.localhost`, `.example`, `.local`) that cannot resolve by definition. Either one means the domain is unevaluatable, so it is recorded as `unknown` rather than `failing`.
+A record the instance's resolver does not return is confirmed with the domain's own authoritative nameservers before `spf_found` or `dmarc_found` reads `false`, so a stale cached miss or a resolver that drops `TXT` answers does not report a configured domain as missing.
+
+`lookup_error` is `true` when DNS could not answer, from the instance's resolver or the domain's nameservers, and `reserved` is `true` for a special-use domain (`.test`, `.invalid`, `.localhost`, `.example`, `.local`) that cannot resolve by definition. Either one means the domain is unevaluatable, so it is recorded as `unknown` rather than `failing`.
 
 ## Record a domain authentication check
 
@@ -744,6 +746,8 @@ Response:
   "state": "n0nc3-opaque-state"
 }
 ```
+
+For `outlook` the response also carries `admin_consent_url`: Microsoft's admin consent page for the same delegated permissions, tenant-wide. Pass it to the organization's administrator when Microsoft answers the sign-in with **Need admin approval**; once they approve, every mailbox in the organization can sign in. It returns to the API's callback page, which shows the outcome and hands nothing back to an opener.
 
 After the user approves, the provider redirects to the API's callback page, which hands `code` and `state` back to the client: a web opener receives them via `postMessage`, and when there is no opener (a native in-app browser session) the page redirects to `warmbly://email-oauth?provider=...&code=...&state=...&error=...` instead. Either way, the client then calls Finish OAuth.
 

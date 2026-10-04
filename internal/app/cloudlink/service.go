@@ -98,10 +98,22 @@ type Service interface {
 	ListMailboxes(ctx context.Context, orgID uuid.UUID) ([]models.CloudLinkMailboxRow, *errx.Error)
 	Enroll(ctx context.Context, orgID, accountID uuid.UUID) (*models.CloudLinkMailboxRow, *errx.Error)
 	Unenroll(ctx context.Context, orgID, accountID uuid.UUID) *errx.Error
+	// RefreshCredentials re-sends an enrolled mailbox's credential and ramp after they change here.
+	RefreshCredentials(ctx context.Context, orgID, accountID uuid.UUID) *errx.Error
 	// RevokeForDelete releases the mailbox on the cloud, credential and link
 	// alike, without ever calling back into the email service.
 	RevokeForDelete(ctx context.Context, orgID, accountID uuid.UUID) *errx.Error
 	SetLifecycle(ctx context.Context, orgID, accountID uuid.UUID, action string) (*models.CloudLinkMailboxRow, *errx.Error)
+
+	// Root redirects Warmbly Cloud serves for this instance (redirects.go).
+	RedirectOffer(ctx context.Context) (*models.PoolLinkRedirectOffer, bool)
+	ListRedirects(ctx context.Context) ([]models.DomainRedirect, *errx.Error)
+	PutRedirect(ctx context.Context, domain string, in models.DomainRedirectRequest) (*models.DomainRedirect, *errx.Error)
+	GetRedirect(ctx context.Context, domain string) (*models.DomainRedirect, *errx.Error)
+	VerifyRedirect(ctx context.Context, domain string) (*models.DomainRedirect, *errx.Error)
+	DeleteRedirect(ctx context.Context, domain string) *errx.Error
+	// OnDisconnect runs after the link ends, for state that only held while linked.
+	OnDisconnect(fn func(context.Context))
 
 	// Cloud-managed mailboxes: consent through the cloud, tokens brokered from it (managed.go).
 	StartOAuth(ctx context.Context, orgID, userID uuid.UUID, provider models.InboxProvider) (*models.CloudLinkOAuthStart, *errx.Error)
@@ -144,6 +156,11 @@ type service struct {
 	pending  *PendingConnect
 	sessions map[string]oauthSession
 	tokens   map[uuid.UUID]cachedToken
+	offer    cachedOffer
+	// offerFetch lets one caller ask Cloud for the offer while the others wait for its answer.
+	offerFetch sync.Mutex
+
+	disconnected []func(context.Context)
 }
 
 func NewService(repo repository.CloudLinkRepository, emails repository.EmailRepository, emailSvc email.EmailService) Service {
@@ -184,6 +201,7 @@ func (s *service) Status(ctx context.Context) (*models.CloudLinkStatus, *errx.Er
 	}
 	st.Reachable = true
 	st.Info = &info
+	s.rememberOffer(info.Redirects)
 	_ = s.repo.SetSyncResult(ctx, time.Now(), "")
 	return st, nil
 }
@@ -270,6 +288,7 @@ func (s *service) PollConnect(ctx context.Context, userID uuid.UUID) (*ConnectPo
 		return nil, errx.InternalError()
 	}
 	s.clearPending(p)
+	s.forgetOffer()
 	var info models.PoolLinkInstanceInfo
 	out := &ConnectPollResult{Status: models.PoolLinkCodeApproved, Link: l}
 	if xerr := s.clientFor(l).do(ctx, http.MethodGet, "/instance", nil, &info); xerr == nil {
@@ -337,6 +356,10 @@ func (s *service) Disconnect(ctx context.Context) *errx.Error {
 	for _, m := range released {
 		s.syncLocalPool(ctx, m.EmailAccountID)
 		s.carryStanding(ctx, m)
+	}
+	s.forgetOffer()
+	for _, fn := range s.disconnected {
+		fn(ctx)
 	}
 	return nil
 }
@@ -467,7 +490,7 @@ func (s *service) Enroll(ctx context.Context, orgID, accountID uuid.UUID) (*mode
 		Provider: models.InboxProvider(acc.Provider),
 		Warmup: models.PoolLinkWarmupSettings{
 			Base: acc.WarmupBase, Max: acc.WarmupMax, Increase: acc.WarmupIncrease, ReplyRate: acc.WarmupReplyRate,
-			StartTime: acc.WarmupStartTime, EndTime: acc.WarmupEndTime, Days: acc.WarmupDays, Timezone: acc.ClockTimezone(),
+			StartTime: models.ClockHHMM(acc.WarmupStartTime), EndTime: models.ClockHHMM(acc.WarmupEndTime), Days: acc.WarmupDays, Timezone: acc.ClockTimezone(),
 		},
 	}
 	switch req.Provider {
@@ -498,6 +521,20 @@ func (s *service) Enroll(ctx context.Context, orgID, accountID uuid.UUID) (*mode
 	s.syncLocalPool(ctx, acc.ID)
 	s.recordStanding(ctx, acc.ID, state.Health, true)
 	return s.row(ctx, orgID, accountID)
+}
+
+func (s *service) RefreshCredentials(ctx context.Context, orgID, accountID uuid.UUID) *errx.Error {
+	m, err := s.repo.GetByAccount(ctx, accountID)
+	if err != nil {
+		return errx.InternalError()
+	}
+	// A managed mailbox's sign-in lives on the cloud; nothing here to hand over.
+	if m == nil || m.Managed {
+		return nil
+	}
+	// Enrolling again is how the cloud takes a new credential: it updates the mailbox it already holds.
+	_, xerr := s.Enroll(ctx, orgID, accountID)
+	return xerr
 }
 
 func (s *service) Unenroll(ctx context.Context, orgID, accountID uuid.UUID) *errx.Error {

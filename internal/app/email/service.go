@@ -83,7 +83,9 @@ type EmailService interface {
 	// a new one, so the handler can audit and answer accordingly.
 	// loginHint preselects an address in the provider's picker; "" for none.
 	OAuthStart(ctx context.Context, userID string, orgID *uuid.UUID, provider models.InboxProvider, loginHint string) (*models.EmailOnboardingStartResponse, *errx.Error)
-	OAuthFinish(ctx context.Context, userID, code, state string) (*models.Email, bool, *errx.Error)
+	// authorize runs before the code is exchanged, against the organization the
+	// state names, so a caller removed mid-flow cannot finish it.
+	OAuthFinish(ctx context.Context, userID, code, state string, authorize FinishAuthorizer) (*models.Email, bool, *errx.Error)
 	OnboardSMTPIMAP(ctx context.Context, userID string, orgID *uuid.UUID, data *models.NewSMTPIMAPAccount) (*models.Email, *errx.Error)
 	// OnboardSMTPIMAPBulk connects many SMTP/IMAP mailboxes in one call and
 	// answers per row, so one bad password never fails the file. Rows past the
@@ -124,6 +126,8 @@ type EmailService interface {
 	WireCloudLink(repo repository.CloudLinkRepository)
 	// WireCloudUnenroll attaches cloud credential revocation to mailbox deletion.
 	WireCloudUnenroll(u CloudUnenroller)
+	// WireCloudCredentials hands Warmbly Cloud a mailbox's credential after it changes here.
+	WireCloudCredentials(r CloudCredentialRefresher)
 	// ConnectDelegated stores a Gmail or Outlook mailbox reached through an
 	// administrator's grant and loads it; tokens are minted per use.
 	ConnectDelegated(ctx context.Context, userID string, orgID *uuid.UUID, data models.NewDelegatedAccount) (*models.Email, *errx.Error)
@@ -190,6 +194,8 @@ type emailService struct {
 	cloudLink repository.CloudLinkRepository
 	// cloudUnenroll revokes a Warmbly Cloud enrollment on delete.
 	cloudUnenroll CloudUnenroller
+	// cloudCredentials re-sends a changed credential to Warmbly Cloud.
+	cloudCredentials CloudCredentialRefresher
 	// webhookService is optional. When non-nil, account lifecycle events
 	// (email_account.connected, email_account.removed) are dispatched to
 	// subscribed customer webhooks.
@@ -293,6 +299,15 @@ type CloudUnenroller interface {
 // WireCloudUnenroll attaches remote revocation after service construction.
 func (s *emailService) WireCloudUnenroll(u CloudUnenroller) {
 	s.cloudUnenroll = u
+}
+
+// CloudCredentialRefresher re-sends an enrolled mailbox to Warmbly Cloud, which holds its own copy of the credential.
+type CloudCredentialRefresher interface {
+	RefreshCredentials(ctx context.Context, orgID, accountID uuid.UUID) *errx.Error
+}
+
+func (s *emailService) WireCloudCredentials(r CloudCredentialRefresher) {
+	s.cloudCredentials = r
 }
 
 func (s *emailService) WirePoolLink(repo repository.PoolLinkRepository) {
@@ -499,3 +514,7 @@ func (s *emailService) UpdateSyncSettings(ctx context.Context, orgID, emailID st
 	s.loadAccountBestEffort(ctx, acc.ID)
 	return folders, nil
 }
+
+// FinishAuthorizer refuses an OAuth finish when the caller no longer holds the
+// rights to connect (or, with reauth, to renew) a mailbox in orgID.
+type FinishAuthorizer func(ctx context.Context, orgID uuid.UUID, reauth bool) *errx.Error

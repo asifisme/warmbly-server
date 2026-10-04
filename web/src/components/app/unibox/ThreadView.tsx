@@ -87,6 +87,7 @@ function toUniboxEmail(m: UniboxThreadMessage): UniboxEmail {
     is_seen: m.seen,
     thread_id: m.thread_id,
     account_id: m.email_id,
+    answers_mailbox_id: m.answers_mailbox_id,
   };
 }
 
@@ -216,6 +217,7 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
       bcc: pendingRestore.bcc,
       subject: pendingRestore.subject,
       body: pendingRestore.body,
+      ...(pendingRestore.bodyHtml ? { body_html: pendingRestore.bodyHtml } : {}),
       email_account_id: pendingRestore.emailAccountId,
     });
   }, [pendingRestore, threadId, openReply]);
@@ -235,13 +237,17 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
   // is seen the id list is empty and this no-ops, so it self-terminates.
   const markSeen = useMarkSeen();
   const markSeenMutate = markSeen.mutate;
+  // The reader outlives a close by a render (the URL follows the store in an
+  // effect), and reading back the patch Mark as unread just wrote undoes it.
+  const selected = useAppStore((s) => s.selectedThreadId === threadId);
   React.useEffect(() => {
+    if (!selected) return;
     const unseenIds = (q.data?.data ?? [])
       .filter((m) => !m.seen)
       .map((m) => m.id);
     if (unseenIds.length === 0) return;
     markSeenMutate({ ids: unseenIds, threadIds: [threadId] });
-  }, [threadId, q.data, markSeenMutate]);
+  }, [selected, threadId, q.data, markSeenMutate]);
 
   // Header actions. Each one closes the thread: the effect above would
   // otherwise re-mark an "unread" thread as seen on the next refetch, and a
@@ -250,12 +256,13 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
   const setSelectedThreadId = useAppStore((s) => s.setSelectedThreadId);
   const threadIds = () => (q.data?.data ?? []).map((m) => m.id);
   const markUnread = () => {
-    markSeenMutate({ ids: threadIds(), seen: false, threadIds: [threadId] });
+    // By conversation: the server picks its newest received message.
+    markSeenMutate({ seen: false, threadIds: [threadId] });
     setSelectedThreadId(null);
   };
 
-  // Filing is store-side: the message keeps its place at the provider, and
-  // the sync knows not to undo this (migration 000146).
+  // Filing moves the message here first; the backend then moves it in the
+  // mailbox too, unless the mailbox turned that off.
   // The row leaves the list and the reader closes at once; the request runs
   // behind the toast, and a failure re-reads the list, which brings it back.
   // The copy, the undo and the cache handling are shared with the list row.
@@ -651,6 +658,11 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
             defaultExpanded={i === messages.length - 1 || !email.is_seen}
             outbound={
               !!mailboxEmail && bareEmail(email.from).toLowerCase() === mailboxEmail
+            }
+            answersMailbox={
+              email.answers_mailbox_id
+                ? accounts.find((a) => a.id === email.answers_mailbox_id)?.email
+                : undefined
             }
             onReply={() => openReply(email.id, "reply")}
             onForward={() => openReply(email.id, "forward")}

@@ -57,6 +57,9 @@ type IntegrationRepository interface {
 	GetConnectionByID(ctx context.Context, orgID, id uuid.UUID) (*models.IntegrationConnection, error)
 	GetConnectionSecrets(ctx context.Context, id uuid.UUID) (*ConnectionSecrets, error)
 	GetConnectionByInboundSecret(ctx context.Context, provider models.IntegrationProvider, secret string) (*models.IntegrationConnection, error)
+	// ListConnectionsByExternalAccount finds a provider's connections across
+	// orgs by the external account id (a Slack team id), oldest first.
+	ListConnectionsByExternalAccount(ctx context.Context, provider models.IntegrationProvider, externalID string) ([]models.IntegrationConnection, error)
 	DeleteConnection(ctx context.Context, orgID, id uuid.UUID) error
 	MarkConnectionSynced(ctx context.Context, id uuid.UUID, status models.IntegrationStatus, displayFields json.RawMessage, errMsg string) error
 	UpdateConnectionTokens(ctx context.Context, id uuid.UUID, accessEnc, refreshEnc string, expiresAt *time.Time, scopes []string) error
@@ -109,6 +112,11 @@ type IntegrationRepository interface {
 	ListFieldMappings(ctx context.Context, orgID, connID uuid.UUID) ([]models.IntegrationFieldMapping, error)
 	ReplaceConnectionFieldMappings(ctx context.Context, orgID, connID uuid.UUID, object string, mappings []models.IntegrationFieldMapping) error
 	UpdateConnectionConfig(ctx context.Context, orgID, connID uuid.UUID, configCapabilities []byte, syncDirection string) error
+	// SetInboundSigningConfig writes a Calendly/Cal.com connection's sealed
+	// config and records in display_fields whether deliveries must be signed.
+	SetInboundSigningConfig(ctx context.Context, orgID, connID uuid.UUID, configEncrypted []byte, signed bool) error
+	// SetInboundSecret replaces a Calendly/Cal.com connection's inbound URL secret.
+	SetInboundSecret(ctx context.Context, orgID, connID uuid.UUID, secret string) error
 
 	// Sync runs
 	CreateSyncRun(ctx context.Context, run *models.IntegrationSyncRun) error
@@ -306,6 +314,28 @@ func (r *integrationRepository) GetConnectionByInboundSecret(ctx context.Context
 		return nil, err
 	}
 	return &c, nil
+}
+
+func (r *integrationRepository) ListConnectionsByExternalAccount(ctx context.Context, provider models.IntegrationProvider, externalID string) ([]models.IntegrationConnection, error) {
+	out := []models.IntegrationConnection{}
+	if externalID == "" {
+		return out, nil
+	}
+	rows, err := r.db.Query(ctx, `SELECT `+connectionPublicCols+`
+		FROM integration_connections WHERE provider = $1 AND external_account_id = $2
+		ORDER BY created_at ASC, id ASC`, string(provider), externalID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var c models.IntegrationConnection
+		if err := scanConnectionInto(rows, &c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 func (r *integrationRepository) DeleteConnection(ctx context.Context, orgID, id uuid.UUID) error {
@@ -790,6 +820,41 @@ func (r *integrationRepository) UpdateConnectionConfig(ctx context.Context, orgI
 		WHERE organization_id = $3 AND id = $4`, configCapabilities, syncDirection, orgID, connID)
 	return err
 }
+
+func (r *integrationRepository) SetInboundSigningConfig(ctx context.Context, orgID, connID uuid.UUID, configEncrypted []byte, signed bool) error {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE integration_connections
+		SET config_encrypted = $3,
+		    display_fields = COALESCE(display_fields, '{}'::jsonb) || jsonb_build_object('inbound_signing', $4::boolean),
+		    updated_at = now()
+		WHERE organization_id = $1 AND id = $2 AND provider IN ('calendly', 'cal_com')`,
+		orgID, connID, nullIfEmptyBytes(configEncrypted), signed)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrInboundConnectionNotFound
+	}
+	return nil
+}
+
+func (r *integrationRepository) SetInboundSecret(ctx context.Context, orgID, connID uuid.UUID, secret string) error {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE integration_connections SET inbound_secret = $3, updated_at = now()
+		WHERE organization_id = $1 AND id = $2 AND provider IN ('calendly', 'cal_com')`,
+		orgID, connID, secret)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrInboundConnectionNotFound
+	}
+	return nil
+}
+
+// ErrInboundConnectionNotFound means no Calendly or Cal.com connection with
+// that id exists in the organization.
+var ErrInboundConnectionNotFound = errors.New("inbound connection not found")
 
 // MatchingDispatchTargets returns enabled subscriptions for an org+event whose
 // connection is usable, each hydrated with the connection's encrypted secrets.

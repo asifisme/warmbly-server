@@ -58,6 +58,8 @@ type UniboxService interface {
 
 	// Overview powers the scope rail + top metric strip in one call.
 	Overview(ctx context.Context, orgID, userID uuid.UUID) (*models.UniboxOverview, *errx.Error)
+	// ForgetOverview makes the next Overview for the organization compute afresh.
+	ForgetOverview(orgID uuid.UUID)
 
 	// Conversation labels. SetThreadLabels replaces a thread's full
 	// label set (idempotent); ListThreadLabels reads the current set.
@@ -88,7 +90,7 @@ type UniboxService interface {
 	StartBodyTextBackfill(ctx context.Context)
 
 	// WireProviderRelay attaches the worker bus, after which a read/unread
-	// change made here is carried out to the mailbox provider too.
+	// change or a filing made here is carried out to the mailbox provider too.
 	WireProviderRelay(p events.Publisher)
 }
 
@@ -98,10 +100,12 @@ type uniboxService struct {
 	tasksClient      tasksched.Scheduler
 	cache            *cache.Cache
 	blob             storage.Store
-	// publisher relays read/unread changes out to the mailbox providers.
-	// Optional: without it the unibox still works and only Warmbly's own copy
-	// of the read state changes.
+	// publisher relays read/unread changes and filings out to the mailbox
+	// providers. Optional: without it the unibox still works and only
+	// Warmbly's own copy changes.
 	publisher events.Publisher
+	// overview shares one overview computation per organization between concurrent readers.
+	overview *overviewCache
 }
 
 // WireProviderRelay attaches the bus the unibox relays read state through.
@@ -119,11 +123,13 @@ func NewService(
 	taskRepo repository.TaskRepository,
 	tasksClient tasksched.Scheduler,
 ) UniboxService {
-	return &uniboxService{
+	s := &uniboxService{
 		uniboxRepository: uniboxRepository,
 		taskRepo:         taskRepo,
 		tasksClient:      tasksClient,
 		cache:            cache,
 		blob:             blob,
 	}
+	s.overview = newOverviewCache(s.computeOverview)
+	return s
 }

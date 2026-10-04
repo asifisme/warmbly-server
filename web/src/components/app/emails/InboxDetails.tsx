@@ -40,8 +40,11 @@ import {
     HelpCircleIcon,
     RefreshCwIcon,
     TrashIcon,
+    PowerIcon,
+    PowerOffIcon,
     type LucideIcon,
 } from "lucide-react";
+import useMailboxSwitch from "@/components/app/emails/useMailboxSwitch";
 import toast from "react-hot-toast";
 
 import type Inbox from "@/lib/api/models/app/emails/Inbox";
@@ -98,6 +101,8 @@ import useSendingBehavior from "@/lib/api/hooks/app/emails/useSendingBehavior";
 import useSendingPlan from "@/lib/api/hooks/app/emails/useSendingPlan";
 import { minutesToClock, secondsToLabel } from "@/lib/api/models/app/emails/SendingBehavior";
 import TagSelector from "../popup/select/TagSelector";
+import { useAppStore } from "@/stores";
+import { repliesGoTo } from "@/lib/unibox/replyInbox";
 import TimeSelect from "@/components/ui/TimeSelect";
 import { DitherBarChart } from "@/components/ui/dither";
 import WeekdayBitmask from "../campaigns/schedule/WeekdayBitmask";
@@ -105,9 +110,11 @@ import { Loading } from "@/components/loader";
 import { NumberInput, TextInput } from "@/components/ui/field";
 import { clampWarmupRetentionDays } from "@/lib/warmupRetention";
 import { useConfirm } from "@/hooks/context/confirm";
+import { usePermission } from "@/hooks/usePermission";
 import { usePresenceResource } from "@/hooks/PresenceProvider";
 import ResourceViewers from "@/components/app/presence/ResourceViewers";
 import { cn } from "@/lib/utils";
+import WarmupSendFailureNote from "./WarmupSendFailureNote";
 
 /* ── small themed primitives ─────────────────────── */
 
@@ -392,7 +399,7 @@ export default function InboxDetails({
 const EDITABLE: (keyof Inbox)[] = [
     "name", "signature_html", "signature_plain", "signature_sync", "signature_code",
     "send_as_email",
-    "tags", "campaign_limit", "min_wait_time", "reply_to", "save_to_sent", "timezone",
+    "tags", "campaign_limit", "min_wait_time", "reply_to", "save_to_sent", "relay_folder_moves", "timezone",
     "warmup_base", "warmup_max", "warmup_increase", "warmup_reply_rate",
     "warmup_tag", "warmup_start_time", "warmup_end_time", "warmup_days",
     "warmup_placement", "warmup_folder", "warmup_retention_days",
@@ -471,7 +478,7 @@ function Detail({ mailbox, onClose, initialTab = "overview", canWarmup = true }:
                     </div>
                 </div>
                 <span className={cn("h-5 px-2 rounded-full border text-[10px] font-semibold uppercase tracking-wide inline-flex items-center shrink-0", statusTone(mailbox.status))}>
-                    {mailbox.status}
+                    {mailbox.status === "inactive" ? "Off" : mailbox.status}
                 </span>
                 <ResourceViewers resource={mailbox.id ? `mailbox:${mailbox.id}` : null} className="shrink-0" />
                 <button onClick={onClose} aria-label="Close" className="w-7 h-7 rounded-md flex items-center justify-center text-slate-400 hover:text-slate-900 hover:bg-slate-100 transition-colors shrink-0">
@@ -698,6 +705,7 @@ function OverviewTab({ status, loading, mailbox }: { status?: import("@/lib/api/
 
     return (
         <div className="divide-y divide-slate-200/60">
+            {mailbox.status === "inactive" && <SwitchedOffNotice mailbox={mailbox} />}
             {mailbox.provider === "gmail" && mailbox.auth_method !== "delegated" && <SigninRetiringNotice mailbox={mailbox} />}
             {/* Whatever the Advisor has on this mailbox, above the numbers that
                 produced it. This is where a row flag and a deep link both land. */}
@@ -1077,7 +1085,9 @@ function AuthRecordRow({ label, state, detail }: { label: string; state: AuthRec
 // The banner above the records, shown only when the stored state is "failing".
 // The gate is invisible otherwise, and an owner whose campaigns have stopped
 // needs to be told that here rather than inferring it from a paused campaign.
-function AuthGateNotice({ mailbox }: { mailbox: Inbox }) {
+// livePassing is a read-only check that passed: the records are fixed but the
+// stored verdict is not, so the banner says who can clear it.
+function AuthGateNotice({ mailbox, livePassing }: { mailbox: Inbox; livePassing: boolean }) {
     if (mailbox.auth_state !== "failing") return null;
 
     const since = mailbox.auth_failing_since ? new Date(mailbox.auth_failing_since) : null;
@@ -1087,8 +1097,10 @@ function AuthGateNotice({ mailbox }: { mailbox: Inbox }) {
             <div className="min-w-0 text-[11.5px] text-rose-900/90 leading-relaxed">
                 <span className="font-medium">This domain is failing authentication.</span>{" "}
                 Cold sending and warmup from this mailbox stop while it stays that way
-                {since ? `, failing since ${since.toLocaleDateString()}` : ""}. Add the missing DNS
-                records at your registrar, then re-check below to clear it straight away.
+                {since ? `, failing since ${since.toLocaleDateString()}` : ""}.{" "}
+                {livePassing
+                    ? "The records check out now; someone who can manage mailboxes can re-check to clear it."
+                    : "Add the missing DNS records at your registrar, then re-check below to clear it straight away."}
             </div>
         </div>
     );
@@ -1097,24 +1109,41 @@ function AuthGateNotice({ mailbox }: { mailbox: Inbox }) {
 function AuthCheckPanel({ mailbox }: { mailbox: Inbox }) {
     const emailId = mailbox.id;
     const [open, setOpen] = useState(false);
-    const check = useAuthCheck(emailId, open);
-    // Re-checking RECORDS the verdict, which is what lifts the send gate, so
-    // the button is a write and not a query refetch.
+    // A check by someone who can manage mailboxes RECORDS its verdict, which is
+    // what lifts the send gate. Showing a live result without recording it
+    // left a passing check under a "failing" banner that never cleared.
+    const canRecord = usePermission("MANAGE_EMAILS");
+    const check = useAuthCheck(emailId, open && !canRecord);
     const refresh = useRefreshAuthCheck(emailId);
     const data = refresh.data ?? check.data;
+    const error = canRecord ? refresh.error : check.error;
     const busy = check.isFetching || refresh.isPending;
+
+    const run = () => {
+        setOpen(true);
+        if (!canRecord) {
+            if (open) void check.refetch();
+            return;
+        }
+        refresh.mutate();
+    };
 
     // The verdict follows what the check can actually prove. SPF and DMARC are
     // discoverable, so a miss there is a real miss; DKIM is not, so a domain
     // with both of those in place is aligned as far as anyone can tell, and
-    // saying "needs attention" over an unverifiable DKIM is a false alarm.
+    // saying "needs attention" over an unverifiable DKIM is a false alarm. A
+    // lookup DNS did not answer proves nothing either way.
+    const unanswered = !!data?.lookup_error;
     const verdict = !data
         ? null
-        : data.all_aligned
-          ? { ok: true, tone: "text-emerald-700", title: "Authentication aligned" }
-          : data.spf_found && data.dmarc_found
-            ? { ok: true, tone: "text-emerald-700", title: "SPF and DMARC aligned, DKIM unverified" }
-            : { ok: false, tone: "text-amber-700", title: "Authentication needs attention" };
+        : unanswered
+          ? { ok: false, tone: "text-slate-600", title: "DNS did not answer" }
+          : data.all_aligned
+            ? { ok: true, tone: "text-emerald-700", title: "Authentication aligned" }
+            : data.spf_found && data.dmarc_found
+              ? { ok: true, tone: "text-emerald-700", title: "SPF and DMARC aligned, DKIM unverified" }
+              : { ok: false, tone: "text-amber-700", title: "Authentication needs attention" };
+    const discoverable = (found: boolean): AuthRecordState => (found ? "found" : unanswered ? "unverified" : "missing");
 
     return (
         <div className="px-5 py-4">
@@ -1124,14 +1153,7 @@ function AuthCheckPanel({ mailbox }: { mailbox: Inbox }) {
                     <p className="mt-1 text-[11px] text-slate-400 leading-relaxed">Live SPF, DKIM &amp; DMARC check on the sending domain.</p>
                 </div>
                 <button
-                    onClick={() => {
-                        setOpen(true);
-                        if (open) {
-                            refresh.mutate(undefined, {
-                                onError: (e) => toast.error(buildError(e as unknown as AppError)),
-                            });
-                        }
-                    }}
+                    onClick={run}
                     disabled={busy}
                     className="h-8 px-3 rounded-md border border-slate-200 hover:border-slate-300 text-[12px] font-medium text-slate-700 hover:text-slate-900 inline-flex items-center gap-1.5 transition-colors disabled:opacity-60 shrink-0"
                 >
@@ -1140,15 +1162,16 @@ function AuthCheckPanel({ mailbox }: { mailbox: Inbox }) {
                 </button>
             </div>
 
-            <AuthGateNotice mailbox={mailbox} />
+            <AuthGateNotice mailbox={mailbox} livePassing={!canRecord && !!data && !unanswered && data.spf_found && data.dmarc_found} />
 
             {open && (
-                <div className="mt-3">
-                    {check.isError ? (
+                <div className="mt-3 space-y-2">
+                    {error && (
                         <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2.5 text-[11.5px] text-rose-700 leading-relaxed">
-                            {buildError(check.error as unknown as AppError)}
+                            {buildError(error as unknown as AppError)}
                         </div>
-                    ) : check.isFetching && !data ? (
+                    )}
+                    {busy && !data ? (
                         <div className="rounded-md border border-slate-200 bg-slate-50/70 px-3 py-3 flex items-center gap-2 text-[12px] text-slate-500">
                             <Loading className="!w-3.5 h-3.5" /> Looking up DNS records…
                         </div>
@@ -1159,12 +1182,17 @@ function AuthCheckPanel({ mailbox }: { mailbox: Inbox }) {
                                 <div className="min-w-0">
                                     <div className="text-[12px] font-medium">{verdict.title}</div>
                                     {data.summary && <div className="mt-0.5 text-[11px] text-slate-500 leading-relaxed">{data.summary}</div>}
+                                    {unanswered && (
+                                        <div className="mt-0.5 text-[11px] text-slate-500 leading-relaxed">
+                                            Nothing is held against the domain for this. Try again in a minute.
+                                        </div>
+                                    )}
                                 </div>
                             </div>
                             <div className="px-3">
                                 <AuthRecordRow
                                     label="SPF"
-                                    state={data.spf_found ? "found" : "missing"}
+                                    state={discoverable(data.spf_found)}
                                     detail={data.spf_record ? <span className="font-mono break-all">{data.spf_record}</span> : undefined}
                                 />
                                 <AuthRecordRow
@@ -1180,7 +1208,7 @@ function AuthCheckPanel({ mailbox }: { mailbox: Inbox }) {
                                 />
                                 <AuthRecordRow
                                     label="DMARC"
-                                    state={data.dmarc_found ? "found" : "missing"}
+                                    state={discoverable(data.dmarc_found)}
                                     detail={
                                         data.dmarc_found && data.dmarc_policy ? (
                                             <span className="font-mono break-all">
@@ -1328,6 +1356,7 @@ function WarmupTab({ form, update, status, mailbox, canWarmup = true }: { form: 
                             never writes to the same partner twice in a day. It sends more as partners free up.
                         </p>
                     )}
+                    {ws.send_failure && <WarmupSendFailureNote failure={ws.send_failure} />}
                 </div>
             )}
 
@@ -1973,6 +2002,63 @@ function SendIdentityCard({
  * takes before asking, and the copy differs by provider because what happens to
  * the connection does: Google accepts a revocation and Microsoft does not.
  */
+// Off stops everything, so the way back sits where the drawer opens.
+function SwitchedOffNotice({ mailbox }: { mailbox: Inbox }) {
+    const power = useMailboxSwitch(mailbox.id, mailbox.email);
+    return (
+        <div className="px-5 py-4">
+            <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2.5 flex items-start gap-2">
+                <PowerOffIcon className="w-3.5 h-3.5 mt-px shrink-0 text-slate-500" />
+                <div className="min-w-0 flex-1">
+                    <p className="text-[12.5px] font-medium text-slate-900">This mailbox is switched off</p>
+                    <p className="text-[11.5px] text-slate-600 leading-relaxed mt-0.5">
+                        It is not sending campaigns, warming up or syncing mail, whatever its warmup setting says. Its
+                        settings, history and worker are kept, so switching it back on picks up where it stopped.
+                        To keep it out of campaigns while it warms, turn on Hold from campaigns below first, then switch it back on.
+                    </p>
+                    <button
+                        type="button"
+                        onClick={power.switchOn}
+                        disabled={power.pending}
+                        className="mt-2 h-7 px-2.5 inline-flex items-center gap-1.5 rounded-md bg-sky-600 hover:bg-sky-700 text-white text-[12px] font-medium disabled:opacity-60 transition-colors"
+                    >
+                        <PowerIcon className="w-3.5 h-3.5" />
+                        {power.pending ? "Switching on…" : "Switch back on"}
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+// The mailbox's own on/off switch; a revoked mailbox is turned back on by reconnecting.
+function MailboxPowerCard({ mailbox }: { mailbox: Inbox }) {
+    const power = useMailboxSwitch(mailbox.id, mailbox.email);
+    if (mailbox.status !== "active" && mailbox.status !== "inactive") return null;
+    const on = mailbox.status === "active";
+    return (
+        <div className="px-5 py-5 space-y-3">
+            <Eyebrow>Mailbox</Eyebrow>
+            <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                    <div className="text-[12.5px] font-medium text-slate-900">Mailbox on</div>
+                    <div className="text-[11px] text-slate-400">
+                        Switched off, it neither sends, warms nor syncs, and keeps its settings and history. To stop
+                        only campaign sending and keep warming, use Hold from campaigns on the Overview tab. On a
+                        mailbox that is off, turn the hold on before switching it back on.
+                    </div>
+                </div>
+                <Toggle
+                    value={on}
+                    onChange={(v) => (v ? power.switchOn() : power.switchOff())}
+                    disabled={power.pending}
+                    ariaLabel="Mailbox on"
+                />
+            </div>
+        </div>
+    );
+}
+
 function DisconnectCard({ mailbox, onDisconnected }: { mailbox: Inbox; onDisconnected: () => void }) {
     const confirm = useConfirm();
     const remove = useRemoveEmail(mailbox.id);
@@ -1986,7 +2072,7 @@ function DisconnectCard({ mailbox, onDisconnected }: { mailbox: Inbox; onDisconn
 
     const ask = () =>
         confirm.show(
-            `Disconnect ${mailbox.email}? This deletes its imported mail, warmup history and credentials, and cannot be undone. Set the mailbox inactive instead if you only want it to stop sending.`,
+            `Disconnect ${mailbox.email}? This deletes its imported mail, warmup history and credentials, and cannot be undone. Switch the mailbox off instead if you only want it to stop.`,
             async () => {
                 try {
                     await remove.mutateAsync();
@@ -2029,6 +2115,27 @@ function DisconnectCard({ mailbox, onDisconnected }: { mailbox: Inbox; onDisconn
     );
 }
 
+// Where a reply-to sends replies, and whether Warmbly still sees them there.
+function ReplyToNote({ mailbox, value }: { mailbox: Inbox; value: string }) {
+    const accounts = useAppStore((s) => s.emails);
+    const address = value.trim();
+    const own = [mailbox.email, mailbox.send_as_email].some((a) => !!a && a.toLowerCase() === address.toLowerCase());
+    if (!address || own) return null;
+    const inbox = accounts.find((a) => repliesGoTo({ ...mailbox, reply_to: address }, a));
+    if (inbox) {
+        return (
+            <p className="text-[10.5px] text-slate-500 mt-1 leading-relaxed">
+                Replies land in {inbox.email} and still count for this mailbox's campaigns. Warmup mail keeps its replies here.
+            </p>
+        );
+    }
+    return (
+        <p className="text-[10.5px] text-amber-700 mt-1 leading-relaxed">
+            {address} is not a mailbox in this workspace, so replies sent there are not tracked. Connect it to track them.
+        </p>
+    );
+}
+
 function SettingsTab({ form, update, mailbox, onDisconnected }: { form: Inbox; update: (p: Partial<Inbox>) => void; mailbox: Inbox; onDisconnected: () => void }) {
     const { timezones } = useUserProfile();
     const org = useCurrentOrganization();
@@ -2040,6 +2147,7 @@ function SettingsTab({ form, update, mailbox, onDisconnected }: { form: Inbox; u
         ],
         [timezones, workspaceZone, form.timezone],
     );
+    const mirrorTarget = mailbox.provider === "gmail" ? "Gmail" : mailbox.provider === "outlook" ? "Outlook" : "the mailbox";
     return (
         <div className="divide-y divide-slate-200/60">
             <div className="px-5 py-5 space-y-4">
@@ -2049,7 +2157,7 @@ function SettingsTab({ form, update, mailbox, onDisconnected }: { form: Inbox; u
                 </FieldShell>
                 <FieldShell
                     label="Reply-to"
-                    hint={`Where replies land. Leave empty to use ${mailbox.email}.`}
+                    hint={`Where replies land. Leave empty to use ${mailbox.email}. Point several mailboxes at one connected mailbox to read every reply in one place.`}
                 >
                     <div className="flex items-center gap-1.5">
                         <TextInput
@@ -2068,6 +2176,7 @@ function SettingsTab({ form, update, mailbox, onDisconnected }: { form: Inbox; u
                             </button>
                         )}
                     </div>
+                    <ReplyToNote mailbox={mailbox} value={form.reply_to ?? ""} />
                 </FieldShell>
             </div>
 
@@ -2092,6 +2201,28 @@ function SettingsTab({ form, update, mailbox, onDisconnected }: { form: Inbox; u
                     </div>
                 </div>
             )}
+
+            <div className="px-5 py-5 space-y-3">
+                <Eyebrow>Unibox</Eyebrow>
+                <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                        <div className="text-[12.5px] font-medium text-slate-900">
+                            Mirror Archive and Delete to {mirrorTarget}
+                        </div>
+                        <div className="text-[11px] text-slate-400">
+                            Archive, Delete and Move to inbox in the unibox move the message in
+                            the mailbox too, so a conversation is only cleaned up once. Delete
+                            moves it to the mailbox's Trash and never removes it for good. Turn
+                            it off to keep filing inside Warmbly.
+                        </div>
+                    </div>
+                    <Toggle
+                        value={form.relay_folder_moves ?? true}
+                        onChange={(v) => update({ relay_folder_moves: v })}
+                        ariaLabel="Mirror Archive and Delete to the mailbox"
+                    />
+                </div>
+            </div>
 
             <SendIdentityCard
                 mailbox={mailbox}
@@ -2165,6 +2296,8 @@ function SettingsTab({ form, update, mailbox, onDisconnected }: { form: Inbox; u
             <TrackingDomainCard mailbox={mailbox} />
 
             <DirectMailTrackingControl mailbox={mailbox} />
+
+            <MailboxPowerCard mailbox={mailbox} />
 
             <DisconnectCard mailbox={mailbox} onDisconnected={onDisconnected} />
 

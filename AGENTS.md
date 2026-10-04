@@ -32,7 +32,7 @@ CI is strict. `go build ./...` succeeding is not enough — `golangci-lint` runs
 
 Other CI-touching rules:
 
-- the frontend trees (`admin/`, `web/`, `site/`) each have their own CI jobs; run `pnpm typecheck` in any tree you touched and `pnpm lint` when the rules are non-trivial
+- the frontend trees (`admin/`, `web/`, `site/`, `qa/`) each have their own CI jobs; run `pnpm typecheck` in any tree you touched and `pnpm lint` when the rules are non-trivial
 - never push without first re-running the relevant `*build*` / `*typecheck*` / `*lint*` step on the affected tree
 - a `make lint` (or `gofmt -l`) failure is always a real CI failure; do not push hoping it will pass
 
@@ -173,9 +173,23 @@ is `make cli-check` (and `make cli-sha` after any edit).
 Do not:
 
 - do not run `go build ./...`, `pnpm build`, or docker image builds as a "did it work" check. They are slow and are not what CI gates on. `go run` (via the make dev targets) already compiles; `make fmt` + `make lint` + `pnpm typecheck` are the real signals.
-- do not write or run Python/Playwright (or any browser-automation) scripts to test the app. Manual, in-browser verification is the user's job against the native dev stack (`make infra` + `make backend` + `make web`). Do not add screenshot/e2e test harnesses to this repo.
+- do not write Python or ad-hoc browser scripts, and do not drive the app step by step from screenshots or accessibility snapshots. Browser automation lives in `qa/` and only records proof for a PR (below); it is not a test gate, and manual verification against the native dev stack stays the user's job.
 - do not run the Go test suite as a default gate unless the task is specifically about those tests.
 - do not push hoping CI passes; a `gofmt -l` / `make lint` / `pnpm typecheck` failure is always a real CI failure.
+
+### Visual proof on pull requests
+
+Record proof only for a UI change a reviewer should actually see; most changes need none. `qa/` is the harness and `qa/README.md` is its playbook; read it before the first recording.
+
+- record for: a new page, dialog, drawer or multi-step flow; a redesigned or re-laid-out screen; a changed interaction (new controls, new states, a different path through a task); a visible bug fix where the before was visibly broken; or when the user asks for it
+- skip for: anything without a visible change (backend, API, migrations, workers, tests, CI, docs, refactors, dependency bumps) and small visual tweaks (copy, a label, an icon, spacing or colour nudges), which the PR text describes instead. When unsure, skip
+- a follow-up commit is re-recorded only when it changes what the proof shows
+
+- write a scripted flow in `qa/flows/` from the code you changed, run `pnpm proof <filter>` in `qa/`, and read only pass or the failing step. Never screenshot your way around the page; `pnpm aria <path>` prints the accessibility tree when you need a selector
+- record against this worktree's own stack (`pnpm stack up`, in the smallest of `lite`, `full`, `sandbox` the flow needs), never another session's and never anything but localhost: the repository is public and so is everything attached to its PRs
+- publish with `pnpm share` once the PR exists. The first publish goes into the PR description; every later one is a comment showing before/after of only the stills that changed. Record follow-ups with `pnpm proof:fresh` so the comparison starts from fresh seed data. Media reaches GitHub only through `gh --attach`, never an image host, a commit or another repository
+- keep shot names stable across commits, because follow-up comments diff stills by name
+- the machine is shared: record from the main agent, never from fanned-out subagents (a machine-wide lock runs one recording at a time, so they would only queue while each holds a context), and `pnpm stack down` once the proof is published
 
 ## Security And Compliance Invariants
 
@@ -306,7 +320,7 @@ Everything in the dashboard must use our own theme, not browser/library defaults
 - Row interactions: list rows behave like the campaigns list — clicking anywhere on a row opens that item's detail (drawer or page); right-side action buttons (3-dots / "More") either open a relevant detail/tab or drop a short menu of the actions for that row (the mailbox 3-dots menus Settings and Disconnect). A destructive action belongs in that menu as a `danger` item as well as in the detail's own danger zone, because the selection bar is not where anyone looks to remove one row. Inner interactive controls (checkbox, dropdown trigger, action buttons) must `e.stopPropagation()` so they don't also fire the row's open handler.
 - Prefer realtime over polling: subscribe to the socket and `queryClient.invalidateQueries(...)` on the relevant event instead of `refetchInterval` where an event exists (see `useRealtimeEvents` / `RealtimeManager`).
 - Interaction details are part of "done". Before calling a dashboard change finished, walk the small things a user hits in the first minute, because these are what make the product feel broken even when the data flow is right:
-  - every dropdown / popover / picker closes on click-away and on Escape, including when it sits inside a dialog or drawer. Dialog cards stop `mousedown` propagation so the backdrop does not close them; React's `stopPropagation` also stops the native event, so any click-outside listener must be registered in the **capture** phase (`document.addEventListener("mousedown", fn, true)`, as `PopoverMenu` and `useClickOutside` do), never the bubble phase. Escape must close only the innermost layer: the dialog's Escape handler bails out while a `[data-floating]` popover or the `[role="alertdialog"]` confirm is on screen
+  - every dropdown / popover / picker closes on click-away and on Escape, including when it sits inside a dialog or drawer. Dialog cards stop `mousedown` propagation so the backdrop does not close them; React's `stopPropagation` also stops the native event, so never hand-roll a click-outside listener: every floating layer closes through `useClickOutside` (`@/hooks/useClickOutside`, which `PopoverMenu` uses too). It listens for `pointerdown` in the capture phase, treats a `[data-floating]` layer it opened as inside but the floating panel or dialog holding it as outside, closes on focus moving into an iframe or a tap landing in a same-origin one (a phone moves no focus), and takes Escape for the innermost layer only, stopping it there and handing focus back to the trigger. A dialog's own Escape handler still bails out while a `[data-floating]` popover or the `[role="alertdialog"]` confirm is on screen
   - toggles are the shared `Toggle` (sky pill, 32x18) from `campaigns/preferences/components/CampaignPreferenceBoolBox`; never hand-roll a switch. If a whole row toggles on click, the switch itself must `stopPropagation` so it does not toggle twice, and a `<label htmlFor>` pointing at the switch would double-fire too, so use a plain element for the row title
   - **a page is not shipped until it is routed, linked and titled.** Three lists have to agree, and nothing fails the build when they do not: the route table in `web/src/main.tsx`, the nav that links to it (`AppNav`, `settings/layout.tsx`), and the title map in `web/src/hooks/useDocumentTitle.ts` (static pathnames in `ROUTE_TITLES`, `:id` routes as a regex in `PARAM_ROUTES`). A nav entry with no route renders nothing; a page component with no route is dead code nobody can reach; a route with no title falls through to the literal `"Page not found | Warmbly"` in the tab, which reads as a broken app on a page that works. All three drift silently, so check them together, and after a merge that touched routing check the settings nav against `main.tsx` specifically
   - every detail page reachable from a list has a way back on all viewports: a "← Section" link above the title (see `campaigns/[id]/layout.tsx`) or a back arrow in its header (see `AutomationFlow`); the header breadcrumb is desktop-only and its crumbs must stay clickable, so it does not count as the only route back
@@ -361,6 +375,7 @@ API keys with the `REALTIME_SUBSCRIBE` permission (bit 11) can connect to the sa
 - `realtime/`: websocket fanout service
 - `web/`: in-product frontend (dashboard). Customer-facing only: it holds no platform-admin screens, and operator tooling must not be added back here
 - `admin/`: platform admin panel (:5174), the single operator surface. Workers, users, orgs, warmup, campaigns, analytics, audit. Every route sits behind `RequireAdmin` and the backend's `RequireAdminPermission` gates
+- `qa/`: the proof harness (scripted Playwright flows recording 1080p walkthroughs and stills for pull requests, published with `gh --attach`). Its own package; see `qa/README.md`
 - `site/`: public marketing site (Astro 5 + Tailwind v4). `site/public/install.sh` is the self-host installer served at warmbly.com/install.sh and `site/public/cli.sh` is the CLI installer served at warmbly.com/cli.sh (with `cli.ps1` for Windows), each with its checksum next to it; see the rules above before touching either
 - `deploy/`: production deploy manifests, infrastructure, and runtime config. `deploy/split-cloud/` is the three-provider shape (control plane on a container host, bus + cache + fleet on machines you own, database + root key + object store in a cloud region), documented at `docs/content/docs/development/split-deployment.mdx`
 - `docs/`: documentation site (docs.warmbly.com); product guides, API reference, and self-hosting/engineering docs under `content/docs/development/`

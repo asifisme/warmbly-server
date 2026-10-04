@@ -167,11 +167,12 @@ var Tables = []Table{
 	},
 	{
 		Name: "domain_redirects", Group: models.OrgDataGroupCore,
-		Scope: scopeOrg,
-		// DNS points at the source instance until the customer moves it, so the
-		// destination serves nothing until its own check sees the records.
-		ResetOnImport: []string{"verified", "verified_at", "last_checked_at", "last_error"},
-		Note:          "Sending domains whose root redirects to the workspace's website. The destination lists its own TXT value, derived from its secret and the new workspace, and verifies once it is published.",
+		// A row Cloud serves for a linked instance belongs to that link, which does not travel.
+		Scope: `organization_id = $1 AND linked_instance_id IS NULL`,
+		// DNS points at the source (or at Cloud for it) until moved, so the destination serves it itself once its own check passes.
+		ResetOnImport: []string{"verified", "verified_at", "last_checked_at", "last_error", "served_by", "remote_host", "remote_records",
+			"linked_instance_id", "reach_status", "reach_hint", "reach_detail", "reach_proxy", "reach_checked_at"},
+		Note: "Sending domains whose root redirects to the workspace's website. The destination lists its own TXT value, derived from its secret and the new workspace, and verifies once it is published. A redirect Warmbly Cloud served for the source arrives served by the destination.",
 	},
 	{
 		Name: "email_accounts", Group: models.OrgDataGroupCore,
@@ -924,7 +925,14 @@ var ExcludedTables = map[string]string{
 	"mailbox_import_rows":          "The rows of a mailbox import, with credentials sealed until each row is connected. They follow mailbox_imports, which does not travel.",
 	"contact_imports":              "Contact imports in progress or recently finished. They are work this instance is doing; the contacts they created travel with the contacts group.",
 	"contact_import_rows":          "The uploaded rows of a contact import and what became of each. They follow contact_imports, which does not travel.",
-	"user_view_preferences":        "Each member's own column layout and sort for the dashboard's lists. It belongs to the person rather than the workspace: members are matched by account on import and a layout names custom fields the destination may not hold yet, so everyone starts from the default view and picks their columns again.",
+	"placement_renders":            "The copy a tracking comparison is sending to each seed, sealed so both halves send the same words. It lives only while the comparison runs, and a copy that had not been sent stays behind with its task.",
+	"inbox_follow_up_sweeps":       "This instance's hourly follow-up sweep state for the workspace: where its cycle stopped (by this instance's mailbox and message row ids), how far it has checked changed conversations, and which walker holds it. The destination starts its own cycle at the newest conversation.",
+	"slack_user_links":             "Which Slack member speaks for which Warmbly member. Slack delivers that member's messages to the instance whose Slack app the workspace installed, so each member links again after the workspace reconnects Slack on the destination.",
+	"slack_link_codes":             "In-flight Slack account links, valid for minutes.",
+	"slack_agent_threads":          "Which Slack thread the assistant answers in for which conversation. The Slack install they belong to does not travel; the conversations themselves do, with agent_sessions.",
+	"slack_inbox_threads":          "Which Slack thread mirrors which inbox conversation. The Slack install and its channel do not travel; the conversations themselves do, with the unified inbox.",
+	"user_view_preferences":        "Each member's own column layout and sort for the dashboard's lists, and their unibox scope rail arrangement. It belongs to the person rather than the workspace: members are matched by account on import and a layout names custom fields the destination may not hold yet, so everyone starts from the default view and picks their columns again.",
+	"campaign_send_plan_snapshots": "Today's precomputed send plan for a campaign, derived from the campaign, its leads, its mailboxes and this instance's limits, which all travel. Keyed to this instance's budget day, and naming mailboxes and workers. The destination's own background snapshotter recomputes it.",
 }
 
 // TableByName indexes Tables for lookup during import.

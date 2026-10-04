@@ -34,6 +34,10 @@ type AnalyticsRepository interface {
 	// Email account status
 	GetAccountsWithErrors(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, *errx.Error)
 	GetAccountDailyUsage(ctx context.Context, accountID uuid.UUID, date time.Time) (*models.AccountDailyUsage, *errx.Error)
+	// GetAccountDailyUsageBatch reads the same day's usage for many mailboxes in
+	// one query, keyed by account id, so a status list avoids one round trip per
+	// mailbox. A missing mailbox is simply absent from the map.
+	GetAccountDailyUsageBatch(ctx context.Context, accountIDs []uuid.UUID, date time.Time) (map[uuid.UUID]*models.AccountDailyUsage, *errx.Error)
 
 	// Usage overview
 	GetEmailAccountCounts(ctx context.Context, orgID uuid.UUID) (*models.AccountsUsage, *errx.Error)
@@ -499,6 +503,70 @@ func (r *analyticsRepository) GetAccountDailyUsage(ctx context.Context, accountI
 	return &usage, nil
 }
 
+// GetAccountDailyUsageBatch is the batched form of GetAccountDailyUsage: one
+// pass over the mailbox set rather than a query per mailbox. It mirrors the
+// per-mailbox columns and the same completed-task ledger.
+func (r *analyticsRepository) GetAccountDailyUsageBatch(ctx context.Context, accountIDs []uuid.UUID, date time.Time) (map[uuid.UUID]*models.AccountDailyUsage, *errx.Error) {
+	out := make(map[uuid.UUID]*models.AccountDailyUsage, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return out, nil
+	}
+
+	query := `
+		SELECT
+			ea.id,
+			$2::date::text as date,
+			(
+				SELECT COUNT(*)
+				FROM tasks t
+				WHERE t.email_account_id = ea.id
+				  AND t.status = 'completed'
+				  AND t.task_type = 'campaign'
+				  AND t.completed_at >= $2::date
+				  AND t.completed_at < $2::date + INTERVAL '1 day'
+				  AND ` + taskDispatchedEmail + `
+			) as campaign_sent,
+			COALESCE(ea.campaign_limit, 50) as campaign_limit,
+			(
+				SELECT COUNT(*)
+				FROM tasks t
+				WHERE t.email_account_id = ea.id
+				  AND t.status = 'completed'
+				  AND t.task_type = 'warmup'
+				  AND t.completed_at >= $2::date
+				  AND t.completed_at < $2::date + INTERVAL '1 day'
+			) as warmup_sent,
+			COALESCE(ea.warmup_max, 0) as warmup_limit
+		FROM email_accounts ea
+		WHERE ea.id = ANY($1::uuid[])
+	`
+
+	params := []any{accountIDs, date}
+	rows, err := r.DB.Query(ctx, query, params...)
+	if err != nil {
+		db.CaptureError(err, query, params, "query")
+		return nil, errx.InternalError()
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id uuid.UUID
+		var usage models.AccountDailyUsage
+		if err := rows.Scan(&id, &usage.Date, &usage.CampaignSent, &usage.CampaignLimit, &usage.WarmupSent, &usage.WarmupLimit); err != nil {
+			db.CaptureError(err, "", nil, "scan")
+			return nil, errx.InternalError()
+		}
+		u := usage
+		out[id] = &u
+	}
+	if err := rows.Err(); err != nil {
+		db.CaptureError(err, "", nil, "rows")
+		return nil, errx.InternalError()
+	}
+
+	return out, nil
+}
+
 func (r *analyticsRepository) GetEmailAccountCounts(ctx context.Context, orgID uuid.UUID) (*models.AccountsUsage, *errx.Error) {
 	query := `
 		SELECT
@@ -627,7 +695,9 @@ func (r *analyticsRepository) GetDashboardOverallStats(ctx context.Context, orgI
 func (r *analyticsRepository) GetRecentActivity(ctx context.Context, orgID uuid.UUID, limit int) ([]models.RecentActivityItem, *errx.Error) {
 	// Union query to get recent opens, clicks, replies, and bounces. The
 	// origin of an open or click is looked up only for the rows that make
-	// the page, from the person's first logged open or click on the step.
+	// the page, from the person's first logged open or click on the step,
+	// and so is the mailbox the step was sent from, which is not always the
+	// one a reply landed in.
 	query := `
 		WITH recent_events AS (
 			-- Opens
@@ -679,8 +749,14 @@ func (r *analyticsRepository) GetRecentActivity(ctx context.Context, orgID uuid.
 		SELECT p.type, p.campaign_id, p.campaign_name, p.contact_email, p.contact_id, p.timestamp, COALESCE(p.link, '') as link,
 		       COALESCE(og.client, ''), COALESCE(og.client_type, ''), COALESCE(og.device_hidden, false),
 		       COALESCE(og.device_type, ''), COALESCE(og.os, ''), COALESCE(og.browser, ''),
-		       COALESCE(og.country_code, ''), COALESCE(og.region, ''), COALESCE(og.city, '')
+		       COALESCE(og.country_code, ''), COALESCE(og.region, ''), COALESCE(og.city, ''),
+		       sender.id, COALESCE(NULLIF(sender.send_as_email, ''), sender.email, '')
 		FROM page p
+		LEFT JOIN campaign_contact_progress sent
+		       ON sent.campaign_id = p.campaign_id AND sent.contact_id = p.contact_id AND sent.sequence_id = p.sequence_id
+		LEFT JOIN tasks sent_task ON sent_task.id = sent.dispatch_task_id
+		LEFT JOIN email_accounts sender
+		       ON sender.id = sent_task.email_account_id AND sender.organization_id = $1
 		LEFT JOIN LATERAL (
 			SELECT o.opened_at AS at, o.client, o.client_type, o.device_hidden, o.device_type, o.os, o.browser, o.country_code, o.region, o.city
 			FROM email_opens o
@@ -714,7 +790,7 @@ func (r *analyticsRepository) GetRecentActivity(ctx context.Context, orgID uuid.
 		var o models.EngagementOrigin
 		if err := rows.Scan(&a.Type, &a.CampaignID, &a.CampaignName, &a.ContactEmail, &a.ContactID, &a.Timestamp, &a.Link,
 			&o.Client, &o.ClientType, &o.DeviceHidden, &o.DeviceType, &o.OS, &o.Browser,
-			&o.CountryCode, &o.Region, &o.City); err != nil {
+			&o.CountryCode, &o.Region, &o.City, &a.SenderID, &a.SenderEmail); err != nil {
 			db.CaptureError(err, "", nil, "scan")
 			return nil, errx.InternalError()
 		}

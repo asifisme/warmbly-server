@@ -20,6 +20,7 @@ import (
 	awsconf "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/google/uuid"
 	"github.com/meszmate/apple-go"
+	"github.com/redis/go-redis/v9"
 	"github.com/warmbly/warmbly/internal/api"
 	"github.com/warmbly/warmbly/internal/api/handler"
 	"github.com/warmbly/warmbly/internal/api/middleware"
@@ -95,6 +96,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/sequence"
 	"github.com/warmbly/warmbly/internal/app/settings"
 	"github.com/warmbly/warmbly/internal/app/skills"
+	"github.com/warmbly/warmbly/internal/app/slackapp"
 	"github.com/warmbly/warmbly/internal/app/socialauth"
 	"github.com/warmbly/warmbly/internal/app/socket"
 	"github.com/warmbly/warmbly/internal/app/stripe"
@@ -172,6 +174,7 @@ func main() {
 
 	var serviceAccount string
 	var keySet keyfunc.Keyfunc
+	var tasksWebhookURL string
 
 	var tokenService token.TokenService
 	var authService auth.AuthService
@@ -217,6 +220,7 @@ func main() {
 	var aiSearch generation.SearchClient
 	var aiToolRegistry *aitools.Registry
 	var aiAgentService aiagent.Service
+	var slackService *slackapp.Service
 	var researchService research.Service
 	var skillsService skills.Service
 	var mcpService mcp.Service
@@ -1267,6 +1271,7 @@ func main() {
 		cloudLinkService = cloudlink.NewService(cloudLinkRepository, emailRepostory, emailService)
 		// Deleting a mailbox must also revoke its cloud-held credential.
 		emailService.WireCloudUnenroll(cloudLinkService)
+		emailService.WireCloudCredentials(cloudLinkService)
 
 		rateLimitRepository := repository.NewRateLimitRepository(primaryDB)
 		rateLimitService = ratelimit.NewService(cache, rateLimitRepository)
@@ -1338,6 +1343,7 @@ func main() {
 				errs.CaptureFatal(err)
 				log.Fatal(err)
 			}
+			tasksWebhookURL = cloudTasksCfg.WebhookURL
 			gclient, err := gtasks.NewClient(ctx, cloudTasksCfg.QueueName, cloudTasksCfg.WebhookURL, serviceAccount, cloudTasksCfg.EmulatorHost)
 			if err != nil {
 				errs.CaptureFatal(err)
@@ -1395,6 +1401,12 @@ func main() {
 		// A start with nothing left to send says whether verification is why.
 		if aware, ok := campaignService.(campaign.ProgressAware); ok {
 			aware.WireProgress(campaignProgressRepository)
+		}
+		// The send-plan read endpoint serves a background-computed snapshot
+		// rather than walking the planner on the request, so a huge campaign's
+		// plan read stays fast and bounded.
+		if aware, ok := campaignService.(campaign.SnapshotAware); ok {
+			aware.WireSnapshots(repository.NewCampaignSendPlanSnapshotRepository(primaryDB))
 		}
 		// The wizard's audience-versus-pool estimate counts segment members.
 		if aware, ok := campaignService.(campaign.SegmentAware); ok {
@@ -1513,6 +1525,13 @@ func main() {
 			FeatureGate:  featureGateService,
 			Skills:       skillsService,
 			AppBaseURL:   cfg.GetStringOptional(ctx, "APP_BASE_URL", "app_base_url", ""),
+			// tasksService is built later in boot, so it is read at call time.
+			WarmupScheduler: func(ctx context.Context, accountID uuid.UUID) error {
+				if tasksService == nil {
+					return nil
+				}
+				return tasksService.EnsureWarmupScheduled(ctx, accountID)
+			},
 		})
 
 		// Connected MCP servers (client direction): their enabled tools are
@@ -1586,7 +1605,6 @@ func main() {
 		notificationService = notification.NewService(repository.NewNotificationRepository(primaryDB.Pool), streamingPublisher)
 		// Saved list layouts: each member's columns and sort per dashboard list.
 		viewPreferencesService = viewprefs.NewService(repository.NewViewPreferencesRepository(primaryDB.Pool))
-		notificationService.WireDelivery(emailNotificationService, integrationServiceForHandler, userRepostory, organizationRepoForHandler)
 		// Mobile push (APNs): device registration always works; delivery only
 		// activates when the APNS_* env is configured. The Redis client backs
 		// the shared immediate-then-digest push window. The sender stays a nil
@@ -1617,6 +1635,26 @@ func main() {
 			inboxAgentService.WireDraftGate(inboxtag.NewDraftGate(inboxTagRepository))
 		}
 		advancedService.WireInboxAgent(inboxAgentService)
+		// Slack app: the assistant, the inbox mirror's actions and notifications.
+		// Built here because it needs the agent, the tool registry and the drafts.
+		var slackRedis *redis.Client
+		if authCache != nil {
+			slackRedis = authCache.Client
+		}
+		slackService = slackapp.New(slackapp.Deps{
+			Integrations: integrationServiceForHandler, Repo: repository.NewSlackRepository(primaryDB),
+			Orgs: organizationService, Agent: aiAgentService, Registry: aiToolRegistry,
+			Audit: auditService, Redis: slackRedis,
+			Threads: uniboxRepository, Labels: repository.NewTagCategoryStore(primaryDB.Pool),
+			Drafts: aiDraftRepo, Users: userRepostory, Tasks: taskRepository, Campaigns: campaignRepostory,
+			Cipher: cipherService,
+		})
+		notificationService.WireDelivery(emailNotificationService, slackService, userRepostory, organizationRepoForHandler)
+		if aware, ok := emailSendService.(emailsend.ReplyObserverAware); ok {
+			aware.WireReplyObserver(slackService)
+		}
+		organizationService.WireMemberRemoval(slackService.OnMemberRemoved)
+		slackService.StartMaintenance(ctx)
 		// The classified intent lands on the contact's progress for the
 		// reply_intent branch condition.
 		advancedService.WireInboxTags(inboxTagRepository)
@@ -1733,6 +1771,9 @@ func main() {
 		// Sending domains: tracking host per domain and the bare-domain redirect.
 		sendingDomainService = sendingdomain.NewService(repository.NewDomainRedirectRepository(primaryDB), emailRepostory, nil, domainProver)
 		sendingDomainService.WireAuditor(auditService)
+		// A linked self-hosted instance can have Warmbly Cloud serve a redirect instead.
+		sendingDomainService.WireCloud(cloudLinkService)
+		cloudLinkService.OnDisconnect(sendingDomainService.MarkCloudUnlinked)
 		go sendingDomainService.StartSweep(ctx)
 
 		mailhostDetector := mailhost.NewDetector(nil, nil, mailboximport.NewRedisDetectionCache(cache))
@@ -1845,6 +1886,14 @@ func main() {
 		// crash between send and enqueue). Campaigns have no other bootstrap once
 		// started, so without this a stranded campaign stops sending forever.
 		go tasksService.StartCampaignReconciler(ctx, 5*time.Minute)
+
+		// Send-plan snapshotter: walk every active campaign's send plan on an
+		// interval and store it, so GET /campaigns/:id/send-plan serves a stored
+		// snapshot instead of running the planner (lead supply, per-mailbox
+		// history) on the request. A no-op without the snapshot store or planner.
+		if campaignService != nil {
+			go campaignService.StartSendPlanSnapshotter(ctx, time.Minute)
+		}
 
 		// Segment-linked campaigns: enrol contacts that drifted into a linked
 		// segment (date windows, engagement counters, nested segments) that
@@ -2240,6 +2289,7 @@ func main() {
 		AISearch:         aiSearch,
 		AITools:          aiToolRegistry,
 		AIAgentService:   aiAgentService,
+		SlackService:     slackService,
 		ResearchService:  researchService,
 		SkillsService:    skillsService,
 		MCPService:       mcpService,
@@ -2325,6 +2375,7 @@ func main() {
 		ServiceAccount: serviceAccount,
 		KeySet:         keySet,
 		AppEnv:         os.Getenv("APP_ENV"),
+		Audience:       tasksWebhookURL,
 	}
 
 	log.Printf("Starting the backend on %s", addr)
