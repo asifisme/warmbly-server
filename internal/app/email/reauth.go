@@ -12,17 +12,17 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"github.com/warmbly/warmbly/internal/config"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/observability/errs"
-	"github.com/warmbly/warmbly/internal/pkg/crypt"
 	"golang.org/x/oauth2"
 )
 
 // OAuthReauth issues an authorization URL that renews an existing mailbox's
 // tokens. Same round trip as OAuthStart, but the state carries the account id
 // so the finish leg updates in place instead of connecting a duplicate.
-func (s *emailService) OAuthReauth(ctx context.Context, userID string, orgID *uuid.UUID, accountID uuid.UUID) (*models.EmailOnboardingStartResponse, *errx.Error) {
+func (s *emailService) OAuthReauth(ctx context.Context, userID string, orgID *uuid.UUID, accountID uuid.UUID, returnOrigin string) (*models.EmailOnboardingStartResponse, *errx.Error) {
 	if orgID == nil {
 		return nil, errx.ErrNoOrganization
 	}
@@ -36,6 +36,9 @@ func (s *emailService) OAuthReauth(ctx context.Context, userID string, orgID *uu
 	}
 
 	provider := models.InboxProvider(account.Provider)
+	if returnOrigin != "" && config.DashboardOrigin(returnOrigin) == "" {
+		return nil, errx.ErrEmailOnboardReturnOrigin
+	}
 	if provider == models.InboxProviderSMTPIMAP {
 		return nil, errx.ErrEmailReauthProvider
 	}
@@ -55,7 +58,8 @@ func (s *emailService) OAuthReauth(ctx context.Context, userID string, orgID *uu
 		return nil, xerr
 	}
 
-	state, err := crypt.Nonce()
+	// Only the dashboard renews a mailbox's sign-in.
+	state, err := newState(true)
 	if err != nil {
 		errs.CaptureException(err)
 		return nil, errx.InternalError()
@@ -72,6 +76,7 @@ func (s *emailService) OAuthReauth(ctx context.Context, userID string, orgID *uu
 		Nonce:          state,
 		EmailAccountID: &accountID,
 		CodeVerifier:   verifier,
+		ReturnOrigin:   returnOrigin,
 	}); xerr != nil {
 		return nil, xerr
 	}

@@ -179,6 +179,10 @@ type IntegrationCatalogEntry struct {
 	// for this provider. OAuth providers without credentials render as
 	// "coming soon" instead of a dead Connect button.
 	Configured bool `json:"configured"`
+
+	// Rank is the provider's popularity on this instance, 1 being the most
+	// used: workspaces with a live connection, ties broken by catalog order.
+	Rank int `json:"rank"`
 }
 
 // IntegrationConnection is one org's link to one provider. Secrets
@@ -221,9 +225,9 @@ type IntegrationConnection struct {
 	InboundWebhookURL string `json:"inbound_webhook_url,omitempty"`
 }
 
-// ConfigCapabilitiesSigningSecret is the config_capabilities key holding an
-// automation connection's outbound HMAC secret. Only the webhook-secret route,
-// behind the connection write gate, hands it out.
+// ConfigCapabilitiesSigningSecret is the config_capabilities key an automation
+// connection's outbound HMAC secret is moved out of into its sealed config.
+// Only the webhook-secret route, behind the connection write gate, hands it out.
 const ConfigCapabilitiesSigningSecret = "signing_secret"
 
 // MarshalJSON leaves the outbound signing secret out of every response.
@@ -256,6 +260,8 @@ type IntegrationTokens struct {
 	RefreshToken string
 	ExpiresAt    *time.Time
 	Scopes       []string
+	// InstanceURL is a per-org API host a refresh reported (Salesforce).
+	InstanceURL string
 }
 
 // IntegrationOAuthState is the short-lived CSRF/PKCE record minted at the
@@ -269,9 +275,12 @@ type IntegrationOAuthState struct {
 	CodeVerifier    string
 	Label           string
 	RequestedScopes []string
-	UsedAt          *time.Time
-	ExpiresAt       time.Time
-	CreatedAt       time.Time
+	// Params carries provider options chosen at start, such as the Salesforce
+	// login host the code must be exchanged at.
+	Params    map[string]string
+	UsedAt    *time.Time
+	ExpiresAt time.Time
+	CreatedAt time.Time
 }
 
 // IntegrationOAuthStartResponse is returned to the SPA so it can open the

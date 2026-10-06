@@ -120,6 +120,23 @@ export function useRealtimeEvents() {
         return
       }
 
+      // Mirrored CRM data moved (HubSpot pushed or pulled): the deals, tasks,
+      // pipelines and the contact's HubSpot panel refetch.
+      if (event === 'CRM_SYNCED') {
+        const objects = Array.isArray(payload.objects) ? (payload.objects as string[]) : []
+        const keys: QueryKey[] = [['crm', 'sync']]
+        if (objects.includes('owner')) keys.push(['crm', 'owners'])
+        if (objects.includes('deal')) keys.push(['crm', 'deals'])
+        if (objects.includes('task')) keys.push(['crm', 'tasks'])
+        if (objects.includes('pipeline')) keys.push(['crm', 'pipelines'], ['crm', 'deals'])
+        if (objects.some((o) => o === 'contact' || o === 'note' || o === 'deal' || o === 'task')) {
+          keys.push(contactId ? ['contacts', contactId] : ['contacts'])
+          keys.push(contactId ? ['crm', 'contact', contactId] : ['crm', 'contact'])
+        }
+        invalidate(keys)
+        return
+      }
+
       // A contact import moved. The import refreshes on every beat; the lists
       // its rows land in refresh when it settles, not once a second while it runs.
       if (event === 'CONTACT_IMPORT_PROGRESS') {
@@ -420,7 +437,7 @@ export function useRealtimeEvents() {
           ['integrations', 'slack', 'status'],
         ])
         const connectionId = getString('connection_id')
-        if (connectionId) invalidate([['integrations', 'connection', connectionId]])
+        if (connectionId) invalidate([['integrations', 'connection', connectionId], ['integrations', 'salesforce', connectionId]])
         return
       }
 
@@ -493,8 +510,8 @@ export function useRealtimeEvents() {
           team: [['teams']],
           role: [['organizations']],
           automation: [['automations']],
-          // Slack settings and member links are audited as integration writes too.
-          integration: [['integrations', 'connections'], ['integrations', 'slack']],
+          // Slack and Salesforce settings, member links and import sources are audited as integration writes too.
+          integration: [['integrations', 'connections'], ['integrations', 'slack'], ['integrations', 'salesforce'], ['crm', 'settings'], ['crm', 'owners']],
           lead_sync_source: [['lead-sync', 'sources']],
           meeting: [['meetings'], ['meetings', 'summary']],
           subscription: [['subscription'], ['organizations', 'limits']],
@@ -508,8 +525,14 @@ export function useRealtimeEvents() {
           ai_session: [['ai', 'sessions']],
           // AI skills (org playbooks).
           ai_skill: [['ai', 'skills']],
+          // Workspace "always allow" policies for assistant tools.
+          ai_tool_policy: [['ai', 'tool-policies']],
           // Connected MCP servers (external tools).
           mcp_server: [['ai', 'connections']],
+          // A teammate published, edited or unpublished one of the workspace's apps.
+          app_listing: [['oauth-app-listing'], ['integrations', 'community']],
+          // A member's app authorization ended, by them or by a workspace admin.
+          oauth_authorization: [['oauth-authorized-apps']],
           // Advisor: a background evaluation that opened or resolved findings,
           // or a teammate applying/snoozing/dismissing one. Refreshes every
           // strip and every nav badge at once.

@@ -49,8 +49,24 @@ export default function InboundUrlDialog({
         );
     }
 
+    React.useEffect(() => {
+        const onKey = (ev: KeyboardEvent) => {
+            if (ev.key !== "Escape" || document.querySelector("[data-floating], [role='alertdialog']")) return;
+            ev.preventDefault();
+            ev.stopImmediatePropagation();
+            onClose();
+        };
+        // Capture, so the popup underneath does not close on the same Escape.
+        document.addEventListener("keydown", onKey, true);
+        return () => document.removeEventListener("keydown", onKey, true);
+    }, [onClose]);
+
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
+        <div
+            data-nested-dialog
+            onMouseDown={(ev) => ev.stopPropagation()}
+            className="fixed inset-0 z-[150] flex items-center justify-center px-2"
+        >
             <button
                 type="button"
                 aria-label="Close"
@@ -59,10 +75,8 @@ export default function InboundUrlDialog({
             />
             <div className="relative z-10 w-[520px] max-w-[92vw] max-h-[90dvh] flex flex-col bg-white rounded-lg shadow-xl border border-slate-200 overflow-hidden">
                 <div className="h-12 px-5 border-b border-slate-200 flex items-center gap-3 shrink-0">
-                    <div className="text-[10px] uppercase tracking-[0.14em] text-slate-400 font-medium">Webhook URL</div>
-                    <div className="h-4 w-px bg-slate-200" />
-                    <div className="text-[12.5px] text-slate-900 font-medium truncate flex-1">
-                        {PROVIDER_NAMES[provider] ?? provider}
+                    <div className="text-[13px] text-slate-900 font-semibold truncate flex-1">
+                        {PROVIDER_NAMES[provider] ?? provider} webhook URL
                     </div>
                     <button
                         type="button"
@@ -80,7 +94,9 @@ export default function InboundUrlDialog({
                     </p>
 
                     <div className="rounded border border-slate-200 bg-slate-50 p-2.5 flex items-center gap-2">
-                        <code className="flex-1 font-mono text-[11.5px] text-slate-800 break-all">{fullUrl}</code>
+                        <code className="flex-1 font-mono text-[11.5px] text-slate-800 break-all" data-ph-mask="">
+                            {fullUrl}
+                        </code>
                         <button
                             type="button"
                             onClick={copy}

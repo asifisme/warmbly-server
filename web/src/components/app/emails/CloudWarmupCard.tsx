@@ -3,7 +3,7 @@
 // pause/resume/remove, or the way in when it is not enrolled yet.
 
 import React from "react";
-import { Link } from "react-router-dom";
+import { Link } from "@tanstack/react-router";
 import toast from "react-hot-toast";
 import { CloudIcon, Loader2Icon, PauseIcon, PlayIcon } from "lucide-react";
 import type { AppError } from "@/lib/api/client/normalizeError";
@@ -24,7 +24,7 @@ export default function CloudWarmupCard({ mailboxId, email, provider }: { mailbo
     const confirm = useConfirm();
     const busy = enroll.isPending || unenroll.isPending || lifecycle.isPending;
 
-    if (!pool.selfHosted) return null;
+    if (!pool.manageable) return null;
 
     const run = async (fn: () => Promise<unknown>, ok: string) => {
         try {

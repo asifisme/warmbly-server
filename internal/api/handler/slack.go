@@ -1,4 +1,4 @@
-// Slack app endpoints: the three request URLs Slack calls (verified against
+// Slack app endpoints: the two request URLs Slack calls (verified against
 // SLACK_SIGNING_SECRET before anything is parsed) and the dashboard's Slack
 // panel (status, channels, settings, member links).
 package handler
@@ -62,13 +62,6 @@ func (h *Handler) SlackInteractivity(c *gin.Context) {
 	})
 }
 
-// SlackCommands — POST /api/v1/integrations/slack/commands
-func (h *Handler) SlackCommands(c *gin.Context) {
-	h.slackIngress(c, func(ctx context.Context, body []byte) (any, error) {
-		return h.SlackService.HandleCommand(ctx, body)
-	})
-}
-
 // slackCaller resolves the signed-in user and, when required, the org.
 func (h *Handler) slackCaller(c *gin.Context, needOrg bool) (uuid.UUID, uuid.UUID, bool) {
 	if h.SlackService == nil {
@@ -102,7 +95,14 @@ func (h *Handler) GetSlackStatus(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.Forbidden, "not a member of this organization"))
 		return
 	}
-	st, xerr := h.SlackService.Status(c.Request.Context(), orgID, userID, member.Permissions.HasPermission(models.PermManageSettings))
+	access := slackapp.StatusOwnLink
+	switch {
+	case member.Permissions.HasPermission(models.PermManageSettings):
+		access = slackapp.StatusManage
+	case member.Permissions.HasPermission(models.PermUseIntegrations):
+		access = slackapp.StatusWorkspace
+	}
+	st, xerr := h.SlackService.Status(c.Request.Context(), orgID, userID, access)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -166,12 +166,20 @@ func (h *Handler) ConfirmSlackLink(c *gin.Context) {
 	}
 	var req struct {
 		Code string `json:"code" binding:"required"`
+		// SlackCode and State are a Sign in with Slack result, from
+		// POST /integrations/slack/link/verify.
+		SlackCode string `json:"slack_code"`
+		State     string `json:"state"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		errx.JSON(c, errx.InvalidBody(err))
 		return
 	}
-	link, xerr := h.SlackService.ConfirmLink(c.Request.Context(), userID, req.Code)
+	var proof *slackapp.LinkProof
+	if req.SlackCode != "" {
+		proof = &slackapp.LinkProof{Code: req.SlackCode, State: req.State}
+	}
+	link, xerr := h.SlackService.ConfirmLink(c.Request.Context(), userID, req.Code, proof)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
@@ -182,6 +190,27 @@ func (h *Handler) ConfirmSlackLink(c *gin.Context) {
 			&link.ConnectionID, c.ClientIP(), c.Request.UserAgent(), nil, map[string]string{"slack_link": "linked"})
 	}
 	c.JSON(http.StatusCreated, link)
+}
+
+// StartSlackLinkVerify — POST /v1/integrations/slack/link/verify
+func (h *Handler) StartSlackLinkVerify(c *gin.Context) {
+	_, userID, ok := h.slackCaller(c, false)
+	if !ok {
+		return
+	}
+	var req struct {
+		Code string `json:"code" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		errx.JSON(c, errx.InvalidBody(err))
+		return
+	}
+	u, xerr := h.SlackService.StartLinkVerify(c.Request.Context(), userID, req.Code)
+	if xerr != nil {
+		errx.JSON(c, xerr)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"url": u})
 }
 
 // UpdateMySlackLink — PATCH /v1/integrations/slack/link

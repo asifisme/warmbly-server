@@ -54,6 +54,9 @@ import {
     type MeetingsSearch,
 } from "@/lib/api/models/app/integrations/Integration";
 import { cn } from "@/lib/utils";
+import { Link } from "@tanstack/react-router";
+import useCrmProvider from "@/hooks/useCrmProvider";
+import { CrmMark } from "@/components/app/crm/crmProviders";
 
 type Timeframe = "upcoming" | "past" | "all";
 
@@ -154,6 +157,9 @@ export default function MeetingsPage() {
     const { data: summary } = useMeetingsSummary();
 
     const rows = meetings ?? [];
+    // Provider mode with meeting logging on: booked calls also land in the CRM.
+    const { isExternal, crm, settings } = useCrmProvider();
+    const logsToCrm = isExternal && !!settings?.config?.activity?.meetings;
 
     return (
         <Page>
@@ -174,6 +180,20 @@ export default function MeetingsPage() {
             </StatStrip>
 
             <PageBody>
+                {logsToCrm && (
+                    <div className={cn("px-5 py-2 border-b border-slate-200 flex items-center gap-2 text-[11.5px] text-slate-600", crm.tint)}>
+                        <CrmMark provider={crm.id} className="w-3.5 h-3.5" />
+                        <span className="min-w-0 flex-1">
+                            Calls booked through Calendly or Cal.com are logged to {crm.name} as meetings on the {crm.words.contact}.
+                        </span>
+                        <Link
+                            to={crm.settingsPath}
+                            className={cn("shrink-0 text-[11.5px] font-medium text-slate-600 transition-colors", crm.hoverText)}
+                        >
+                            Settings
+                        </Link>
+                    </div>
+                )}
                 <SectionBar label="Meetings" count={total ? `${rows.length} of ${total}` : undefined}>
                     <div className="flex items-center gap-0.5 rounded-md border border-slate-200 p-0.5">
                         {TABS.map((tab) => (

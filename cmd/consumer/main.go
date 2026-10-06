@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,7 +25,9 @@ import (
 	"github.com/warmbly/warmbly/internal/app/contact"
 	"github.com/warmbly/warmbly/internal/app/credits"
 	"github.com/warmbly/warmbly/internal/app/creditwatch"
+	"github.com/warmbly/warmbly/internal/app/crmmode"
 	"github.com/warmbly/warmbly/internal/app/feature"
+	"github.com/warmbly/warmbly/internal/app/hubspot"
 	"github.com/warmbly/warmbly/internal/app/inboxagent"
 	"github.com/warmbly/warmbly/internal/app/inboxtag"
 	"github.com/warmbly/warmbly/internal/app/instancesettings"
@@ -32,7 +35,9 @@ import (
 	"github.com/warmbly/warmbly/internal/app/nativeactions"
 	"github.com/warmbly/warmbly/internal/app/notification"
 	"github.com/warmbly/warmbly/internal/app/opsnotify"
+	"github.com/warmbly/warmbly/internal/app/pipedrive"
 	"github.com/warmbly/warmbly/internal/app/replyclassify"
+	"github.com/warmbly/warmbly/internal/app/salesforce"
 	warmupapp "github.com/warmbly/warmbly/internal/app/warmup"
 	"github.com/warmbly/warmbly/internal/app/webhook"
 	workerapp "github.com/warmbly/warmbly/internal/app/worker"
@@ -238,6 +243,19 @@ func main() {
 	integrationRepoC := repository.NewIntegrationRepository(primaryDB.Pool)
 	integrationServiceC := integration.NewService(integrationRepoC, cipherService, integration.NewOAuthManager())
 	webhookService.WireDispatchSink(integrationServiceC.DispatchAny)
+	// Replies, opens and clicks are raised here, so the Salesforce outbox
+	// records them here too; the backend drains it. Automation upserts take
+	// the native path as well.
+	salesforceC := salesforce.NewService(salesforce.Deps{
+		Repo:         repository.NewSalesforceRepository(primaryDB.Pool),
+		Integrations: integrationServiceC,
+		Cipher:       cipherService,
+		Holds:        campaignProgressRepo,
+		Suppression:  advancedRepo,
+		Subscription: contactRepo,
+	})
+	integrationServiceC.SetSalesforce(salesforceC)
+	webhookService.WireRecordSink(salesforceC.Recorder().Record)
 	// AI automation nodes + reply-classifier Layer 3 run in THIS process (reply /
 	// warmup / bounce events dispatch here). Build the credit ledger + provider so
 	// the ai_step / ai_switch nodes can charge + call, and so the classifier's
@@ -314,6 +332,45 @@ func main() {
 		aware.WireSegments(repository.NewSegmentRepository(primaryDB))
 	}
 	advancedService.WireDispatcher(webhookService)
+
+	// HubSpot as the workspace CRM: replies and bounces dispatched here log to
+	// HubSpot, reply tasks reach it, and this process drains the CRM outbox and
+	// runs the pull that keeps the mirror current.
+	hubspotService := hubspot.New(hubspot.Deps{
+		Repo:         repository.NewCRMProviderRepository(primaryDB.Pool),
+		CRM:          crmRepo,
+		Tokens:       integrationServiceC,
+		Contacts:     contactRepo,
+		Holds:        campaignProgressRepo,
+		Suppress:     advancedRepo,
+		Realtime:     streamingPublisher,
+		Cache:        redisCache,
+		AppURL:       os.Getenv("APP_URL"),
+		ClientSecret: strings.TrimSpace(os.Getenv("HUBSPOT_OAUTH_CLIENT_SECRET")),
+	})
+	// Pipedrive mode: the same in this process, on Pipedrive's records.
+	pipedriveService := pipedrive.New(pipedrive.Deps{
+		Repo:         repository.NewCRMProviderRepository(primaryDB.Pool),
+		CRM:          crmRepo,
+		Tokens:       integrationServiceC,
+		Contacts:     contactRepo,
+		Holds:        campaignProgressRepo,
+		Suppress:     advancedRepo,
+		Realtime:     streamingPublisher,
+		Cache:        redisCache,
+		AppURL:       os.Getenv("APP_URL"),
+		PublicURL:    config.BackendPublicURL(),
+		ClientSecret: strings.TrimSpace(os.Getenv("PIPEDRIVE_OAUTH_CLIENT_SECRET")),
+	})
+	crmModes := crmmode.New(repository.NewCRMProviderRepository(primaryDB.Pool), integrationServiceC, hubspotService, pipedriveService)
+	webhookService.WireRecordSink(hubspotService.OnEvent)
+	webhookService.WireRecordSink(pipedriveService.OnEvent)
+	advancedService.WireCRMOutbox(crmModes)
+	integrationServiceC.SetCRMModeCheck(crmModes.Mode)
+	go hubspotService.RunDrainer(ctx)
+	go hubspotService.RunPuller(ctx)
+	go pipedriveService.RunDrainer(ctx)
+	go pipedriveService.RunPuller(ctx)
 	// Replies, bounces, opens and clicks teach verification what real mail
 	// showed about each address.
 	verificationEvidence := emailverifyapp.NewEvidence(repository.NewVerificationEvidenceRepository(primaryDB))
@@ -666,7 +723,7 @@ func newConsumerAgent() *nodeagent.Agent {
 		Region:            os.Getenv("WARMBLY_NODE_REGION"),
 		Version:           os.Getenv("WARMBLY_VERSION"),
 		BaseURL:           consumerBackendURL(),
-		Token:             os.Getenv("INTERNAL_API_TOKEN"),
+		Token:             config.NodeAPIToken(),
 		TargetVersionPath: os.Getenv("WARMBLY_TARGET_VERSION_PATH"),
 	})
 }

@@ -15,13 +15,13 @@ How "fetched" happens depends on how the instance was installed, and the updater
 
 ## The indicator
 
-The top bar of the **admin panel** (`:5174`) carries a version pill next to the environment label. It reads the running backend's build identity, so it shows exactly what is deployed, not what the checkout says.
+The foot of the **admin panel** (`:5174`) sidebar carries a version pill next to the environment label. It reads the running backend's build identity, so it shows exactly what is deployed, not what the checkout says.
 
 | Pill | Means |
 |---|---|
 | `v1.4.0` (grey) | Up to date. Click it for the details and a manual check |
-| `Update to v1.5.0` (amber) | A newer release exists on the configured channel |
-| `Update available` (amber) | The checkout is behind its branch (an install that tracks `main`) |
+| `Update to v1.5.0` (highlighted, pulsing) | A newer release exists on the configured channel |
+| `Update available` (highlighted, pulsing) | The checkout is behind its branch (an install that tracks `main`) |
 | `Updating` (blue, spinning) | An update job is running; the pill follows it from any tab |
 | `Restarting` (blue, spinning) | The backend is coming back after an update |
 
@@ -112,7 +112,7 @@ The updater mounts `/var/run/docker.sock`, which is root on the host. That is wh
 
 ### An install from install.sh
 
-Already done. The installer writes the updater into the generated compose file in image mode, pointed at the install directory, sharing `INTERNAL_API_TOKEN` with the backend. Nothing to configure.
+Already done. The installer writes the updater into the generated compose file in image mode, pointed at the install directory, with its own `UPDATER_TOKEN` that the backend also reads from `.env`. Nothing to configure.
 
 To update by hand instead, from the install directory:
 
@@ -179,7 +179,7 @@ Backend:
 | `RELEASES_GITHUB_REPO` | The `owner/repo` whose releases are Warmbly versions. Point a fork's instance at the fork | `warmbly/warmbly` |
 | `RELEASES_GITHUB_TOKEN` | Optional; only raises the GitHub API rate limit | unset |
 | `UPDATER_URL` | The updater. Unset, or `none`, leaves the panel report-only | `http://updater:8095` under compose |
-| `UPDATER_TOKEN` | Bearer token presented to the updater | `INTERNAL_API_TOKEN` |
+| `UPDATER_TOKEN` | Bearer token presented to the updater. Give it its own value; the one-command installer generates one | `INTERNAL_API_TOKEN` |
 
 Updater:
 

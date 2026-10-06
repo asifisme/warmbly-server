@@ -107,6 +107,7 @@ import { triggerLabel } from "@/lib/api/models/app/automations/meta";
 import TaskTypePicker from "@/components/app/crm/TaskTypePicker";
 import AssigneeTeamPicker, { type AssigneeValue } from "@/components/app/crm/AssigneeTeamPicker";
 import DealStagePicker from "@/components/app/crm/DealStagePicker";
+import { CrmDealNote, CrmTaskNote } from "@/components/app/crm/crmMode";
 
 // Personalization tokens available in templated copy. Mirrors SequenceView's
 // VARIABLES so a deal name can use the same {{.FirstName}}/{{.Company}} tokens
@@ -3106,6 +3107,7 @@ function ActionConfigFields({
 
             {action.type === "create_task" && (
                 <div className="space-y-4">
+                    <CrmTaskNote className="max-w-[420px]" />
                     <div>
                         <Label>Task title</Label>
                         <TextInput
@@ -3174,6 +3176,7 @@ function ActionConfigFields({
 
             {(action.type === "create_deal" || action.type === "move_deal_stage") && (
                 <div className="space-y-4">
+                    <CrmDealNote className="max-w-[420px]" creates={action.type === "create_deal"} />
                     <div>
                         <Label>{action.type === "create_deal" ? "Create the deal in" : "Move the deal to"}</Label>
                         <DealStagePicker

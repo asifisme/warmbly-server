@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/warmbly/warmbly/internal/app/auth"
+	"github.com/warmbly/warmbly/internal/app/token"
 	"github.com/warmbly/warmbly/internal/config"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
@@ -129,6 +130,12 @@ func runUserCreate(ctx context.Context, args []string) error {
 	created, cerr := c.users.CreateUser(ctx, parsed, hash)
 	if cerr != nil {
 		return fmt.Errorf("creating the account: %w", cerr)
+	}
+	// An operator-made account is ready to use; the first-run wizard is for self-service signups.
+	if at, merr := c.users.MarkOnboarded(ctx, created.ID); merr != nil {
+		warn("the account was created but is not marked onboarded, so the dashboard will show the setup wizard first: %v", merr)
+	} else {
+		created.OnboardingCompletedAt = &at
 	}
 	if c.cache != nil {
 		if xerr := c.userService().SaveUser(ctx, created); xerr != nil {
@@ -301,7 +308,8 @@ func issueResetLink(ctx context.Context, c *conn, u *models.User, ttl time.Durat
 	issuedAt := time.Now()
 	expiresAt := issuedAt.Add(ttl)
 
-	tok, terr := c.tokenService(secret).GenerateToken(u.ID, sessionID, u.Email, nonce, issuedAt, expiresAt)
+	// The reset flow accepts only a token minted for its own purpose.
+	tok, terr := c.tokenService(secret).GenerateTokenFor(token.PurposePasswordReset, u.ID, sessionID, u.Email, nonce, issuedAt, expiresAt)
 	if terr != nil {
 		return fmt.Errorf("signing the reset token: %w", terr)
 	}
@@ -309,7 +317,7 @@ func issueResetLink(ctx context.Context, c *conn, u *models.User, ttl time.Durat
 		return fmt.Errorf("storing the reset session: %w", serr)
 	}
 
-	fmt.Printf("Issued a password reset session for %s. It is single use and expires at %s. No password has changed yet.\n\n  %s\n\n", u.Email, expiresAt.UTC().Format(time.RFC3339), config.GetPasswordResetURL(tok))
+	fmt.Printf("Issued a password reset session for %s. It is single use and expires at %s. No password has changed yet.\n\n  %s\n\n", u.Email, expiresAt.UTC().Format(time.RFC3339), config.GetPasswordResetURL(tok, ""))
 	fmt.Println("Open that link in a browser to choose the new password. Opening it revokes every existing session for the account.")
 	fmt.Println("If the host is wrong, set APP_URL to the URL the dashboard is served from and run this again.")
 	return nil

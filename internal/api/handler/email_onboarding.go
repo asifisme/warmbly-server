@@ -19,6 +19,8 @@ type OnboardingOAuthStartRequest struct {
 	Provider string `json:"provider"`
 	// LoginHint preselects the mailbox in the provider's picker (an import's sign-in rows).
 	LoginHint string `json:"login_hint"`
+	// Return is "web" when the dashboard starts the flow: a sign-in window without an opener then returns to it.
+	Return string `json:"return"`
 }
 
 // OnboardingOAuthFinishRequest carries the authorization code + state back from the provider.
@@ -49,7 +51,11 @@ func (h *Handler) StartEmailOAuth(c *gin.Context) {
 		return
 	}
 
-	resp, xerr := h.EmailService.OAuthStart(c.Request.Context(), userID, orgID, models.InboxProvider(req.Provider), req.LoginHint)
+	returnOrigin := ""
+	if req.Return == "web" {
+		returnOrigin = c.GetHeader("Origin")
+	}
+	resp, xerr := h.EmailService.OAuthStart(c.Request.Context(), userID, orgID, models.InboxProvider(req.Provider), req.LoginHint, req.Return == "web", returnOrigin)
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
@@ -78,10 +84,14 @@ func (h *Handler) FinishEmailOAuth(c *gin.Context) {
 	if reauthed {
 		action, status = models.AuditActionUpdate, http.StatusOK
 	}
-	h.auditOrg(c, action, models.AuditEntityEmailAccount, &acc.ID, nil, map[string]string{
-		"provider": acc.Provider,
-		"email":    acc.Email,
-	})
+	// The flow's organization is the one the state was minted for, which the
+	// session may have switched away from since.
+	if acc.OrganizationID != nil {
+		h.auditInOrg(c, *acc.OrganizationID, action, models.AuditEntityEmailAccount, &acc.ID, nil, map[string]string{
+			"provider": acc.Provider,
+			"email":    acc.Email,
+		})
+	}
 
 	c.JSON(status, acc)
 }
@@ -128,7 +138,7 @@ func (h *Handler) ReauthEmailOAuth(c *gin.Context) {
 		return
 	}
 
-	resp, xerr := h.EmailService.OAuthReauth(c.Request.Context(), userID, orgID, id)
+	resp, xerr := h.EmailService.OAuthReauth(c.Request.Context(), userID, orgID, id, c.GetHeader("Origin"))
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return

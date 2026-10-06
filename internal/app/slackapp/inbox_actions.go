@@ -150,8 +150,8 @@ func (s *Service) submitReply(ctx context.Context, p *interaction) any {
 		return viewErrors("body", "Replying from Slack is not available on this Warmbly instance.")
 	}
 	a := s.resolveActor(ctx, p.teamID(), p.User.ID)
-	if a == nil || a.link == nil {
-		return viewErrors("body", "Link your Warmbly account first: type /warmbly link.")
+	if a == nil || (a.link == nil && !s.autoLink(ctx, a)) {
+		return viewErrors("body", "Link your Warmbly account first: mention @Warmbly or message it, and follow the link it sends you.")
 	}
 	if !a.member.Permissions.HasPermission(models.PermAccessUnibox) {
 		return viewErrors("body", "You need inbox access in Warmbly to reply.")
@@ -215,7 +215,7 @@ func (s *Service) inboxDraft(ctx context.Context, p *interaction, threadID, acti
 		conn: t.a.conn, token: t.a.token, link: t.a.link, inv: invocation(t.a.member, t.a.link),
 		channel: t.mapping.ChannelID, threadTS: t.mapping.ThreadTS,
 		messageID: "slack:inbox_draft:" + t.mapping.ID.String() + ":" + actionTS,
-		text:      text, reassign: true,
+		text:      text, reassign: true, quotesOthers: true,
 	})
 }
 

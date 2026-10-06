@@ -1,6 +1,6 @@
 import { RiFireLine, RiMoreLine } from "@remixicon/react";
 import React, { useEffect, useMemo, useRef } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams } from "@/hooks/useSearchParams";
 import toast from "react-hot-toast";
 import { useQueryClient } from "@tanstack/react-query";
 import useEmails from "@/lib/api/hooks/app/emails/useEmails";
@@ -465,7 +465,7 @@ export default function AddressesPage() {
                             totalCount={stats.total}
                             canWarmup={canWarmup}
                             onAdd={() => p?.setAddEmail(true)}
-                            onConnectCloud={!cloud.connected ? () => setCloudDialog(true) : undefined}
+                            onConnectCloud={cloud.manageable && !cloud.connected ? () => setCloudDialog(true) : undefined}
                             cloudConnected={cloud.connected}
                         />
                     )}

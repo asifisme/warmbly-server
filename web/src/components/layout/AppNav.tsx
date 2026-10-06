@@ -6,7 +6,7 @@
 // generic "+ New Campaign" pill. Cold-email work is always-on; the
 // sidebar should reflect that rather than nag with a CTA.
 
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation } from "@tanstack/react-router";
 import {
     ClipboardListIcon,
     BarChart3Icon,
@@ -69,6 +69,8 @@ import { Tooltip, TooltipContent, TooltipGroupRoot, TooltipProvider, TooltipTrig
 import ShortcutTooltip from "@/components/ui/shortcut-tooltip";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { cn } from "@/lib/utils";
+import useCrmProvider from "@/hooks/useCrmProvider";
+import { CrmMark } from "@/components/app/crm/crmProviders";
 
 // Stable (module-level) empty contacts search so the sidebar's contact-count
 // query key never changes identity between renders (which would refetch-loop).
@@ -99,6 +101,8 @@ interface NavItem {
      *  recommendations the Advisor has open for that area, so a problem is
      *  visible from the sidebar on the tab where its fix lives. */
     advisorSurface?: AdvisorSurface;
+    /** CRM screen that shows the connected CRM's records (its logo). */
+    crmProvider?: boolean;
     /** Live indicator key — renders an ambient, realtime activity cluster.
      *  Each key has its OWN motif (campaigns = dot-grid, accounts = flame,
      *  tasks = red attention dot) so the rows stay visually distinct rather
@@ -166,10 +170,10 @@ const sections: NavSection[] = [
         id: "crm",
         label: "CRM",
         items: [
-            { title: "Pipelines", requires: "subscription", url: "/app/crm/pipelines", icon: GitBranchIcon, indicator: "pipelines", permission: "VIEW_CONTACTS", permissionLabel: "View contacts" },
-            { title: "Deals", requires: "subscription", url: "/app/crm/deals", icon: CircleDollarSignIcon, indicator: "deals", permission: "VIEW_CONTACTS", permissionLabel: "View contacts" },
-            { title: "Tasks", requires: "subscription", url: "/app/crm/tasks", icon: CheckSquareIcon, indicator: "tasks", permission: "VIEW_CONTACTS", permissionLabel: "View contacts" },
-            { title: "Meetings", requires: "subscription", url: "/app/crm/meetings", icon: CalendarClockIcon, indicator: "meetings", permission: "VIEW_CONTACTS", permissionLabel: "View contacts" },
+            { title: "Pipelines", crmProvider: true, requires: "subscription", url: "/app/crm/pipelines", icon: GitBranchIcon, indicator: "pipelines", permission: "VIEW_CONTACTS", permissionLabel: "View contacts" },
+            { title: "Deals", crmProvider: true, requires: "subscription", url: "/app/crm/deals", icon: CircleDollarSignIcon, indicator: "deals", permission: "VIEW_CONTACTS", permissionLabel: "View contacts" },
+            { title: "Tasks", crmProvider: true, requires: "subscription", url: "/app/crm/tasks", icon: CheckSquareIcon, indicator: "tasks", permission: "VIEW_CONTACTS", permissionLabel: "View contacts" },
+            { title: "Meetings", crmProvider: true, requires: "subscription", url: "/app/crm/meetings", icon: CalendarClockIcon, indicator: "meetings", permission: "VIEW_CONTACTS", permissionLabel: "View contacts" },
         ],
     },
     {
@@ -242,7 +246,7 @@ function isNavItemActive(pathname: string, item: NavItem): boolean {
 }
 
 function NavRow({ item, collapsed = false }: { item: NavItem; collapsed?: boolean }) {
-    const { pathname } = useLocation();
+    const pathname = useLocation({ select: (l) => l.pathname });
     const unseen = useAppStore((s) => s.unseenCount);
     const access = useFeatureAccess();
     const hasItemPermission = usePermission(item.permission ?? "VIEW_CAMPAIGNS");
@@ -373,6 +377,7 @@ function NavRow({ item, collapsed = false }: { item: NavItem; collapsed?: boolea
                     "Campaigns"/"Accounts" used to clip it at narrower widths. */}
                 <span className={labelFade(collapsed)}>
                     <span className="truncate flex-1 min-w-0">{item.title}</span>
+                    {item.crmProvider && !locked && <CrmProviderMark />}
                     {item.advisorSurface && !locked && !collapsed && <AdvisorNavBadge surface={item.advisorSurface} />}
                     {item.indicator === "campaigns" && !locked && <CampaignActivity />}
                     {item.indicator === "accounts" && !locked && <MailboxActivity />}
@@ -407,6 +412,7 @@ function NavRow({ item, collapsed = false }: { item: NavItem; collapsed?: boolea
                         <AdvisorNavBadge surface={item.advisorSurface} dot />
                     </span>
                 )}
+                {collapsed && item.crmProvider && !locked && <CrmReconnectDot />}
                 {collapsed && badge != null && badge > 0 && (
                     <span className={cn("absolute -right-0.5 -top-0.5 min-w-[15px] h-[15px] px-1 rounded-full bg-red-500 text-white text-[9px] font-medium leading-none flex items-center justify-center tabular-nums ring-2 ring-white", RAIL_MARK_IN)}>
                         <span className="sr-only">{badge} unread</span>
@@ -415,6 +421,35 @@ function NavRow({ item, collapsed = false }: { item: NavItem; collapsed?: boolea
                 )}
             </Link>
         </NavTip>
+    );
+}
+
+// The connected CRM's logo on a CRM row while the workspace runs on it, with an
+// amber dot when the connection needs to be reconnected.
+function CrmProviderMark() {
+    const { isExternal, crm, needsReconnect } = useCrmProvider();
+    if (!isExternal) return null;
+    return (
+        <span
+            className="relative inline-flex shrink-0"
+            title={needsReconnect ? `${crm.name} needs to be reconnected` : `Records from ${crm.name}`}
+        >
+            <CrmMark provider={crm.id} className="w-3 h-3" title={needsReconnect ? `${crm.name} needs to be reconnected` : crm.name} />
+            {needsReconnect && (
+                <span className="absolute -right-0.5 -top-0.5 size-1.5 rounded-full bg-amber-500 ring-1 ring-white" />
+            )}
+        </span>
+    );
+}
+
+// Collapsed rail: only the reconnect warning survives, as a dot on the icon.
+function CrmReconnectDot() {
+    const { needsReconnect, crm } = useCrmProvider();
+    if (!needsReconnect) return null;
+    return (
+        <span className={cn("absolute right-1 top-1 size-1.5 rounded-full bg-amber-500 ring-2 ring-white", RAIL_MARK_IN)}>
+            <span className="sr-only">{crm.name} needs to be reconnected</span>
+        </span>
     );
 }
 
@@ -724,7 +759,7 @@ function Section({
     collapsed?: boolean;
 }) {
     const id = useId();
-    const { pathname } = useLocation();
+    const pathname = useLocation({ select: (l) => l.pathname });
     const folded = useAppStore((s) => s.navCollapsedSections[section.id] ?? false);
     const toggleNavSection = useAppStore((s) => s.toggleNavSection);
     const org = useAppStore((s) => s.currentOrganization);
