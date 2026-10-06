@@ -5,7 +5,7 @@
 // allowance is actually used up.
 
 import React from "react";
-import { Link } from "react-router-dom";
+import { Link } from "@tanstack/react-router";
 import { ArrowRightIcon, CloudIcon, ExternalLinkIcon, MailCheckIcon, TrendingUpIcon, XIcon } from "lucide-react";
 import useCloudPool from "@/hooks/useCloudPool";
 
@@ -15,7 +15,7 @@ export default function CloudPoolBanner({ onConnect, mailboxCount }: { onConnect
     const pool = useCloudPool();
     const [dismissed, setDismissed] = React.useState(() => localStorage.getItem(DISMISS_KEY) === "1");
 
-    if (!pool.selfHosted || pool.loading) return null;
+    if (!pool.manageable || pool.loading) return null;
 
     if (pool.connected) {
         const plan = pool.plan;

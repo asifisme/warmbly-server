@@ -19,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconf "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/google/uuid"
-	"github.com/meszmate/apple-go"
 	"github.com/redis/go-redis/v9"
 	"github.com/warmbly/warmbly/internal/api"
 	"github.com/warmbly/warmbly/internal/api/handler"
@@ -36,6 +35,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/aitools"
 	"github.com/warmbly/warmbly/internal/app/analytics"
 	"github.com/warmbly/warmbly/internal/app/apikey"
+	"github.com/warmbly/warmbly/internal/app/appdirectory"
 	"github.com/warmbly/warmbly/internal/app/audit"
 	"github.com/warmbly/warmbly/internal/app/auth"
 	behaviorapp "github.com/warmbly/warmbly/internal/app/behavior"
@@ -50,6 +50,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/credits"
 	"github.com/warmbly/warmbly/internal/app/creditwatch"
 	"github.com/warmbly/warmbly/internal/app/crm"
+	"github.com/warmbly/warmbly/internal/app/crmmode"
 	"github.com/warmbly/warmbly/internal/app/dailythrottle"
 	"github.com/warmbly/warmbly/internal/app/dangerzone"
 	"github.com/warmbly/warmbly/internal/app/delegation"
@@ -64,6 +65,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/form"
 	"github.com/warmbly/warmbly/internal/app/group"
 	"github.com/warmbly/warmbly/internal/app/guardrail"
+	"github.com/warmbly/warmbly/internal/app/hubspot"
 	idempotencyapp "github.com/warmbly/warmbly/internal/app/idempotency"
 	"github.com/warmbly/warmbly/internal/app/inboxagent"
 	"github.com/warmbly/warmbly/internal/app/inboxtag"
@@ -84,6 +86,7 @@ import (
 	orgrisk "github.com/warmbly/warmbly/internal/app/orgrisk"
 	"github.com/warmbly/warmbly/internal/app/orgtransfer"
 	"github.com/warmbly/warmbly/internal/app/passkey"
+	"github.com/warmbly/warmbly/internal/app/pipedrive"
 	"github.com/warmbly/warmbly/internal/app/placement"
 	"github.com/warmbly/warmbly/internal/app/poollink"
 	"github.com/warmbly/warmbly/internal/app/ratelimit"
@@ -91,6 +94,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/releases"
 	"github.com/warmbly/warmbly/internal/app/replyclassify"
 	"github.com/warmbly/warmbly/internal/app/research"
+	"github.com/warmbly/warmbly/internal/app/salesforce"
 	"github.com/warmbly/warmbly/internal/app/segment"
 	"github.com/warmbly/warmbly/internal/app/sendingdomain"
 	"github.com/warmbly/warmbly/internal/app/sequence"
@@ -137,6 +141,7 @@ import (
 	"github.com/warmbly/warmbly/internal/notify"
 	"github.com/warmbly/warmbly/internal/observability"
 	productanalytics "github.com/warmbly/warmbly/internal/observability/analytics"
+	"github.com/warmbly/warmbly/internal/pkg/appleauth"
 	"github.com/warmbly/warmbly/internal/pkg/captcha"
 	"github.com/warmbly/warmbly/internal/pkg/domainproof"
 	"github.com/warmbly/warmbly/internal/pkg/emailverify"
@@ -183,6 +188,9 @@ func main() {
 	var emailService email.EmailService
 	var mailboxImportService *mailboximport.Service
 	var contactImportService *contactimport.Service
+	var hubspotService *hubspot.Service
+	var pipedriveService *pipedrive.Service
+	var crmModes *crmmode.Registry
 	var delegationService *delegation.Service
 	var vendorConnService *vendorconn.Service
 	var sendingDomainService *sendingdomain.Service
@@ -339,6 +347,7 @@ func main() {
 	var webhookServiceForHandler webhook.Service
 	var integrationServiceForHandler integration.Service
 	var oauthService *oauth.Service
+	var appDirectoryService *appdirectory.Service
 	var notificationService notification.Service
 	var twofaService twofa.Service
 	var viewPreferencesService viewprefs.Service
@@ -346,6 +355,7 @@ func main() {
 	var attachmentRepoForHandler repository.AttachmentRepository
 	var emailImageRepoForHandler repository.EmailImageRepository
 	var leadSyncServiceForHandler leadsync.Service
+	var salesforceServiceForHandler *salesforce.Service
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -562,9 +572,9 @@ func main() {
 		// Apple Sign in is optional. Skip it entirely when unconfigured (a
 		// self-host without Apple creds); only warn — never fatal — when creds
 		// are present but init fails, so Apple simply stays unavailable.
-		var appleAuthClient apple.AppleAuth
+		var appleAuthClient socialauth.AppleCodeExchanger
 		if authCfg.AppleAppID != "" || authCfg.AppleKeySecret != "" {
-			appleAuthInstance, appleErr := apple.NewB64(
+			appleAuthInstance, appleErr := appleauth.NewFromBase64(
 				authCfg.AppleAppID,
 				authCfg.AppleTeamID,
 				authCfg.AppleKeyID,
@@ -618,11 +628,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		// The bypass token must be set explicitly. It used to fall back to a
-		// hardcoded literal whenever APP_ENV was "dev", which is the shipped
-		// default in both compose and env.example, so any deployment that
-		// turned captcha on while leaving APP_ENV alone had a universal,
-		// publicly known bypass on login, registration and password reset.
+		// The captcha bypass exists only in dev and only as an explicitly set token; there is no default.
 		turnstileBypassToken := ""
 		if cfg.Env == "dev" {
 			turnstileBypassToken = authCfg.TurnstileBypass
@@ -783,13 +789,19 @@ func main() {
 
 		integrationRepository := repository.NewIntegrationRepository(primaryDB.Pool)
 		// OAuth 2.1 authorization server (third-party app registration + token flow).
-		oauthService = oauth.NewService(repository.NewOAuthRepository(primaryDB.Pool), cache)
+		oauthRepository := repository.NewOAuthRepositorySealed(primaryDB.Pool, credEncrypter)
+		oauthService = oauth.NewService(oauthRepository, cache)
 		// Enforce the per-app webhook-domain allowlist on app-scoped endpoints (at
 		// write time, and re-checked at delivery time via the worker below).
 		webhookService.WireAppDomainResolver(oauthService.AllowedWebhookDomains)
 		// Materialize per-org webhook endpoints when an app is authorized/revoked or
 		// its webhook config changes (the app-level subscription model).
 		oauthService.WireWebhookSync(webhookRepository)
+		// Community app directory: published OAuth apps, reviewed before discovery.
+		appDirectoryRepo := repository.NewAppDirectoryRepository(primaryDB.Pool)
+		oauthService.WireListingGuard(appDirectoryRepo)
+		oauthService.WireAdmin(repository.NewOAuthAdminRepository(primaryDB.Pool))
+		appDirectoryService = appdirectory.NewService(appDirectoryRepo, oauthRepository)
 		// integrationServiceForHandler is constructed after cipherService below —
 		// OAuth/secret sealing depends on the envelope-encryption service.
 		contactRepoForHandler = contactRepostory
@@ -857,6 +869,10 @@ func main() {
 		}
 
 		tokenService = token.NewService(primaryDB, tokenRepostory, cache, geoloc, authCfg.AuthSecret)
+		// A revoked session takes the user's open sockets with it.
+		if streamingPublisher != nil {
+			tokenService.WireRevocationPublisher(streamingPublisher)
+		}
 		userService = user.NewService(userRepostory, cache)
 
 		// A removed member's sessions and app authorizations end with the membership, on every removal path.
@@ -952,6 +968,13 @@ func main() {
 			// document, so this needs nothing else configured to work.
 			opsNotifier = opsnotify.NewService(instanceSettings, emailNotificationService, config.AppBaseURL())
 			authService.WireOperatorNotifier(opsNotifier)
+			// Security alerts: admin sign-ins and admin access grants and revokes.
+			tokenService.WireSessionObserver(opsnotify.NewAdminSignIns(opsNotifier, organizationRepoForHandler, adminRepository))
+			if aware, ok := adminService.(interface {
+				WireOperatorNotifier(admin.OperatorNotifier)
+			}); ok && adminService != nil {
+				aware.WireOperatorNotifier(opsNotifier)
+			}
 			if organizationService != nil {
 				organizationService.WireOperatorNotifier(opsNotifier)
 			}
@@ -1582,6 +1605,25 @@ func main() {
 		// The AI switch's optional web search shares the same pluggable backend as
 		// the campaign switch and dashboard agent.
 		integrationServiceForHandler.SetAISearch(aiSearch)
+
+		// Native Salesforce sync: events are recorded ahead of the webhook
+		// throttle, and the loops log them as Tasks, pull changes back and run
+		// recurring list-view imports.
+		salesforceServiceForHandler = salesforce.NewService(salesforce.Deps{
+			Repo:         repository.NewSalesforceRepository(primaryDB.Pool),
+			Integrations: integrationServiceForHandler,
+			Cipher:       cipherService,
+			Contacts:     contactService,
+			Holds:        campaignProgressRepository,
+			Suppression:  advancedRepository,
+			Subscription: contactRepostory,
+		})
+		integrationServiceForHandler.SetSalesforce(salesforceServiceForHandler)
+		webhookService.WireRecordSink(salesforceServiceForHandler.Recorder().Record)
+		go jobrun.Loop(ctx, "salesforce_activity_drain", 30*time.Second, true, salesforceServiceForHandler.Drain)
+		go jobrun.Loop(ctx, "salesforce_pull", 5*time.Minute, false, salesforceServiceForHandler.Pull)
+		go jobrun.Loop(ctx, "salesforce_recurring_imports", 5*time.Minute, false, salesforceServiceForHandler.RunRecurring)
+		go jobrun.Loop(ctx, "salesforce_activity_prune", 24*time.Hour, false, salesforceServiceForHandler.Prune)
 		// Port reply-classifier Layer 3 onto the platform provider (OpenAI-first,
 		// self-hostable). Platform-paid, never charged to org credits. Nil provider
 		// leaves Layer 3 disabled (the ambiguous middle resolves to "unknown").
@@ -1646,7 +1688,7 @@ func main() {
 			Orgs: organizationService, Agent: aiAgentService, Registry: aiToolRegistry,
 			Audit: auditService, Redis: slackRedis,
 			Threads: uniboxRepository, Labels: repository.NewTagCategoryStore(primaryDB.Pool),
-			Drafts: aiDraftRepo, Users: userRepostory, Tasks: taskRepository, Campaigns: campaignRepostory,
+			Drafts: aiDraftRepo, Users: userRepostory, Bans: userRepostory, Tasks: taskRepository, Campaigns: campaignRepostory,
 			Cipher: cipherService,
 		})
 		notificationService.WireDelivery(emailNotificationService, slackService, userRepostory, organizationRepoForHandler)
@@ -1654,6 +1696,8 @@ func main() {
 			aware.WireReplyObserver(slackService)
 		}
 		organizationService.WireMemberRemoval(slackService.OnMemberRemoved)
+		integrationServiceForHandler.SetSlackInstallHook(slackService)
+		aitools.RegisterSlackTools(aiToolRegistry, slackService, auditService)
 		slackService.StartMaintenance(ctx)
 		// The classified intent lands on the contact's progress for the
 		// reply_intent branch condition.
@@ -1912,6 +1956,11 @@ func main() {
 		// just new mail. Walks the table once, then returns.
 		go uniboxService.StartBodyTextBackfill(ctx)
 
+		// Automation signing secrets live in each connection's sealed config.
+		if m, ok := integrationServiceForHandler.(interface{ StartSigningSecretMigration(context.Context) }); ok {
+			go m.StartSigningSecretMigration(ctx)
+		}
+
 		// Danger zone: schedule + execute delayed deletions (orgs, accounts).
 		dangerZoneRepository := repository.NewDangerZoneRepository(primaryDB.Pool)
 		dangerZoneService = dangerzone.NewService(
@@ -2019,6 +2068,51 @@ func main() {
 				Kicked: emailVerifyService.Kick,
 			})
 			go contactImportService.Run(ctx)
+		}
+
+		// HubSpot as the workspace CRM: write-through for the CRM service, the
+		// activity sink, and the outbox for automation-written records. The
+		// consumer drains the outbox and runs the pull.
+		hubspotService = hubspot.New(hubspot.Deps{
+			Repo:         repository.NewCRMProviderRepository(primaryDB.Pool),
+			CRM:          crmRepository,
+			Tokens:       integrationServiceForHandler,
+			Contacts:     contactRepostory,
+			Holds:        campaignProgressRepository,
+			Suppress:     advancedRepository,
+			Importer:     hubspotImporter(contactImportService),
+			Leads:        contactService,
+			Realtime:     streamingPublisher,
+			Cache:        cache,
+			AppURL:       os.Getenv("APP_URL"),
+			ClientSecret: strings.TrimSpace(os.Getenv("HUBSPOT_OAUTH_CLIENT_SECRET")),
+		})
+		// Pipedrive as the workspace CRM: the same shape on Pipedrive's records,
+		// plus per-connection webhooks registered when a workspace switches.
+		pipedriveService = pipedrive.New(pipedrive.Deps{
+			Repo:         repository.NewCRMProviderRepository(primaryDB.Pool),
+			CRM:          crmRepository,
+			Tokens:       integrationServiceForHandler,
+			Contacts:     contactRepostory,
+			Holds:        campaignProgressRepository,
+			Suppress:     advancedRepository,
+			Importer:     pipedriveImporter(contactImportService),
+			Leads:        contactService,
+			Realtime:     streamingPublisher,
+			Cache:        cache,
+			AppURL:       os.Getenv("APP_URL"),
+			PublicURL:    config.BackendPublicURL(),
+			ClientSecret: strings.TrimSpace(os.Getenv("PIPEDRIVE_OAUTH_CLIENT_SECRET")),
+		})
+		crmModes = crmmode.New(repository.NewCRMProviderRepository(primaryDB.Pool), integrationServiceForHandler,
+			hubspotService, pipedriveService)
+		crmService.AddExternal(hubspotService)
+		crmService.AddExternal(pipedriveService)
+		integrationServiceForHandler.SetCRMModeCheck(crmModes.Mode)
+		webhookServiceForHandler.WireRecordSink(hubspotService.OnEvent)
+		webhookServiceForHandler.WireRecordSink(pipedriveService.OnEvent)
+		if advancedService != nil {
+			advancedService.WireCRMOutbox(crmModes)
 		}
 		emailVerifyService.SetVerdictHook(func(ctx context.Context, orgID uuid.UUID) {
 			if campaignService != nil {
@@ -2248,6 +2342,9 @@ func main() {
 
 		// CRM
 		CRMService: crmService,
+		HubSpot:    hubspotService,
+		Pipedrive:  pipedriveService,
+		CRMModes:   crmModes,
 
 		// Teams
 		TeamService: teamService,
@@ -2314,8 +2411,14 @@ func main() {
 		// OAuth 2.1 authorization server
 		OAuthService: oauthService,
 
+		// Community app directory
+		AppDirectoryService: appDirectoryService,
+
 		// On-demand Google Sheets -> leads sync
 		LeadSyncService: leadSyncServiceForHandler,
+
+		// Native Salesforce sync
+		SalesforceService: salesforceServiceForHandler,
 
 		WebsocketURI: websocketURI,
 
@@ -2430,6 +2533,23 @@ func main() {
 }
 
 // emailVerifyHeloHost resolves the hostname the pre-send verifier announces in
+// hubspotImporter keeps a missing import service a nil interface rather than
+// a typed nil, so HubSpot list import reports itself unavailable.
+func hubspotImporter(s *contactimport.Service) hubspot.Importer {
+	if s == nil {
+		return nil
+	}
+	return s
+}
+
+// pipedriveImporter is hubspotImporter for Pipedrive filter import.
+func pipedriveImporter(s *contactimport.Service) pipedrive.Importer {
+	if s == nil {
+		return nil
+	}
+	return s
+}
+
 // analyticsHostFrom reduces APP_URL to a bare hostname. It is one of the three
 // inputs to PostHog's cookieless hash, and PostHog reduces it further to the
 // registrable root domain, which is what makes a visit to warmbly.com and the

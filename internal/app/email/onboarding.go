@@ -18,12 +18,35 @@ import (
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/observability/errs"
 	"github.com/warmbly/warmbly/internal/pkg/crypt"
+	"github.com/warmbly/warmbly/internal/pkg/displayname"
+	"github.com/warmbly/warmbly/internal/utils/validate"
 	"golang.org/x/oauth2"
 )
 
+// WebStatePrefix marks a state the dashboard started, so a sign-in window that lost its opener returns
+// to the dashboard rather than the native app scheme. A base64url nonce never contains '.'.
+const WebStatePrefix = "w."
+
+// IsWebState reports whether a callback state belongs to a flow the dashboard started.
+func IsWebState(state string) bool {
+	return strings.HasPrefix(state, WebStatePrefix)
+}
+
+// newState mints a state nonce, marked when the dashboard started the flow.
+func newState(web bool) (string, error) {
+	n, err := crypt.Nonce()
+	if err != nil || !web {
+		return n, err
+	}
+	return WebStatePrefix + n, nil
+}
+
 // OAuthStart issues a fresh state nonce and returns the provider-specific authorization URL.
 // The caller is expected to redirect the user to the URL and post back to OAuthFinish on return.
-func (s *emailService) OAuthStart(ctx context.Context, userID string, orgID *uuid.UUID, provider models.InboxProvider, loginHint string) (*models.EmailOnboardingStartResponse, *errx.Error) {
+func (s *emailService) OAuthStart(ctx context.Context, userID string, orgID *uuid.UUID, provider models.InboxProvider, loginHint string, web bool, returnOrigin string) (*models.EmailOnboardingStartResponse, *errx.Error) {
+	if returnOrigin != "" && (!web || config.DashboardOrigin(returnOrigin) == "") {
+		return nil, errx.ErrEmailOnboardReturnOrigin
+	}
 	// A new mailbox only; OAuthReauth renews an existing one and is not gated.
 	if provider == models.InboxProviderGoogle && !config.GoogleOAuthConnect() {
 		return nil, errx.ErrEmailOnboardGoogleOAuthDisabled
@@ -39,7 +62,7 @@ func (s *emailService) OAuthStart(ctx context.Context, userID string, orgID *uui
 		return nil, xerr
 	}
 
-	state, err := crypt.Nonce()
+	state, err := newState(web)
 	if err != nil {
 		errs.CaptureException(err)
 		return nil, errx.InternalError()
@@ -56,6 +79,7 @@ func (s *emailService) OAuthStart(ctx context.Context, userID string, orgID *uui
 		Provider:       string(provider),
 		Nonce:          state,
 		CodeVerifier:   verifier,
+		ReturnOrigin:   returnOrigin,
 	}); xerr != nil {
 		return nil, xerr
 	}
@@ -152,15 +176,11 @@ func (s *emailService) OAuthFinish(ctx context.Context, userID, code, state stri
 		return nil, false, xerr
 	}
 
-	// The verifier proves this is the same party that started the flow. Absent
-	// only for a state written before PKCE existed, where the exchange has to
-	// go ahead without it or an in-flight consent dies on deploy.
-	var exchangeOpts []oauth2.AuthCodeOption
-	if sess.CodeVerifier != "" {
-		exchangeOpts = append(exchangeOpts, oauth2.VerifierOption(sess.CodeVerifier))
+	// The verifier proves this is the same party that started the flow.
+	if sess.CodeVerifier == "" {
+		return nil, false, errx.ErrEmailOnboardState
 	}
-
-	tok, err := cfg.Exchange(ctx, code, exchangeOpts...)
+	tok, err := cfg.Exchange(ctx, code, oauth2.VerifierOption(sess.CodeVerifier))
 	if err != nil {
 		return nil, false, errx.ErrEmailOnboardExchange
 	}
@@ -357,6 +377,13 @@ func validateSMTPIMAPInput(data *models.NewSMTPIMAPAccount) *errx.Error {
 	}
 	if !validNameLen(&data.Name) {
 		return errx.ErrEmailName
+	}
+	// Replaced rather than refused, so a row of an import file still connects.
+	if validate.MailboxNameShown(data.Name) != nil {
+		data.Name = displayname.FromEmail(data.Email)
+		if len([]rune(data.Name)) < 2 {
+			data.Name = "Mailbox"
+		}
 	}
 	if strings.TrimSpace(data.SMTP.Host) == "" {
 		return errx.ErrEmailSMTPHost

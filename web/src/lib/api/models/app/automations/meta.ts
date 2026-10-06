@@ -40,7 +40,7 @@ export const ACTION_LABELS: Record<string, string> = {
     "discord.notify": "Send a Discord message",
     "hubspot.upsert_contact": "Create / update HubSpot contact",
     "pipedrive.upsert_person": "Create / update Pipedrive person",
-    "salesforce.upsert_contact": "Create / update Salesforce contact",
+    "salesforce.upsert_contact": "Create / update Salesforce record",
     "close.upsert_lead": "Create / update Close lead",
     "webhook.ping": "Send a webhook",
     // Native (Warmbly built-in) actions — no external connection needed.
@@ -235,7 +235,7 @@ export const CONTACT_SOURCES = [
     { value: "api", label: "API" },
     { value: "form", label: "Form submission" },
     { value: "automation", label: "Automation" },
-    { value: "ai_assistant", label: "AI assistant" },
+    { value: "ai_assistant", label: "Remie" },
 ];
 
 export const TRIGGER_FIELDS: Record<string, TriggerFieldDef[]> = {

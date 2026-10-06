@@ -8,27 +8,23 @@ import (
 	"github.com/warmbly/warmbly/internal/models"
 )
 
-func TestHeartbeatAddressPrefersBackendObservedPublicIPv4(t *testing.T) {
+func TestHeartbeatAddressRequiresNodePublicIPv4(t *testing.T) {
 	tests := []struct {
-		name     string
 		reported string
-		observed string
 		want     string
 	}{
-		{"observed public address replaces stale report", "198.51.100.8", "8.8.8.8", "8.8.8.8"},
-		{"private proxy hop keeps reported public address", "1.1.1.1", "10.0.0.4", "1.1.1.1"},
-		{"carrier grade nat is not a public address", "1.1.1.1", "100.64.2.3", "1.1.1.1"},
-		{"mapped public IPv4 is canonicalized", "1.1.1.1", "::ffff:8.8.8.8", "8.8.8.8"},
-		{"private direct address is still useful", "", "10.0.0.4", "10.0.0.4"},
-		{"public IPv6 does not replace requested IPv4", "1.1.1.1", "2001:4860:4860::8888", "1.1.1.1"},
+		{"1.1.1.1", "1.1.1.1"},
+		{"::ffff:1.1.1.1", "1.1.1.1"},
+		{"198.51.100.8", ""},
+		{"100.64.2.3", ""},
+		{"172.17.0.2", ""},
+		{"2001:4860:4860::8888", ""},
+		{"", ""},
 	}
-
 	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := heartbeatAddress(tc.reported, tc.observed); got != tc.want {
-				t.Fatalf("heartbeatAddress(%q, %q) = %q, want %q", tc.reported, tc.observed, got, tc.want)
-			}
-		})
+		if got := heartbeatAddress(tc.reported); got != tc.want {
+			t.Errorf("heartbeatAddress(%q) = %q, want %q", tc.reported, got, tc.want)
+		}
 	}
 }
 
@@ -219,5 +215,43 @@ func TestRenderNodeEnvWorkerIdentity(t *testing.T) {
 	// the node concatenates paths onto.
 	if env["ENCRYPTED_KEYS_BACKEND_URL"] != "https://api.example.com" {
 		t.Errorf("ENCRYPTED_KEYS_BACKEND_URL = %q", env["ENCRYPTED_KEYS_BACKEND_URL"])
+	}
+}
+
+// A consumer refreshes integration tokens and drains the CRM outbox, so it
+// needs the integration client credentials; a worker never sees them.
+func TestRenderNodeEnvIntegrationCredentialsReachConsumerOnly(t *testing.T) {
+	setInstanceEnv(t)
+	t.Setenv("HUBSPOT_OAUTH_CLIENT_ID", "hs-id")
+	t.Setenv("HUBSPOT_OAUTH_CLIENT_SECRET", "hs-secret")
+
+	consumer := envLines(t, renderNodeEnv(uuid.New(), models.NodeRoleConsumer, ""))
+	if consumer["HUBSPOT_OAUTH_CLIENT_SECRET"] != "hs-secret" || consumer["HUBSPOT_OAUTH_CLIENT_ID"] != "hs-id" {
+		t.Errorf("consumer missing HubSpot credentials: %v", consumer)
+	}
+	worker := envLines(t, renderNodeEnv(uuid.New(), models.NodeRoleWorker, ""))
+	if _, ok := worker["HUBSPOT_OAUTH_CLIENT_SECRET"]; ok {
+		t.Error("a worker was handed an integration client secret")
+	}
+}
+
+// A node calls only node routes, so with a separate node token it carries that
+// alone and never the token the tracking and forms services hold.
+func TestRenderNodeEnvSendsOnlyTheNodeToken(t *testing.T) {
+	setInstanceEnv(t)
+	t.Setenv("NODE_BROKER_TOKEN", "nodetok")
+
+	env := envLines(t, renderNodeEnv(uuid.New(), models.NodeRoleWorker, ""))
+	if env["NODE_BROKER_TOKEN"] != "nodetok" || env["ENCRYPTED_KEYS_WORKER_TOKEN"] != "nodetok" {
+		t.Errorf("node token not sent: %q / %q", env["NODE_BROKER_TOKEN"], env["ENCRYPTED_KEYS_WORKER_TOKEN"])
+	}
+	if _, ok := env["INTERNAL_API_TOKEN"]; ok {
+		t.Error("a node was handed the edge services' internal token")
+	}
+
+	t.Setenv("NODE_BROKER_TOKEN", "")
+	env = envLines(t, renderNodeEnv(uuid.New(), models.NodeRoleWorker, ""))
+	if env["ENCRYPTED_KEYS_WORKER_TOKEN"] != "tok" || env["INTERNAL_API_TOKEN"] != "tok" {
+		t.Error("a single-token instance must keep sending the shared token")
 	}
 }

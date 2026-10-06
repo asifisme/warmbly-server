@@ -29,6 +29,10 @@ const (
 	decisionDeny     = "deny"
 	decisionAlways   = "always_allow"
 	errGenericAnswer = "Something went wrong. Please try again."
+	reactWorking     = "eyes"
+	reactDone        = "white_check_mark"
+	// The dashboard gates the assistant on use_ai; Slack answers to the same rule.
+	errNoAIAnswer = "Your Warmbly role does not include the AI assistant. Ask a workspace admin for AI access."
 )
 
 // agentTurn is one assistant run inside a Slack thread.
@@ -45,14 +49,23 @@ type agentTurn struct {
 	// reassign lets a member take over a thread another member started
 	// (inbox threads are shared by the team).
 	reassign bool
+	// ackTS is the member's message, reacted to while the run works on it.
+	ackTS string
+	// quotesOthers: the run reads text other people wrote (a thread, a
+	// message, an email), so no change may run without asking.
+	quotesOthers bool
 }
 
 // invocation builds the tool identity from the member's live permissions.
 func invocation(m *models.OrganizationMember, link *models.SlackUserLink) aitools.Invocation {
+	perms := m.Permissions
+	if m.IsOwner() {
+		perms = models.AllPermissions
+	}
 	return aitools.Invocation{
 		OrgID:     link.OrganizationID,
 		UserID:    link.UserID,
-		OrgPerms:  m.Permissions,
+		OrgPerms:  perms,
 		UserAgent: "Slack",
 	}
 }
@@ -104,6 +117,10 @@ func (s *Service) runTurn(ctx context.Context, t agentTurn) {
 		s.say(ctx, t.token, t.channel, t.threadTS, "The Warmbly assistant is not available on this Warmbly instance.")
 		return
 	}
+	if !t.inv.OrgPerms.HasPermission(models.PermUseAI) {
+		s.say(ctx, t.token, t.channel, t.threadTS, errNoAIAnswer)
+		return
+	}
 	release, ok := s.guard.lock(ctx, runLockKey(t.conn.ID, t.channel, t.threadTS), runLockTTL)
 	if !ok {
 		s.say(ctx, t.token, t.channel, t.threadTS, "I'm still answering the previous message in this thread. Send this again when I'm done.")
@@ -118,15 +135,45 @@ func (s *Service) runTurn(ctx context.Context, t agentTurn) {
 		}
 		return
 	}
+	s.react(ctx, t.token, t.channel, t.ackTS, reactWorking, true)
+	// Anyone can post in a channel, so there every change asks.
+	if !t.dm || t.quotesOthers {
+		ctx = aiagent.WithStrictApproval(ctx)
+	}
 	r := s.newRenderer(t.token, t.channel, t.threadTS, row.SessionID, t.dm)
 	r.start(ctx)
 	xerr := s.agent.RunMessage(ctx, t.inv, row.SessionID, t.messageID, t.text, aiagent.PageSlack, "slack:"+t.channel, r.emit)
 	s.afterRun(ctx, t.token, row, r, xerr)
+	s.react(ctx, t.token, t.channel, t.ackTS, reactWorking, false)
+	if xerr == nil && !r.failed() && r.pendingApproval() == nil {
+		s.react(ctx, t.token, t.channel, t.ackTS, reactDone, true)
+	}
+}
+
+// react adds or removes the bot's reaction on a member's message. An install
+// without reactions:write simply shows none.
+func (s *Service) react(ctx context.Context, token, channel, ts, name string, add bool) {
+	if ts == "" {
+		return
+	}
+	var err error
+	if add {
+		err = s.client.AddReaction(ctx, token, channel, ts, name)
+	} else {
+		err = s.client.RemoveReaction(ctx, token, channel, ts, name)
+	}
+	if err != nil && !IsAPIError(err, "missing_scope", "already_reacted", "no_reaction", "message_not_found") {
+		log.Debug().Err(err).Msg("slack: reaction failed")
+	}
 }
 
 // resumeTurn continues a paused run after the owner's decision.
-func (s *Service) resumeTurn(ctx context.Context, token string, row *models.SlackAgentThread, inv aitools.Invocation, decision string) {
+func (s *Service) resumeTurn(ctx context.Context, token string, row *models.SlackAgentThread, inv aitools.Invocation, toolCallID, decision string) {
 	if s.agent == nil {
+		return
+	}
+	if !inv.OrgPerms.HasPermission(models.PermUseAI) {
+		s.say(ctx, token, row.ChannelID, row.ThreadTS, errNoAIAnswer)
 		return
 	}
 	release, ok := s.guard.lock(ctx, runLockKey(row.ConnectionID, row.ChannelID, row.ThreadTS), runLockTTL)
@@ -135,16 +182,18 @@ func (s *Service) resumeTurn(ctx context.Context, token string, row *models.Slac
 		return
 	}
 	defer release()
+	// What the run read before pausing is not known here, so later changes ask too.
+	ctx = aiagent.WithStrictApproval(ctx)
 	r := s.newRenderer(token, row.ChannelID, row.ThreadTS, row.SessionID, strings.HasPrefix(row.ChannelID, "D"))
 	r.start(ctx)
-	xerr := s.agent.Resume(ctx, inv, row.SessionID, decision, r.emit)
+	xerr := s.agent.Resume(ctx, inv, row.SessionID, toolCallID, decision, r.emit)
 	s.afterRun(ctx, token, row, r, xerr)
 }
 
 func (s *Service) afterRun(ctx context.Context, token string, row *models.SlackAgentThread, r *renderer, xerr *errx.Error) {
 	r.finish(ctx, xerr)
 	if a := r.pendingApproval(); a != nil {
-		ts, err := s.client.PostMessage(ctx, token, approvalCard(row.ChannelID, row.ThreadTS, row.ID, *a))
+		ts, err := s.client.PostMessage(ctx, token, approvalCard(row.ChannelID, row.ThreadTS, row.ID, row.SessionID, *a))
 		if err != nil {
 			log.Warn().Err(err).Msg("slack: approval card failed")
 		} else if err := s.repo.SetAgentThreadApproval(ctx, row.OrganizationID, row.ID, ts); err != nil {
@@ -275,9 +324,13 @@ func formatThreadContext(msgs []slackMessage, skipTS string) string {
 
 // pendingApprovalInfo is the paused tool the approval card shows.
 type pendingApprovalInfo struct {
-	Tool        string
-	Risk        string
-	ArgsSummary string
+	Tool               string
+	Risk               string
+	ToolCallID         string
+	Arguments          string
+	ArgumentsTruncated bool
+	Preview            *models.AgentSendPreview
+	AlwaysAllowOffered bool
 }
 
 func riskLabel(risk string) string {
@@ -290,25 +343,102 @@ func riskLabel(risk string) string {
 	return "Needs your approval"
 }
 
+const (
+	// approvalChunkRunes keeps one preformatted block well inside Slack's per-block limit.
+	approvalChunkRunes = 2900
+	// approvalMaxChunks bounds a card's detail blocks; the rest is read in the dashboard.
+	approvalMaxChunks = 10
+)
+
+// approvalValue binds a card's buttons to its Slack thread row and the one tool call it decides.
+func approvalValue(rowID uuid.UUID, toolCallID string) string {
+	return rowID.String() + "|" + toolCallID
+}
+
+// parseApprovalValue reads approvalValue; a value without a tool call id decides nothing.
+func parseApprovalValue(v string) (uuid.UUID, string, bool) {
+	row, call, ok := strings.Cut(v, "|")
+	if !ok || call == "" {
+		return uuid.Nil, "", false
+	}
+	id, err := uuid.Parse(row)
+	if err != nil {
+		return uuid.Nil, "", false
+	}
+	return id, call, true
+}
+
+// preformatted is a rich_text code block, which Slack shows verbatim with no mrkdwn escaping.
+func preformatted(s string) Block {
+	return Block{"type": "rich_text", "elements": []any{
+		Block{"type": "rich_text_preformatted", "elements": []any{Block{"type": "text", "text": s}}},
+	}}
+}
+
+// chunkRunes splits s into pieces of at most n runes.
+func chunkRunes(s string, n int) []string {
+	r := []rune(s)
+	out := make([]string, 0, len(r)/n+1)
+	for len(r) > n {
+		out = append(out, string(r[:n]))
+		r = r[n:]
+	}
+	if len(r) > 0 {
+		out = append(out, string(r))
+	}
+	return out
+}
+
+// approvalDetails renders what the action will do, within the card's block budget.
+func approvalDetails(a pendingApprovalInfo) ([]Block, bool) {
+	var out []Block
+	budget := approvalMaxChunks
+	truncated := a.ArgumentsTruncated
+	add := func(label, body string) {
+		if strings.TrimSpace(body) == "" {
+			return
+		}
+		out = append(out, contextBlock("*"+label+"*"))
+		for _, c := range chunkRunes(body, approvalChunkRunes) {
+			if budget == 0 {
+				truncated = true
+				return
+			}
+			out = append(out, preformatted(c))
+			budget--
+		}
+	}
+	if p := a.Preview; p != nil {
+		out = append(out, sectionBlock("*From:* "+escapeMrkdwn(p.From)+"\n*To:* "+escapeMrkdwn(strings.Join(p.To, ", "))+"\n*Subject:* "+escapeMrkdwn(p.Subject)))
+		add("Message", p.Body)
+		add("HTML body", p.BodyHTML)
+	}
+	add("All arguments", a.Arguments)
+	return out, truncated
+}
+
 // approvalCard asks the session owner to approve a paused tool.
-func approvalCard(channel, threadTS string, rowID uuid.UUID, a pendingApprovalInfo) Message {
-	id := rowID.String()
+func approvalCard(channel, threadTS string, rowID, sessionID uuid.UUID, a pendingApprovalInfo) Message {
+	id := approvalValue(rowID, a.ToolCallID)
 	btns := []Block{
 		actionButton("Approve", ActionApprove, id, "primary"),
 		actionButton("Deny", ActionDeny, id, "danger"),
 	}
-	if a.Risk == riskWrite {
+	if a.AlwaysAllowOffered && a.Risk == riskWrite {
 		btns = append(btns, actionButton("Always allow", ActionAlwaysAllow, id, ""))
 	}
 	text := "*Approve this action?*\n*" + escapeMrkdwn(friendlyToolName(a.Tool)) + "*  ·  " + riskLabel(a.Risk)
-	var args Block
-	if a.ArgsSummary != "" {
-		args = contextBlock(escapeMrkdwn(truncateRunes(a.ArgsSummary, 300)))
+	details, truncated := approvalDetails(a)
+	bl := append([]Block{sectionBlock(text)}, details...)
+	if truncated {
+		bl = append(bl, contextBlock("Some of this is cut off here. Open the conversation in Warmbly to read all of it before you decide."))
+		btns = append(btns, urlButton("Open in Warmbly", sessionURL(sessionID)))
 	}
+	bl = append(bl, actionsBlock(btns...))
 	return Message{
 		Channel: channel, ThreadTS: threadTS,
 		Text:   "Approve " + friendlyToolName(a.Tool) + "?",
-		Blocks: blocks(sectionBlock(text), args, actionsBlock(btns...)),
+		Blocks: blocks(bl...),
 	}
 }
 
@@ -410,7 +540,11 @@ func (r *renderer) emit(ev aiagent.StreamEvent) {
 			}
 		}
 	case "approval_required":
-		r.appr = &pendingApprovalInfo{Tool: ev.Tool, Risk: ev.Risk, ArgsSummary: ev.ArgsSummary}
+		r.appr = &pendingApprovalInfo{
+			Tool: ev.Tool, Risk: ev.Risk, ToolCallID: ev.ToolCallID,
+			Arguments: ev.Arguments, ArgumentsTruncated: ev.ArgumentsTruncated,
+			Preview: ev.Preview, AlwaysAllowOffered: ev.AlwaysAllowOffered,
+		}
 	case "error":
 		r.errMsg = ev.Message
 		r.bill = ev.Code == "insufficient_credits" || ev.Code == "usage_cap_exceeded"
@@ -444,6 +578,13 @@ func (r *renderer) settleDraft(result string) {
 	for k, v := range p {
 		r.drafts[k] = v
 	}
+}
+
+// failed reports whether the run ended on an error.
+func (r *renderer) failed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.errMsg != ""
 }
 
 func (r *renderer) pendingApproval() *pendingApprovalInfo {

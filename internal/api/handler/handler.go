@@ -9,6 +9,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/aitools"
 	"github.com/warmbly/warmbly/internal/app/analytics"
 	"github.com/warmbly/warmbly/internal/app/apikey"
+	"github.com/warmbly/warmbly/internal/app/appdirectory"
 	"github.com/warmbly/warmbly/internal/app/audit"
 	"github.com/warmbly/warmbly/internal/app/auth"
 	"github.com/warmbly/warmbly/internal/app/behavior"
@@ -21,6 +22,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/contactimport"
 	"github.com/warmbly/warmbly/internal/app/credits"
 	"github.com/warmbly/warmbly/internal/app/crm"
+	"github.com/warmbly/warmbly/internal/app/crmmode"
 	"github.com/warmbly/warmbly/internal/app/dangerzone"
 	"github.com/warmbly/warmbly/internal/app/delegation"
 	"github.com/warmbly/warmbly/internal/app/discount"
@@ -31,6 +33,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/fleetnode"
 	"github.com/warmbly/warmbly/internal/app/form"
 	"github.com/warmbly/warmbly/internal/app/group"
+	"github.com/warmbly/warmbly/internal/app/hubspot"
 	"github.com/warmbly/warmbly/internal/app/instancecheck"
 	"github.com/warmbly/warmbly/internal/app/instanceconfig"
 	"github.com/warmbly/warmbly/internal/app/instancesettings"
@@ -45,11 +48,13 @@ import (
 	"github.com/warmbly/warmbly/internal/app/orgrisk"
 	"github.com/warmbly/warmbly/internal/app/orgtransfer"
 	"github.com/warmbly/warmbly/internal/app/passkey"
+	"github.com/warmbly/warmbly/internal/app/pipedrive"
 	"github.com/warmbly/warmbly/internal/app/placement"
 	"github.com/warmbly/warmbly/internal/app/poollink"
 	"github.com/warmbly/warmbly/internal/app/ratelimit"
 	"github.com/warmbly/warmbly/internal/app/referral"
 	"github.com/warmbly/warmbly/internal/app/research"
+	"github.com/warmbly/warmbly/internal/app/salesforce"
 	"github.com/warmbly/warmbly/internal/app/segment"
 	"github.com/warmbly/warmbly/internal/app/sendingdomain"
 	"github.com/warmbly/warmbly/internal/app/sequence"
@@ -282,9 +287,20 @@ type Handler struct {
 	// panel). Nil answers slack_not_configured.
 	SlackService *slackapp.Service
 
+	// HubSpot runs a workspace's CRM on HubSpot when it chooses so. Nil on
+	// processes built without it.
+	HubSpot *hubspot.Service
+	// Pipedrive runs a workspace's CRM on Pipedrive when it chooses so.
+	Pipedrive *pipedrive.Service
+	// CRMModes routes the CRM mode endpoints to the CRM a workspace runs on.
+	CRMModes *crmmode.Registry
+
 	// OAuth 2.1 authorization server (third-party app registration + the
 	// authorization-code-with-PKCE flow + bearer-token validation).
 	OAuthService *oauth.Service
+
+	// AppDirectoryService is the community app directory (published OAuth apps).
+	AppDirectoryService *appdirectory.Service
 
 	// Realtime publisher for handler paths that emit live dashboard events
 	// directly (inbound meeting webhooks have no service layer of their own).
@@ -294,6 +310,10 @@ type Handler struct {
 	// On-demand Google Sheets -> leads sync. Reuses the google_sheets OAuth
 	// connection's token to read sheets and the contact import path to upsert.
 	LeadSyncService leadsync.Service
+
+	// SalesforceService is the native Salesforce sync: settings, imports, the
+	// activity log and the contact panel.
+	SalesforceService *salesforce.Service
 
 	// Public websocket URL used by frontend clients
 	WebsocketURI string

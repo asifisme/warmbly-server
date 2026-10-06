@@ -26,6 +26,9 @@ var SlackBotScopes = []string{
 	"im:read",
 	"im:write",
 	"mpim:history",
+	"reactions:write",
+	"users:read",
+	"users:read.email",
 }
 
 // Config keys SlackSettings owns inside config_capabilities.
@@ -168,4 +171,8 @@ func (s *service) SlackOAuthConfigured() bool {
 
 func (s *service) SlackOAuthRedirectURL() string {
 	return s.oauth.RedirectURL()
+}
+
+func (s *service) SlackOAuthClient() (string, string) {
+	return s.oauth.ClientCredentials(models.IntegrationSlack)
 }

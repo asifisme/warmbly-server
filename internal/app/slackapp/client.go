@@ -94,7 +94,9 @@ func (c *Client) do(ctx context.Context, token, method, contentType string, body
 		if err != nil {
 			return err
 		}
-		req.Header.Set("Authorization", "Bearer "+token)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
 		req.Header.Set("Content-Type", contentType)
 		resp, err := c.http.Do(req)
 		if err != nil {
@@ -285,6 +287,40 @@ func (c *Client) SetAssistantTitle(ctx context.Context, token, channel, threadTS
 	}, nil)
 }
 
+// AddReaction reacts to a message as the bot; needs reactions:write.
+func (c *Client) AddReaction(ctx context.Context, token, channel, ts, name string) error {
+	return c.callJSON(ctx, token, "reactions.add", map[string]any{"channel": channel, "timestamp": ts, "name": name}, nil)
+}
+
+func (c *Client) RemoveReaction(ctx context.Context, token, channel, ts, name string) error {
+	return c.callJSON(ctx, token, "reactions.remove", map[string]any{"channel": channel, "timestamp": ts, "name": name}, nil)
+}
+
+// slackUser is the part of a users.info answer the link flow reads.
+type slackUser struct {
+	ID               string `json:"id"`
+	Deleted          bool   `json:"deleted"`
+	IsBot            bool   `json:"is_bot"`
+	IsEmailConfirmed *bool  `json:"is_email_confirmed"`
+	Profile          struct {
+		DisplayName string `json:"display_name"`
+		RealName    string `json:"real_name"`
+		Email       string `json:"email"`
+		Image72     string `json:"image_72"`
+	} `json:"profile"`
+}
+
+// UserInfo reads a member's profile; the email needs users:read.email.
+func (c *Client) UserInfo(ctx context.Context, token, userID string) (*slackUser, error) {
+	var out struct {
+		User slackUser `json:"user"`
+	}
+	if err := c.callForm(ctx, token, "users.info", url.Values{"user": {userID}}, &out); err != nil {
+		return nil, err
+	}
+	return &out.User, nil
+}
+
 type authTest struct {
 	UserID string `json:"user_id"`
 	TeamID string `json:"team_id"`
@@ -298,4 +334,25 @@ func (c *Client) AuthTest(ctx context.Context, token string) (*authTest, error) 
 		return nil, err
 	}
 	return &out, nil
+}
+
+// OpenIDToken exchanges a Sign in with Slack authorization code for the
+// signed-in member's OpenID Connect id_token.
+func (c *Client) OpenIDToken(ctx context.Context, clientID, clientSecret, code, redirectURI string) (string, error) {
+	form := url.Values{
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+		"code":          {code},
+		"redirect_uri":  {redirectURI},
+	}
+	var out struct {
+		IDToken string `json:"id_token"`
+	}
+	if err := c.callForm(ctx, "", "openid.connect.token", form, &out); err != nil {
+		return "", err
+	}
+	if out.IDToken == "" {
+		return "", &APIError{Method: "openid.connect.token", Code: "no_id_token"}
+	}
+	return out.IDToken, nil
 }

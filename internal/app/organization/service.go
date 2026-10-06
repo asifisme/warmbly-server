@@ -48,6 +48,7 @@ type OperatorNotifier interface {
 
 // OrganizationService defines the interface for organization management
 type OrganizationService interface {
+	CreateTesterWorkspace(ctx context.Context, userID, adminID uuid.UUID, name, reason string, until time.Time) (*models.Organization, *errx.Error)
 	// WireAuthPolicy attaches the deployment auth policy after construction.
 	WireAuthPolicy(p *config.AuthPolicy)
 
@@ -95,7 +96,7 @@ type OrganizationService interface {
 	UpdateRole(ctx context.Context, orgID, actorID, roleID uuid.UUID, req *models.UpdateOrganizationRoleRequest) (*models.OrganizationRole, *errx.Error)
 	DeleteRole(ctx context.Context, orgID, actorID, roleID uuid.UUID) *errx.Error
 	UpdateMemberRole(ctx context.Context, orgID, actorID, memberUserID uuid.UUID, req *models.UpdateMemberRequest) (*models.OrganizationMember, *errx.Error)
-	RemoveMember(ctx context.Context, orgID, memberUserID uuid.UUID) *errx.Error
+	RemoveMember(ctx context.Context, orgID, actorID, memberUserID uuid.UUID) *errx.Error
 
 	// Invitations
 	GetPendingInvitations(ctx context.Context, orgID uuid.UUID) ([]models.OrganizationInvitation, *errx.Error)
@@ -324,6 +325,7 @@ func (s *organizationService) Create(ctx context.Context, userID uuid.UUID, name
 	}
 
 	org := &models.Organization{
+		Category:    models.OrganizationCategoryStandard,
 		ID:          uuid.New(),
 		Name:        name,
 		OwnerUserID: userID,
@@ -390,6 +392,26 @@ func (s *organizationService) Create(ctx context.Context, userID uuid.UUID, name
 		},
 	)
 
+	return org, nil
+}
+
+func (s *organizationService) CreateTesterWorkspace(ctx context.Context, userID, adminID uuid.UUID, name, reason string, until time.Time) (*models.Organization, *errx.Error) {
+	if !until.After(time.Now()) || strings.TrimSpace(reason) == "" {
+		return nil, errx.New(errx.BadRequest, "test access needs a reason and a future expiry")
+	}
+	org, xerr := s.Create(ctx, userID, name, "")
+	if xerr != nil {
+		return nil, xerr
+	}
+	if err := s.orgRepo.ProvisionTesterWorkspace(ctx, org.ID, userID, adminID, reason, until); err != nil {
+		errs.CaptureException(err)
+		if derr := s.orgRepo.Delete(ctx, org.ID); derr != nil {
+			errs.CaptureException(derr)
+			return nil, errx.New(errx.Internal, "could not provision or remove the test workspace; review it in the admin panel")
+		}
+		return nil, errx.New(errx.Internal, "could not provision the test workspace")
+	}
+	org.Category = models.OrganizationCategoryTest
 	return org, nil
 }
 
@@ -678,7 +700,7 @@ func (s *organizationService) InviteMember(ctx context.Context, orgID uuid.UUID,
 		RoleID:         roleID,
 		Permissions:    permissions,
 		InvitedBy:      inviterID,
-		Token:          token,
+		Token:          crypt.SHA256(token),
 		ExpiresAt:      time.Now().Add(s.invitationTTL(ctx)),
 		CreatedAt:      time.Now(),
 	}
@@ -692,6 +714,8 @@ func (s *organizationService) InviteMember(ctx context.Context, orgID uuid.UUID,
 		return nil, errx.New(errx.Internal, "failed to attach roles")
 	}
 	inv.Roles = toMemberRoles(roles)
+	// The caller mails the plaintext; only its digest is stored.
+	inv.Token = token
 
 	return inv, nil
 }
@@ -730,7 +754,7 @@ func toMemberRoles(roles []models.OrganizationRole) []models.MemberRole {
 
 // AcceptInvitation accepts an invitation and adds the user as a member
 func (s *organizationService) AcceptInvitation(ctx context.Context, token string, userID uuid.UUID, email string) (*models.OrganizationMember, *errx.Error) {
-	inv, err := s.orgRepo.GetInvitationByToken(ctx, token)
+	inv, err := s.orgRepo.GetInvitationByToken(ctx, crypt.SHA256(token))
 	if err != nil {
 		errs.CaptureException(err)
 		return nil, errx.New(errx.Internal, "failed to get invitation")
@@ -757,7 +781,7 @@ func (s *organizationService) AcceptInvitationByID(ctx context.Context, invitati
 
 // PreviewInvitation returns the safe public view for the /invite landing page.
 func (s *organizationService) PreviewInvitation(ctx context.Context, token string) (*models.InvitationPreview, *errx.Error) {
-	inv, err := s.orgRepo.GetInvitationByToken(ctx, token)
+	inv, err := s.orgRepo.GetInvitationByToken(ctx, crypt.SHA256(token))
 	if err != nil {
 		errs.CaptureException(err)
 		return nil, errx.New(errx.Internal, "failed to get invitation")
@@ -778,13 +802,17 @@ func (s *organizationService) PreviewInvitation(ctx context.Context, token strin
 		Expired: false,
 	}
 	if inv.Organization != nil {
-		preview.OrganizationName = inv.Organization.Name
+		// Shown to someone outside the workspace, with the invitation email's fallbacks.
+		preview.OrganizationName = displayname.DisplayableOr(inv.Organization.Name, "your organization")
 		if inv.Organization.AvatarURL != nil {
 			preview.OrganizationAvatar = *inv.Organization.AvatarURL
 		}
 	}
 	if inviter, _ := s.userRepo.GetUser(ctx, inv.InvitedBy); inviter != nil {
-		preview.InviterName = strings.TrimSpace(inviter.FirstName + " " + inviter.LastName)
+		preview.InviterName = displayname.FullName(inviter.FirstName, inviter.LastName)
+		if preview.InviterName == "" {
+			preview.InviterName = "A team member"
+		}
 	}
 	list := []models.OrganizationInvitation{*inv}
 	if err := s.orgRepo.HydrateInvitationRoles(ctx, list); err == nil {
@@ -793,8 +821,8 @@ func (s *organizationService) PreviewInvitation(ctx context.Context, token strin
 	return preview, nil
 }
 
-// GetInvitationToken returns the secure token for one of the org's pending
-// invitations, so a team manager can copy a shareable /invite link.
+// GetInvitationToken mints a shareable /invite link token for one of the org's
+// pending invitations; the emailed link keeps working alongside it.
 func (s *organizationService) GetInvitationToken(ctx context.Context, orgID, invitationID uuid.UUID) (string, *errx.Error) {
 	// The link is a bearer credential, so an operator can switch it off and
 	// require the invitation to arrive by email.
@@ -810,7 +838,21 @@ func (s *organizationService) GetInvitationToken(ctx context.Context, orgID, inv
 	if inv == nil || inv.OrganizationID != orgID {
 		return "", errx.New(errx.NotFound, "invitation not found")
 	}
-	return inv.Token, nil
+	// Only digests are stored, so each copy mints the link's own token and replaces the last copied one.
+	token, err := generateInvitationToken()
+	if err != nil {
+		errs.CaptureException(err)
+		return "", errx.New(errx.Internal, "failed to generate invitation token")
+	}
+	ok, err := s.orgRepo.SetInvitationLinkToken(ctx, orgID, invitationID, crypt.SHA256(token))
+	if err != nil {
+		errs.CaptureException(err)
+		return "", errx.New(errx.Internal, "failed to store invitation link")
+	}
+	if !ok {
+		return "", errx.New(errx.NotFound, "invitation not found")
+	}
+	return token, nil
 }
 
 // acceptResolved performs the actual join given an already-loaded invitation.
@@ -914,11 +956,12 @@ func (s *organizationService) UpdateMemberRole(ctx context.Context, orgID, actor
 		return nil, xerr
 	}
 	// Assignment is an escalation surface: the actor must hold every
-	// permission the new role set grants, and may not re-role themselves.
+	// permission the member has now and every one the new role set grants,
+	// and may not re-role themselves.
 	if actorID == memberUserID {
 		return nil, errx.New(errx.Forbidden, "you cannot change your own roles")
 	}
-	if xerr := s.validateActorHoldsPermissions(ctx, orgID, actorID, permissions); xerr != nil {
+	if xerr := s.validateActorHoldsPermissions(ctx, orgID, actorID, permissions|member.Permissions); xerr != nil {
 		return nil, xerr
 	}
 
@@ -938,8 +981,9 @@ func (s *organizationService) UpdateMemberRole(ctx context.Context, orgID, actor
 	return updated, nil
 }
 
-// RemoveMember removes a member from the organization
-func (s *organizationService) RemoveMember(ctx context.Context, orgID, memberUserID uuid.UUID) *errx.Error {
+// RemoveMember removes a member from the organization. The actor must hold
+// every permission the member holds.
+func (s *organizationService) RemoveMember(ctx context.Context, orgID, actorID, memberUserID uuid.UUID) *errx.Error {
 	member, err := s.orgRepo.GetMember(ctx, orgID, memberUserID)
 	if err != nil {
 		errs.CaptureException(err)
@@ -952,6 +996,9 @@ func (s *organizationService) RemoveMember(ctx context.Context, orgID, memberUse
 	// Cannot remove owner
 	if member.Role == string(models.RoleOwner) {
 		return errx.New(errx.Forbidden, "cannot remove organization owner")
+	}
+	if xerr := s.validateActorHoldsPermissions(ctx, orgID, actorID, member.Permissions); xerr != nil {
+		return xerr
 	}
 
 	if err := s.orgRepo.RemoveMember(ctx, orgID, memberUserID); err != nil {
@@ -1790,6 +1837,10 @@ func (s *organizationService) validateActorHoldsPermissions(ctx context.Context,
 	if actor == nil {
 		return errx.New(errx.Forbidden, "not a member")
 	}
+	// The owner holds every permission, including bits added after its row was written.
+	if actor.Role == string(models.RoleOwner) {
+		return nil
+	}
 	if perms&^actor.Permissions != 0 {
 		return errx.New(errx.Forbidden, "you cannot grant permissions you do not hold")
 	}
@@ -1888,6 +1939,11 @@ func (s *organizationService) UpdateRole(ctx context.Context, orgID, actorID, ro
 	if req.Permissions != nil {
 		perms := models.OrganizationPermission(*req.Permissions)
 		if xerr := s.validateRolePermissions(ctx, orgID, actorID, perms); xerr != nil {
+			return nil, xerr
+		}
+		// Editing takes the old permissions away from everyone holding the
+		// role, so the actor must hold those too, as for DeleteRole.
+		if xerr := s.validateActorHoldsPermissions(ctx, orgID, actorID, role.Permissions); xerr != nil {
 			return nil, xerr
 		}
 		role.Permissions = perms

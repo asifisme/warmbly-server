@@ -160,7 +160,7 @@ func (s *Service) requireLinked(ctx context.Context, p *interaction) *actor {
 	if a == nil {
 		return nil
 	}
-	if a.link == nil {
+	if a.link == nil && !s.autoLink(ctx, a) {
 		channel := p.channelID()
 		dm := strings.HasPrefix(channel, "D")
 		if channel == "" {
@@ -170,7 +170,7 @@ func (s *Service) requireLinked(ctx context.Context, p *interaction) *actor {
 			}
 			channel, dm = dmChannel, true
 		}
-		s.promptLink(ctx, a, channel, p.Message.ThreadTS, dm)
+		s.promptLink(ctx, a, &ask{Channel: channel, ThreadTS: p.Message.ThreadTS, InThread: p.Message.ThreadTS != "", DM: dm})
 		return nil
 	}
 	return a
@@ -179,15 +179,16 @@ func (s *Service) requireLinked(ctx context.Context, p *interaction) *actor {
 // handleApproval resumes a paused run; only the session owner's linked Slack
 // member may decide, and each card is decided once.
 func (s *Service) handleApproval(ctx context.Context, p *interaction, value, decision string) {
-	rowID, err := uuid.Parse(value)
-	if err != nil {
-		return
-	}
+	rowID, toolCallID, ok := parseApprovalValue(value)
 	a := s.requireLinked(ctx, p)
 	if a == nil {
 		return
 	}
-	row, err := s.repo.GetAgentThreadByID(ctx, rowID)
+	if !ok {
+		s.whisper(ctx, a.token, p, "This approval card is from an earlier version and can no longer decide anything. Ask Warmbly again, or approve it in the dashboard.")
+		return
+	}
+	row, err := s.repo.GetAgentThreadByID(ctx, a.link.OrganizationID, rowID)
 	if err != nil {
 		return
 	}
@@ -214,7 +215,7 @@ func (s *Service) handleApproval(ctx context.Context, p *interaction, value, dec
 		Blocks: blocks(contextBlock(verb + " by <@" + p.User.ID + ">")),
 	})
 	_ = s.repo.SetAgentThreadApproval(ctx, row.OrganizationID, row.ID, "")
-	s.resumeTurn(ctx, token, row, invocation(a.member, a.link), decision)
+	s.resumeTurn(ctx, token, row, invocation(a.member, a.link), toolCallID, decision)
 }
 
 // channelRefusal applies workspace settings and Slack Connect to an explicit
@@ -245,6 +246,10 @@ func (s *Service) handleNotificationDraft(ctx context.Context, p *interaction, v
 	if a == nil {
 		return
 	}
+	if !s.conversationInOrg(ctx, a.link.OrganizationID, v) {
+		s.whisper(ctx, a.token, p, "That conversation is not in your Warmbly workspace.")
+		return
+	}
 	channel, ts := p.channelID(), p.Container.MessageTS
 	if refusal := s.channelRefusal(ctx, a, channel); refusal != "" {
 		s.whisper(ctx, a.token, p, refusal)
@@ -256,8 +261,32 @@ func (s *Service) handleNotificationDraft(ctx context.Context, p *interaction, v
 	s.runTurn(ctx, agentTurn{
 		conn: a.conn, token: a.token, link: a.link, inv: invocation(a.member, a.link),
 		channel: channel, threadTS: ts, messageID: "slack:action:" + ts + ":" + actionTS,
-		text: text, dm: strings.HasPrefix(channel, "D"), reassign: true,
+		text: text, dm: strings.HasPrefix(channel, "D"), reassign: true, quotesOthers: true,
 	})
+}
+
+// conversationInOrg reports whether every message a draft card names is stored
+// in orgID's mailboxes.
+func (s *Service) conversationInOrg(ctx context.Context, orgID uuid.UUID, v draftReplyValue) bool {
+	if s.threads == nil {
+		return false
+	}
+	if v.ThreadID != "" {
+		res, err := s.threads.GetByThread(ctx, orgID, uuid.Nil, v.ThreadID, 1, "")
+		if err != nil || res == nil || len(res.Data) == 0 {
+			return false
+		}
+	}
+	if v.EmailID != "" {
+		id, err := uuid.Parse(v.EmailID)
+		if err != nil {
+			return false
+		}
+		if e, _, err := s.threads.GetByIDForOrg(ctx, orgID, id); err != nil || e == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // askAboutMessage starts the assistant about one message: in its thread, or
@@ -294,6 +323,7 @@ func (s *Service) askAboutMessage(ctx context.Context, p *interaction) {
 	turn := agentTurn{
 		conn: a.conn, token: a.token, link: a.link, inv: invocation(a.member, a.link),
 		channel: channel, threadTS: threadTS, messageID: "slack:shortcut:" + p.TriggerID, text: question,
+		quotesOthers: true,
 	}
 	if useDM {
 		dm, ts, err := s.startDMThread(ctx, a, "You asked about a message. Here is what I found.")

@@ -22,6 +22,9 @@ func (s *Service) publishHome(ctx context.Context, teamID, appID, slackUserID st
 	if a == nil {
 		return
 	}
+	if a.link == nil {
+		s.autoLink(ctx, a)
+	}
 	if err := s.client.PublishView(ctx, a.token, slackUserID, s.homeView(ctx, a, appID)); err != nil {
 		log.Warn().Err(err).Msg("slack: publishing the home tab failed")
 	}
@@ -60,7 +63,6 @@ func (s *Service) homeView(ctx context.Context, a *actor, appID string) Block {
 			"*What you can do here*",
 			"• Message me, or open the assistant, to ask about campaigns, replies, contacts and mailboxes.",
 			"• Mention @Warmbly in a channel thread to bring me into the conversation.",
-			"• Type `/warmbly` and a question from anywhere.",
 			"• Use *Ask Warmbly about this* on any message.",
 		}, "\n")),
 	)

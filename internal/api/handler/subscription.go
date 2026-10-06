@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 	"github.com/warmbly/warmbly/internal/api/middleware"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
@@ -87,8 +88,8 @@ func (h *Handler) CreateCheckoutSession(c *gin.Context) {
 
 	// Pinned to this instance's dashboard: Stripe will redirect the customer
 	// to whatever is set here.
-	successURL := billingReturnURL(req.SuccessURL, "/app/settings/billing?checkout=done")
-	cancelURL := billingReturnURL(req.CancelURL, "/app/settings/billing")
+	successURL := billingReturnURL(c.Request.Context(), req.SuccessURL, "/app/settings/billing?checkout=done")
+	cancelURL := billingReturnURL(c.Request.Context(), req.CancelURL, "/app/settings/billing")
 
 	session, errX := h.StripeService.CreateCheckoutSession(c.Request.Context(), uid, *orgID, req.PriceID, successURL, cancelURL, req.DiscountCode)
 	if errX != nil {
@@ -130,7 +131,7 @@ func (h *Handler) CreateBillingPortalSession(c *gin.Context) {
 	}
 
 	portalURL, errX := h.StripeService.CreatePortalSession(c.Request.Context(), sub.StripeCustomerID,
-		billingReturnURL(req.ReturnURL, "/app/settings/billing"))
+		billingReturnURL(c.Request.Context(), req.ReturnURL, "/app/settings/billing"))
 	if errX != nil {
 		errx.JSON(c, errX)
 		return
@@ -211,7 +212,8 @@ func (h *Handler) HandleStripeWebhook(c *gin.Context) {
 		// recorded as processed (see ProcessWebhookEvent), and every handler is
 		// idempotent on the event id, so a retry safely re-runs without
 		// double-applying. Silently 200-ing here would strand paid-for credits.
-		c.JSON(http.StatusInternalServerError, gin.H{"received": false, "error": errX.Message})
+		log.Error().Str("request_id", c.GetString("request_id")).Str("event_id", event.ID).Str("detail", errX.Message).Msg("stripe webhook processing failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"received": false, "error": "event could not be processed"})
 		return
 	}
 

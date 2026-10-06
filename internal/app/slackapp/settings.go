@@ -52,30 +52,43 @@ func missingScopes(granted []string) []string {
 	return out
 }
 
-// Status is the dashboard's Slack panel. Links are listed only for members
-// who manage settings; everyone sees their own.
-func (s *Service) Status(ctx context.Context, orgID, userID uuid.UUID, canManage bool) (*models.SlackStatus, *errx.Error) {
+// StatusAccess is what a caller of Status may read beyond their own link.
+type StatusAccess int
+
+const (
+	// StatusOwnLink: instance readiness and the caller's own link only.
+	StatusOwnLink StatusAccess = iota
+	// StatusWorkspace adds the connection, its settings and missing scopes.
+	StatusWorkspace
+	// StatusManage adds every member's link.
+	StatusManage
+)
+
+// Status is the dashboard's Slack panel, filled as far as access allows.
+func (s *Service) Status(ctx context.Context, orgID, userID uuid.UUID, access StatusAccess) (*models.SlackStatus, *errx.Error) {
 	st := &models.SlackStatus{
 		AppConfigured:         s.integ.SlackOAuthConfigured(),
 		InteractiveConfigured: s.integ.SlackOAuthConfigured() && s.Interactive(),
 		MissingScopes:         []string{},
 		Links:                 []models.SlackUserLink{},
 	}
-	conn, err := s.workspaceConnection(ctx, orgID)
-	if err != nil {
-		return nil, errx.InternalError()
-	}
-	if conn != nil {
-		st.Connection = conn
-		st.Settings = settingsFrom(conn)
-		st.MissingScopes = missingScopes(conn.GrantedScopes)
+	if access >= StatusWorkspace {
+		conn, err := s.workspaceConnection(ctx, orgID)
+		if err != nil {
+			return nil, errx.InternalError()
+		}
+		if conn != nil {
+			st.Connection = conn
+			st.Settings = settingsFrom(conn)
+			st.MissingScopes = missingScopes(conn.GrantedScopes)
+		}
 	}
 	link, err := s.repo.GetLinkForUser(ctx, orgID, userID)
 	if err != nil {
 		return nil, errx.InternalError()
 	}
 	st.MyLink = link
-	if canManage {
+	if access >= StatusManage {
 		links, err := s.repo.ListLinks(ctx, orgID)
 		if err != nil {
 			return nil, errx.InternalError()
@@ -205,6 +218,20 @@ func validateSettings(in models.SlackSettings) (models.SlackSettings, *errx.Erro
 		out.Routes[cat] = ch
 	}
 	return out, nil
+}
+
+// CurrentSettings is the workspace's Slack settings and Slack workspace name,
+// for the assistant's Slack tools.
+func (s *Service) CurrentSettings(ctx context.Context, orgID uuid.UUID) (*models.SlackSettings, string, *errx.Error) {
+	conn, err := s.workspaceConnection(ctx, orgID)
+	if err != nil {
+		return nil, "", errx.InternalError()
+	}
+	if conn == nil {
+		return nil, "", ErrSlackNotConnected
+	}
+	st := settingsFrom(conn)
+	return &st, conn.ExternalAccountName, nil
 }
 
 // UpdateSettings validates and stores the workspace's Slack settings.

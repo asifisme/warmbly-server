@@ -13658,7 +13658,7 @@
       "post": {
         "operationId": "api-keys_create",
         "summary": "Create an API key",
-        "description": "Creates a new key and returns the plaintext secret exactly once. Unknown permission bits are rejected.",
+        "description": "Creates a new key and returns the plaintext secret exactly once. Unknown permission bits are rejected. A key never exceeds its creator: a member's role bounds its permissions, and an API key caller bounds its permissions, mailboxes and IP addresses.",
         "tags": [
           "api-keys"
         ],
@@ -13714,7 +13714,7 @@
             }
           },
           "403": {
-            "description": "Missing API_KEYS scope or manage_api_keys org permission.",
+            "description": "Missing API_KEYS scope or manage_api_keys org permission; called with an OAuth app token (oauth_token_not_allowed); or the key would hold a permission, mailbox or IP address its creator does not have (api_key_permissions_exceed_caller).",
             "content": {
               "application/json": {
                 "schema": {
@@ -13740,7 +13740,7 @@
       "get": {
         "operationId": "api-keys_list_permissions",
         "summary": "List available permissions",
-        "description": "Returns the catalog of permission bits plus the read_only and full_access presets.",
+        "description": "Returns the catalog of permission bits, the read_only and full_access presets, the mask the caller may put on a key (grantable), and the mask an OAuth app may request (app_scopes).",
         "tags": [
           "api-keys"
         ],
@@ -14053,7 +14053,7 @@
       "patch": {
         "operationId": "api-keys_update",
         "summary": "Update an API key",
-        "description": "Updates the mutable fields of a key. Every field is optional; only the fields you send are changed. The secret cannot be rotated here.",
+        "description": "Updates the mutable fields of a key. Every field is optional; only the fields you send are changed. The secret cannot be rotated here. The edited key never exceeds its editor: a member's role bounds new permissions, and an API key caller bounds the whole resulting key.",
         "tags": [
           "api-keys"
         ],
@@ -14118,7 +14118,7 @@
             }
           },
           "403": {
-            "description": "Missing API_KEYS scope or manage_api_keys org permission.",
+            "description": "Missing API_KEYS scope or manage_api_keys org permission; called with an OAuth app token (oauth_token_not_allowed); or the key would hold a permission, mailbox or IP address its creator does not have (api_key_permissions_exceed_caller).",
             "content": {
               "application/json": {
                 "schema": {
@@ -14216,7 +14216,7 @@
             }
           },
           "403": {
-            "description": "Missing API_KEYS scope or manage_api_keys org permission.",
+            "description": "Missing API_KEYS scope or manage_api_keys org permission, or called with an OAuth app token (oauth_token_not_allowed).",
             "content": {
               "application/json": {
                 "schema": {
@@ -14307,7 +14307,7 @@
             }
           },
           "403": {
-            "description": "Missing API_KEYS scope or manage_api_keys org permission.",
+            "description": "Missing API_KEYS scope or manage_api_keys org permission, or called with an OAuth app token (oauth_token_not_allowed).",
             "content": {
               "application/json": {
                 "schema": {
@@ -17898,6 +17898,174 @@
         }
       }
     },
+    "/integrations/community": {
+      "get": {
+        "operationId": "integrations_community_list",
+        "summary": "List community apps",
+        "description": "Community directory listings shown in discovery: featured apps first, then published apps installed in at least 25 workspaces other than the publisher's, each at least two weeks old, most installed first. A link-only app is never returned here; open it by its slug.",
+        "tags": [
+          "integrations"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 100
+            },
+            "description": "Page size. Out-of-range values return 400."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque cursor from pagination.next_cursor. A cursor this API did not issue returns 400."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Listed community apps.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommunityAppList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid limit or cursor.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden (missing INTEGRATIONS scope).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/integrations/community/{slug}": {
+      "get": {
+        "operationId": "integrations_community_get",
+        "summary": "Get a community app",
+        "description": "One listing by its slug, listed or link only. A hidden or unpublished listing, or one whose app is disabled, returns 404.",
+        "tags": [
+          "integrations"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The listing's slug."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The listing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommunityApp"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No published listing with this slug.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden (missing INTEGRATIONS scope).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/integrations/connections": {
       "get": {
         "operationId": "integrations_connections_list",
@@ -19399,7 +19567,7 @@
       "get": {
         "operationId": "integrations_bookings_list",
         "summary": "List meeting bookings (integrations view)",
-        "description": "Up to 50 recent booked meetings, surfaced on the integrations page. For the full Meetings list with filters and pagination, use `GET /meetings`.",
+        "description": "Up to 50 recent booked meetings, surfaced on the integrations page. For the full Meetings list with filters and pagination, use `GET /meetings`. Scope `READ_CONTACTS`.",
         "tags": [
           "integrations"
         ],
@@ -22475,7 +22643,7 @@
       "get": {
         "operationId": "ai_tools_list",
         "summary": "List agent tools",
-        "description": "The AI tool registry filtered to what the caller's credentials allow. `format=openai` (aliases `hermes`, `functions`) returns OpenAI function-calling objects; the default returns `{name, description, input_schema}` per tool. Send-class tools are never listed.",
+        "description": "The AI tool registry filtered to what the caller's credentials allow. Needs `AI_AGENT` for keys and OAuth tokens, or `use_ai` for dashboard members. `format=openai` (aliases `hermes`, `functions`) returns OpenAI function-calling objects; the default returns `{name, description, input_schema}` per tool. Send-class tools are never listed.",
         "tags": [
           "ai"
         ],
@@ -22545,6 +22713,16 @@
               }
             }
           },
+          "403": {
+            "description": "The credentials lack AI_AGENT, or the member lacks use_ai.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "429": {
             "description": "Rate limited.",
             "content": {
@@ -22562,7 +22740,7 @@
       "post": {
         "operationId": "ai_tools_call",
         "summary": "Execute an agent tool",
-        "description": "Runs one registry tool. The request body is the tool's JSON argument object (empty body = no arguments). Each tool enforces its own permission; send-class tools are never callable here.",
+        "description": "Runs one registry tool. The request body is the tool's JSON argument object (empty body = no arguments). Needs `AI_AGENT` for keys and OAuth tokens, or `use_ai` for dashboard members, and each tool enforces its own permission; send-class tools are never callable here.",
         "tags": [
           "ai"
         ],
@@ -22648,7 +22826,7 @@
             }
           },
           "403": {
-            "description": "The credentials lack the permission for this tool.",
+            "description": "The credentials lack AI_AGENT (or use_ai), or the permission for this tool.",
             "content": {
               "application/json": {
                 "schema": {
@@ -35513,7 +35691,9 @@
         "type": "object",
         "required": [
           "permissions",
-          "presets"
+          "presets",
+          "grantable",
+          "app_scopes"
         ],
         "properties": {
           "permissions": {
@@ -35540,6 +35720,16 @@
                 "description": "Bitmask granting every scope."
               }
             }
+          },
+          "grantable": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bitmask the caller may put on a key: the reach of the member's role, or the calling API key's own permissions."
+          },
+          "app_scopes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bitmask an OAuth app may request. API_KEYS is never part of it."
           }
         }
       },
@@ -37629,6 +37819,155 @@
           "configured": {
             "type": "boolean",
             "description": "Whether the server has OAuth client credentials wired for this provider."
+          },
+          "rank": {
+            "type": "integer",
+            "description": "Popularity on this instance, 1 being the most used: workspaces with a live connection, ties broken by a curated order."
+          }
+        }
+      },
+      "CommunityApp": {
+        "type": "object",
+        "description": "A published OAuth app as a workspace browsing the community directory sees it. Carries no credential, redirect or webhook field.",
+        "required": [
+          "application_id",
+          "slug",
+          "name",
+          "tagline",
+          "category",
+          "install_url",
+          "developer",
+          "scopes",
+          "permissions",
+          "status",
+          "listed",
+          "installs",
+          "installed",
+          "published_at"
+        ],
+        "properties": {
+          "application_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "slug": {
+            "type": "string",
+            "description": "The listing's link: /app/integrations/apps/{slug}."
+          },
+          "name": {
+            "type": "string"
+          },
+          "tagline": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "crm",
+              "automation",
+              "notifications",
+              "meetings",
+              "data",
+              "verification",
+              "ai",
+              "other"
+            ]
+          },
+          "logo_url": {
+            "type": "string"
+          },
+          "website_url": {
+            "type": "string"
+          },
+          "install_url": {
+            "type": "string",
+            "description": "HTTPS address the app's install starts from."
+          },
+          "support_url": {
+            "type": "string"
+          },
+          "privacy_url": {
+            "type": "string"
+          },
+          "developer": {
+            "type": "string",
+            "description": "Name of the publishing workspace."
+          },
+          "scopes": {
+            "type": "integer",
+            "description": "API-permission bitmask the app may request."
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "value",
+                "description",
+                "category"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "integer"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "category": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The same permissions, spelled out."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "published",
+              "featured"
+            ],
+            "description": "featured: picked by the instance's team. published: link only unless widely used."
+          },
+          "listed": {
+            "type": "boolean",
+            "description": "Shown in discovery: featured, or installed in at least 25 workspaces other than the publisher's, each at least two weeks old."
+          },
+          "installs": {
+            "type": "integer",
+            "description": "Workspaces on this instance with an active grant."
+          },
+          "installed": {
+            "type": "boolean",
+            "description": "Whether anyone in the caller's workspace has authorized it."
+          },
+          "published_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CommunityAppList": {
+        "type": "object",
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CommunityApp"
+            }
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
           }
         }
       },

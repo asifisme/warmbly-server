@@ -31,7 +31,7 @@ import (
 
 type EmailService interface {
 	Search(ctx context.Context, userID, search, cursor, tag, limit string, allowedAccountIDs []uuid.UUID) (*models.EmailsResult, *errx.Error)
-	Get(ctx context.Context, userID, emailAccountID string) (*models.Email, *errx.Error)
+	Get(ctx context.Context, orgID, emailAccountID string) (*models.Email, *errx.Error)
 	// Update writes a mailbox's settings. orgID scopes the write (the mailbox
 	// is a workspace asset); userID only names who to tell the worker about.
 	Update(ctx context.Context, orgID, userID, emailAccountID string, udata *models.UpdateEmail) (*models.Email, *errx.Error)
@@ -82,7 +82,8 @@ type EmailService interface {
 	// trip renewed an existing mailbox (OAuthReauth) rather than connecting
 	// a new one, so the handler can audit and answer accordingly.
 	// loginHint preselects an address in the provider's picker; "" for none.
-	OAuthStart(ctx context.Context, userID string, orgID *uuid.UUID, provider models.InboxProvider, loginHint string) (*models.EmailOnboardingStartResponse, *errx.Error)
+	OAuthStart(ctx context.Context, userID string, orgID *uuid.UUID, provider models.InboxProvider, loginHint string, web bool, returnOrigin string) (*models.EmailOnboardingStartResponse, *errx.Error)
+	OAuthReturnOrigin(ctx context.Context, state string) string
 	// authorize runs before the code is exchanged, against the organization the
 	// state names, so a caller removed mid-flow cannot finish it.
 	OAuthFinish(ctx context.Context, userID, code, state string, authorize FinishAuthorizer) (*models.Email, bool, *errx.Error)
@@ -93,7 +94,7 @@ type EmailService interface {
 	OnboardSMTPIMAPBulk(ctx context.Context, userID string, orgID *uuid.UUID, rows []models.NewSMTPIMAPAccount) *models.MailboxBulkResult
 	// OAuthReauth starts an OAuth round trip that renews the tokens of an
 	// existing Gmail/Outlook mailbox after the provider invalidated them.
-	OAuthReauth(ctx context.Context, userID string, orgID *uuid.UUID, accountID uuid.UUID) (*models.EmailOnboardingStartResponse, *errx.Error)
+	OAuthReauth(ctx context.Context, userID string, orgID *uuid.UUID, accountID uuid.UUID, returnOrigin string) (*models.EmailOnboardingStartResponse, *errx.Error)
 	// UpdateSMTPIMAPCredentials validates replacement credentials against a
 	// live worker, stores them, and puts the mailbox back to work.
 	UpdateSMTPIMAPCredentials(ctx context.Context, orgID *uuid.UUID, accountID uuid.UUID, creds *models.SmtpImap) (*models.Email, *errx.Error)
@@ -144,8 +145,10 @@ type EmailService interface {
 	// errors it just fixed, which is what clears the mailbox's error banner.
 	WireAccountErrors(repo repository.EmailAccountErrorRepository)
 	// Brokered OAuth (cloud side): consent on this deployment's OAuth app for a linked instance.
-	OAuthAuthorizeURL(provider models.InboxProvider, state string) (string, *errx.Error)
-	OAuthConnectWithCode(ctx context.Context, userID string, orgID *uuid.UUID, provider models.InboxProvider, code string) (*models.Email, *errx.Error)
+	// OAuthAuthorizeURL carries the S256 challenge of verifier; OAuthConnectWithCode redeems with it.
+	OAuthAuthorizeURL(provider models.InboxProvider, state, verifier string) (string, *errx.Error)
+	OAuthCallbackOrigin(provider models.InboxProvider) (string, *errx.Error)
+	OAuthConnectWithCode(ctx context.Context, userID string, orgID *uuid.UUID, provider models.InboxProvider, code, verifier string) (*models.Email, *errx.Error)
 	// OAuthAccessToken is a live access token for an OAuth mailbox, refreshed when near expiry.
 	OAuthAccessToken(ctx context.Context, accountID uuid.UUID) (*oauth2.Token, *errx.Error)
 	// LoadAccountOntoWorker assigns a worker if needed and ships the mailbox

@@ -2,6 +2,8 @@
 //
 // Composition:
 //   - Suppression card (only when suppressed)
+//   - CRM card (HubSpot or Pipedrive mode): owner, lifecycle stage or label, lead status
+//   - Salesforce record (only when a Salesforce connection exists)
 //   - Engagement: six flat stat tiles with a thin ratio bar where
 //     a ratio over Sent makes sense
 //   - Latest activity rail
@@ -32,6 +34,9 @@ import { ContactSegmentsSection } from "./ContactSegmentsSection";
 import VerificationCard from "./VerificationCard";
 import OriginBadge from "@/components/app/engagement/OriginBadge";
 import { labelInk } from "@/lib/utils";
+import CrmContactCard from "@/components/app/crm/CrmContactCard";
+import useCrmProvider from "@/hooks/useCrmProvider";
+import SalesforceContactCard from "@/components/app/integrations/SalesforceContactCard";
 
 export default function OverviewTab({
     contact,
@@ -48,6 +53,7 @@ export default function OverviewTab({
     const confirm = useConfirm();
     const write = useWriteGuard("MANAGE_CONTACTS");
     const removeSuppression = useRemoveSuppression();
+    const { isExternal } = useCrmProvider();
 
     function askLift() {
         if (!supp) return;
@@ -91,6 +97,9 @@ export default function OverviewTab({
                     </button>
                 </div>
             )}
+
+            {isExternal && <CrmContactCard contactId={contact.id} density="drawer" showProperties={false} />}
+            <SalesforceContactCard contactId={contact.id} />
 
             <Section title="Deliverability">
                 <VerificationCard contactId={contact.id} detail={detail?.verification} loading={detailLoading} />

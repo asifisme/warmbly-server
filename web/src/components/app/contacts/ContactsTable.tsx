@@ -11,7 +11,8 @@
 //     section header so it nests cleanly under the campaign view.
 
 import React from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate } from "@tanstack/react-router";
+import { useSearchParams } from "@/hooks/useSearchParams";
 import {
     AlertTriangleIcon,
     ArrowDownIcon,
@@ -119,6 +120,9 @@ import {
     SelectButton,
 } from "@/components/ui/popover-menu";
 import { Checkbox } from "@/components/ui/checkbox";
+import useCrmProvider from "@/hooks/useCrmProvider";
+import { CrmMark } from "@/components/app/crm/crmProviders";
+import CrmImportDialog from "./import/CrmImportDialog";
 
 type SubFilter = "all" | "subscribed" | "unsubscribed";
 
@@ -171,7 +175,18 @@ export default function ContactsTable({
         const id = params.get("import");
         return id && id !== "new" ? id : null;
     });
-    const [importStep] = React.useState<ImportStep | undefined>(() => (params.get("importStep") as ImportStep) ?? undefined);
+    const [importStep, setImportStep] = React.useState<ImportStep | undefined>(
+        () => (params.get("importStep") as ImportStep) ?? undefined,
+    );
+    // Provider mode adds a list import; its draft continues in the same wizard.
+    const { isExternal, crm } = useCrmProvider();
+    const [crmImportOpen, setCrmImportOpen] = React.useState(false);
+    const continueImport = React.useCallback((id: string, step: ImportStep) => {
+        setCrmImportOpen(false);
+        setImportId(id);
+        setImportStep(step);
+        setImportOpen(true);
+    }, []);
     const routeImport = React.useCallback(
         (id: string | null, step: ImportStep) => {
             setParams(
@@ -189,6 +204,7 @@ export default function ContactsTable({
     const closeImport = React.useCallback(() => {
         setImportOpen(false);
         setImportId(null);
+        setImportStep(undefined);
         setParams(
             (prev) => {
                 const next = new URLSearchParams(prev);
@@ -199,6 +215,28 @@ export default function ContactsTable({
             { replace: true },
         );
     }, [setParams]);
+
+    // ?contact=<id> opens that contact's drawer (the CRM's "Open in Warmbly" links here).
+    const deepContact = params.get("contact");
+    React.useEffect(() => {
+        if (deepContact) openContact(deepContact);
+    }, [deepContact, openContact]);
+    // Closing the drawer drops the param, so a reload does not reopen it.
+    const prevEdit = React.useRef(edit);
+    React.useEffect(() => {
+        const was = prevEdit.current;
+        prevEdit.current = edit;
+        if (!was || edit) return;
+        setParams(
+            (prev) => {
+                if (!prev.has("contact")) return prev;
+                const next = new URLSearchParams(prev);
+                next.delete("contact");
+                return next;
+            },
+            { replace: true },
+        );
+    }, [edit, setParams]);
 
     // The member's saved layout for this list: its columns and its sort. The
     // Leads tab and the contacts page are two views with two layouts.
@@ -377,9 +415,11 @@ export default function ContactsTable({
             (connectionsQuery.data?.connections ?? []).filter(
                 (c) =>
                     PUSHABLE_PROVIDERS.includes(c.provider) &&
-                    (c.status === "connected" || c.status === "degraded"),
+                    (c.status === "connected" || c.status === "degraded") &&
+                    // In provider mode contacts sync to that CRM on their own.
+                    !(isExternal && c.provider === crm.id),
             ),
-        [connectionsQuery.data],
+        [connectionsQuery.data, isExternal, crm.id],
     );
 
     async function pushToCRM(connectionId: string, providerLabel: string) {
@@ -796,6 +836,15 @@ export default function ContactsTable({
                     >
                         Import
                     </TopbarAction>
+                    {isExternal && (
+                        <TopbarAction
+                            variant="ghost"
+                            icon={<CrmMark provider={crm.id} className="w-3 h-3" />}
+                            onClick={() => setCrmImportOpen(true)}
+                        >
+                            From {crm.name}
+                        </TopbarAction>
+                    )}
                     <TopbarAction
                         variant="ghost"
                         icon={<SheetIcon className="w-3 h-3" />}
@@ -912,6 +961,14 @@ export default function ContactsTable({
                     initialStep={importStep}
                     onRoute={routeImport}
                 />
+                {isExternal && (
+                    <CrmImportDialog
+                        open={crmImportOpen}
+                        onClose={() => setCrmImportOpen(false)}
+                        onContinue={continueImport}
+                        target={current_campaign ? `Adding to ${current_campaign.name}` : undefined}
+                    />
+                )}
                 <AddFromContactsDialog
                     open={fromContactsOpen}
                     onClose={() => setFromContactsOpen(false)}
@@ -971,6 +1028,15 @@ export default function ContactsTable({
                     >
                         Import
                     </TopbarAction>
+                    {isExternal && (
+                        <TopbarAction
+                            variant="ghost"
+                            icon={<CrmMark provider={crm.id} className="w-3 h-3" />}
+                            onClick={() => setCrmImportOpen(true)}
+                        >
+                            Import from {crm.name}
+                        </TopbarAction>
+                    )}
                     <TopbarAction
                         variant="ghost"
                         icon={<SheetIcon className="w-3 h-3" />}
@@ -998,6 +1064,14 @@ export default function ContactsTable({
                             <PopoverMenuItem onSelect={() => setImportOpen(true)}>
                                 Import
                             </PopoverMenuItem>
+                            {isExternal && (
+                                <PopoverMenuItem
+                                    icon={<CrmMark provider={crm.id} className="w-3.5 h-3.5" />}
+                                    onSelect={() => setCrmImportOpen(true)}
+                                >
+                                    Import from {crm.name}
+                                </PopoverMenuItem>
+                            )}
                             <PopoverMenuItem onSelect={() => setSyncOpen(true)}>
                                 Sheet sync
                             </PopoverMenuItem>
@@ -1099,7 +1173,7 @@ export default function ContactsTable({
                 open={segmentPreset !== null}
                 onClose={() => setSegmentPreset(null)}
                 preset={segmentPreset}
-                onSaved={(saved) => navigate(`/app/contacts/segments/${saved.id}`)}
+                onSaved={(saved) => navigate({ to: "/app/contacts/segments/$id", params: { id: saved.id } })}
             />
             <ContactEdit contacts={contacts ?? []} active={edit} setActive={setEdit} initialTab={editTab} />
             <ContactsEditBulk
@@ -1134,6 +1208,14 @@ export default function ContactsTable({
                 initialStep={importStep}
                 onRoute={routeImport}
             />
+            {isExternal && (
+                <CrmImportDialog
+                    open={crmImportOpen}
+                    onClose={() => setCrmImportOpen(false)}
+                    onContinue={continueImport}
+                    target={segment ? `Adding to ${segment.name}` : undefined}
+                />
+            )}
             <SyncSourcesPanel open={syncOpen} onClose={() => setSyncOpen(false)} segment={segment} />
         </Page>
     );
