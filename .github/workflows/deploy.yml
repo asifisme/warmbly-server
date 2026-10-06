@@ -6,10 +6,15 @@ on:
       - res
   workflow_dispatch:
 
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   deploy:
     name: Deploy to VPS Server
     runs-on: ubuntu-latest
+    if: github.repository == 'asifisme/warmbly-server'
 
     steps:
       - name: SSH into VPS and Update

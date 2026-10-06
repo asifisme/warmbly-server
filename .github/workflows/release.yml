@@ -26,6 +26,7 @@ jobs:
   validate-tag:
     name: Validate Tag
     runs-on: ubuntu-latest
+    if: github.repository == 'warmbly/warmbly'
     outputs:
       version: ${{ steps.version.outputs.version }}
       major: ${{ steps.version.outputs.major }}

@@ -32,6 +32,7 @@ jobs:
   govulncheck:
     name: Go Vulnerabilities
     runs-on: ubuntu-latest
+    if: github.repository == 'warmbly/warmbly'
     steps:
       - uses: actions/checkout@v4
 
@@ -50,6 +51,7 @@ jobs:
   trivy:
     name: Dependency Scan
     runs-on: ubuntu-latest
+    if: github.repository == 'warmbly/warmbly'
     steps:
       - uses: actions/checkout@v4
 
@@ -67,6 +69,7 @@ jobs:
   node:
     name: Node Dependencies
     runs-on: ubuntu-latest
+    if: github.repository == 'warmbly/warmbly'
     strategy:
       fail-fast: false
       matrix:
@@ -86,6 +89,7 @@ jobs:
   rust:
     name: Rust Dependencies
     runs-on: ubuntu-latest
+    if: github.repository == 'warmbly/warmbly'
     # audit-check reports its result as a check run, which the workflow-wide
     # read-only token cannot create.
     permissions:
@@ -101,6 +105,7 @@ jobs:
   elixir:
     name: Elixir Dependencies
     runs-on: ubuntu-latest
+    if: github.repository == 'warmbly/warmbly'
     defaults:
       run:
         working-directory: realtime

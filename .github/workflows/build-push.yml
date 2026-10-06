@@ -22,6 +22,7 @@ jobs:
   changes:
     name: Detect Changes
     runs-on: ubuntu-latest
+    if: github.repository == 'warmbly/warmbly'
     outputs:
       # JSON consumed as matrix inputs. `go` is a list of service names that
       # cross-compile both arches on one runner. `native` is a list of
