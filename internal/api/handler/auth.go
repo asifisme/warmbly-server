@@ -182,12 +182,38 @@ func (h *Handler) GetUser(c *gin.Context) {
 		if tags, terr := h.TagService.List(ctx, *orgID); terr == nil {
 			u.Tags = tags
 		}
-		if cats, cerr := h.CategoryService.List(ctx, *orgID); cerr == nil {
+		// Restricted members see only registries around their grants.
+		if m := middleware.GetAuthMember(c); m.IsRestricted() {
+			scope, xerr := h.OrganizationService.ResolveMemberScope(ctx, *orgID, m.UserID)
+			if xerr != nil {
+				errx.Handle(c, xerr)
+				return
+			}
+			u.Folders = keepGroups(u.Folders, scope.Folders)
+			u.Tags = keepGroups(u.Tags, scope.MailboxTags)
+			if cats, cerr := h.UniboxService.CategoriesForMailboxes(ctx, *orgID, scope.Mailboxes); cerr == nil {
+				u.Categories = cats
+			}
+		} else if cats, cerr := h.CategoryService.List(ctx, *orgID); cerr == nil {
 			u.Categories = cats
 		}
 	}
 
 	c.JSON(http.StatusOK, u)
+}
+
+// keepGroups is the labels whose ids are in keep.
+func keepGroups(groups []models.Group, keep []uuid.UUID) []models.Group {
+	out := make([]models.Group, 0, len(keep))
+	for _, g := range groups {
+		for _, id := range keep {
+			if g.ID == id {
+				out = append(out, g)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (h *Handler) ResetPasswordStart(c *gin.Context) {

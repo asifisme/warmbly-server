@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -28,6 +29,9 @@ func (h *Handler) GetWarmupAnalytics(c *gin.Context) {
 	if emailIDStr := c.Query("email_id"); emailIDStr != "" {
 		if id, err := uuid.Parse(emailIDStr); err == nil {
 			emailAccountID = &id
+		} else {
+			errx.Handle(c, errx.New(errx.BadRequest, "email_id must be a UUID"))
+			return
 		}
 	}
 
@@ -49,6 +53,10 @@ func (h *Handler) GetWarmupAnalytics(c *gin.Context) {
 	to, err := time.Parse("2006-01-02", toStr)
 	if err != nil {
 		errx.Handle(c, errx.New(errx.BadRequest, "Invalid to date format (expected YYYY-MM-DD)"))
+		return
+	}
+	if to.Before(from) {
+		errx.Handle(c, errx.New(errx.BadRequest, "from must be on or before to"))
 		return
 	}
 
@@ -340,8 +348,12 @@ func (h *Handler) GetRealtimeInfo(c *gin.Context) {
 	})
 }
 
+// maxDashboardScopeIDs bounds each of campaign_ids and folder_ids; a folder
+// stands in for any number of campaigns, so a larger set is never needed.
+const maxDashboardScopeIDs = 100
+
 // GetDashboardAnalytics returns main dashboard analytics overview
-// GET /analytics/dashboard?period=7d
+// GET /analytics/dashboard?period=7d[&campaign_ids=a,b][&folder_ids=c]
 func (h *Handler) GetDashboardAnalytics(c *gin.Context) {
 	orgID := middleware.GetOrganizationID(c)
 	if orgID == nil {
@@ -355,15 +367,45 @@ func (h *Handler) GetDashboardAnalytics(c *gin.Context) {
 		period = "7d"
 	}
 
-	analytics, xerr := h.AnalyticsService.GetDashboardAnalytics(c.Request.Context(), *orgID, period)
+	var filter models.DashboardFilter
+	var xerr *errx.Error
+	if filter.CampaignIDs, xerr = uuidListQuery(c, "campaign_ids", maxDashboardScopeIDs); xerr != nil {
+		errx.Handle(c, xerr)
+		return
+	}
+	if filter.FolderIDs, xerr = uuidListQuery(c, "folder_ids", maxDashboardScopeIDs); xerr != nil {
+		errx.Handle(c, xerr)
+		return
+	}
+	restricted := middleware.IsScopeRestricted(c)
+	if restricted {
+		// The filter's echo names what it asked for, so it may only ask for granted ones.
+		if !idsWithin(filter.CampaignIDs, middleware.AllowedCampaigns(c)) || !idsWithin(filter.FolderIDs, middleware.AllowedFolders(c)) {
+			errx.Handle(c, errx.New(errx.NotFound, "campaign or folder not found"))
+			return
+		}
+		filter.AllowedCampaigns = middleware.AllowedCampaigns(c)
+		filter.AllowedMailboxes = middleware.AllowedEmailAccounts(c)
+	}
+
+	analytics, xerr := h.AnalyticsService.GetDashboardAnalytics(c.Request.Context(), *orgID, period, filter)
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
 	}
+	if restricted {
+		// A sender outside the member's mailboxes is not named to them.
+		for i := range analytics.RecentActivity {
+			if a := &analytics.RecentActivity[i]; a.SenderID != nil && !middleware.EmailAccountAllowed(c, *a.SenderID) {
+				a.SenderID, a.SenderEmail = nil, ""
+			}
+		}
+	}
 	// The sidebar meter's denominator: the mailboxes' day under the
 	// scheduler's own clamps, not their caps added up. Best effort; the
-	// dashboard still renders without it.
-	if h.CampaignService != nil {
+	// dashboard still renders without it. It is the workspace's, so a
+	// restricted member is not given it.
+	if h.CampaignService != nil && !restricted {
 		if capacity, cerr := h.CampaignService.WorkspaceCapacity(c.Request.Context(), *orgID); cerr == nil {
 			analytics.CapacityToday = capacity
 		}
@@ -438,6 +480,10 @@ func (h *Handler) CompareCampaigns(c *gin.Context) {
 		errx.Handle(c, errx.New(errx.BadRequest, "at least one valid campaign ID is required"))
 		return
 	}
+	if !idsWithin(campaignIDs, middleware.AllowedCampaigns(c)) {
+		errx.Handle(c, errx.New(errx.NotFound, "campaign not found"))
+		return
+	}
 
 	// Limit to 10 campaigns
 	if len(campaignIDs) > 10 {
@@ -472,6 +518,50 @@ func (h *Handler) CompareCampaigns(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, comparison)
+}
+
+// uuidListQuery reads a comma-separated or repeated query parameter of
+// UUIDs, deduplicated in order. A malformed id or more than max is a 400.
+func uuidListQuery(c *gin.Context, key string, max int) ([]uuid.UUID, *errx.Error) {
+	var ids []uuid.UUID
+	seen := make(map[uuid.UUID]struct{})
+	for _, raw := range c.QueryArray(key) {
+		for _, part := range splitAndTrim(raw) {
+			id, err := uuid.Parse(part)
+			if err != nil {
+				return nil, errx.New(errx.BadRequest, key+" must be a comma-separated list of UUIDs")
+			}
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) > max {
+		return nil, errx.New(errx.BadRequest, fmt.Sprintf("%s accepts at most %d ids", key, max))
+	}
+	return ids, nil
+}
+
+// idsWithin reports whether every id is on allowed; a nil allowed list allows everything.
+func idsWithin(ids, allowed []uuid.UUID) bool {
+	if allowed == nil {
+		return true
+	}
+	for _, id := range ids {
+		ok := false
+		for _, a := range allowed {
+			if a == id && a != uuid.Nil {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // splitAndTrim splits a comma-separated string and trims whitespace

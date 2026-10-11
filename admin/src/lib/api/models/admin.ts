@@ -190,6 +190,7 @@ export interface AdminMailboxesResult {
 }
 
 export interface AdminMailboxSearch {
+    mailbox_id?: string;
     q?: string;
     status?: string;
     provider?: string;
@@ -747,12 +748,12 @@ export interface AdminOrgListItem {
     campaign_count: number;
     active_campaigns: number;
     risk_state?: OrgRiskState | null;
-    /** Acquisition channel recorded once at signup. Absent for a direct
-     *  signup, which is most of them, and always absent on a self-host. */
+    /** Acquisition recorded once at signup; check referrer_host too, since an absent UTM source is unknown. */
     utm_source?: string | null;
     utm_medium?: string | null;
     utm_campaign?: string | null;
     landing_path?: string | null;
+    referrer_host?: string | null;
     plan_name?: string | null;
     plan_public?: boolean | null;
     is_enterprise: boolean;
@@ -904,6 +905,7 @@ export interface AdminOrgSearch {
     utm_campaign?: string;
     has_acquisition?: boolean;
     no_acquisition?: boolean;
+    referrer_host?: string;
     // Subscription state
     subscription_status?: string;
     cancel_at_period_end?: boolean;
@@ -965,6 +967,8 @@ export interface LoginCodeExemption {
     /** When the handed-out password stops working; absent for an account
      *  exempted without one. */
     password_expires_at?: string | null;
+    test_workspace_id?: string | null;
+    sample_data_seeded_at?: string | null;
 }
 
 /** The one time the password is readable. It is not stored in a form anyone

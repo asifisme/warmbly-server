@@ -7,7 +7,7 @@
 // session through /cloud-link/oauth/finish instead.
 
 import React from "react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { useQueryClient } from "@tanstack/react-query";
 import type Inbox from "@/lib/api/models/app/emails/Inbox";
 import { API_URL, APP_URL } from "@/lib/information";
@@ -75,7 +75,7 @@ export function allowedCallbackOrigins(): string[] {
 export default function useMailboxOAuth(options: MailboxOAuthOptions = {}) {
     const qc = useQueryClient();
     const pool = useCloudPool();
-    const viaCloud = pool.connected;
+    const viaCloud = pool.workspaceConnected;
     const gmailAvailable = useGmailOAuthConnect(viaCloud);
 
     const [busy, setBusy] = React.useState<MailboxOAuthProvider | null>(null);

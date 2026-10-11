@@ -3,7 +3,7 @@
 // Import, which is the file import's RunStep: both sources end in the same
 // MailboxImport job, so the result screen, retries and the Imports menu are one.
 import React from "react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { CheckIcon, ChevronRightIcon, Loader2Icon, UploadIcon, XIcon } from "lucide-react";
 import type { MailboxImport, MailboxImportSettings, OnExisting } from "@/lib/api/models/app/emails/MailboxImport";
 import type { SourceImportOptions } from "@/lib/api/models/app/emails/MailboxSources";
@@ -314,6 +314,8 @@ export default function SourceImportWizard(props: SourceImportWizardProps) {
                             </button>
                         )}
                         <PickTable
+                            key={`${source}:${sourceKey}`}
+                            browseScope={`emails.import.${source}.${sourceKey}.pick`}
                             items={items}
                             loading={itemsLoading}
                             loadingLogo={itemsLoadingLogo}
@@ -373,6 +375,7 @@ export default function SourceImportWizard(props: SourceImportWizardProps) {
                         )}
 
                         <DomainChoicesSection
+                            browseScope={`emails.import.${source}.${sourceKey}.domainChoices`}
                             infos={domainInfos}
                             picks={domainPicks}
                             setPicks={setDomainPicks}
@@ -384,6 +387,7 @@ export default function SourceImportWizard(props: SourceImportWizardProps) {
                 )}
                 {current === "run" && importId && (
                     <RunStep
+                        key={importId}
                         importId={importId}
                         onDone={onDone}
                         onAllowance={onAllowance}

@@ -765,6 +765,29 @@ func TestWarmupPoolFindingExplainsItselfWithTheBandsReason(t *testing.T) {
 	}
 }
 
+func TestUnavailableCloudStandingDoesNotInventAReputationBan(t *testing.T) {
+	m := healthyMailbox()
+	m.PoolHealth, m.PoolHealthReason = "blocked", "cloud_evidence_unavailable"
+	byKey := findingsByKey(Detect(snapshotOf(m), defaults()))
+	if _, ok := byKey["warmup_pool_blocked"]; ok {
+		t.Fatal("unavailable Cloud evidence was described as lost pool standing")
+	}
+	f, ok := byKey["cloud_standing_unavailable"]
+	if !ok || !strings.Contains(f.Remedy, "cloud_standing_sync") || len(f.Steps) == 0 || f.Action != nil {
+		t.Fatalf("availability finding does not offer a safe status refresh: %+v", f)
+	}
+	settings := defaults()
+	settings.MutedDetectors = []string{"cloud_standing_unavailable"}
+	if _, ok := findingsByKey(Detect(snapshotOf(m), settings))["cloud_standing_unavailable"]; ok {
+		t.Fatal("Cloud availability detector ignored its own mute setting")
+	}
+	m.PoolHealthReason = "complaints"
+	byKey = findingsByKey(Detect(snapshotOf(m), defaults()))
+	if _, ok := byKey["warmup_pool_blocked"]; !ok {
+		t.Fatal("a real Cloud block stopped being reported")
+	}
+}
+
 // judgedSnapshot is one active campaign with one email step, plus the verdict
 // the copy judge would have attached to it.
 func judgedSnapshot(v *copyjudge.Verdict) (*repository.AdvisorSnapshot, uuid.UUID) {
@@ -960,6 +983,27 @@ func TestJudgeCopyReadsTheCacheBeforeAsking(t *testing.T) {
 	s.judgeCopy(context.Background(), snap3)
 	if judge.calls != 1 {
 		t.Error("a draft campaign's step was sent to the judge")
+	}
+}
+
+type unavailableJudgeCache struct{ memoryJudgeCache }
+
+func (m *unavailableJudgeCache) Put(context.Context, uuid.UUID, string, *copyjudge.Verdict) error {
+	return errors.New("cache unavailable")
+}
+
+func TestJudgeCopyReusesIdenticalCopyWhenCacheWriteFails(t *testing.T) {
+	judge := &recordingJudge{}
+	s := NewService(nil, nil, nil, nil, nil, nil, WithCopyJudge(judge, &unavailableJudgeCache{})).(*service)
+	snap, _ := judgedSnapshot(nil)
+	for i := 0; i < 50; i++ {
+		step := snap.Steps[0]
+		step.ID = uuid.New()
+		snap.Steps = append(snap.Steps, step)
+	}
+	s.judgeCopy(context.Background(), snap)
+	if judge.calls != 1 || len(snap.CopyJudgments) != 51 {
+		t.Fatalf("identical copy cost %d calls and produced %d verdicts", judge.calls, len(snap.CopyJudgments))
 	}
 }
 

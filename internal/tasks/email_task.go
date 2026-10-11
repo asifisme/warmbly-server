@@ -15,6 +15,7 @@ import (
 	"github.com/warmbly/warmbly/internal/observability/errs"
 	"github.com/warmbly/warmbly/internal/pkg/mailhost"
 	"github.com/warmbly/warmbly/internal/repository"
+	"github.com/warmbly/warmbly/internal/scheduler"
 	"github.com/warmbly/warmbly/internal/tasks/proto"
 )
 
@@ -36,23 +37,6 @@ func (s *tasksService) HandleEmailTask(task *proto.ProcessTask) *errx.Error {
 	// campaign ("health_check"). Set once the account is loaded; the defer
 	// reads it at completion time.
 	lane := "warmup"
-	if s.advanced != nil {
-		duplicate, xerr := s.advanced.StartTaskExecution(ctx, taskID, executionKey, map[string]interface{}{
-			"task_type": "warmup",
-		})
-		if xerr != nil {
-			return xerr
-		}
-		if duplicate {
-			return nil
-		}
-		defer func() {
-			_ = s.advanced.CompleteTaskExecution(ctx, taskID, executionKey, executionStatus, map[string]interface{}{
-				"task_type": "warmup",
-				"lane":      lane,
-			})
-		}()
-	}
 
 	// STEP 2: Load task record
 	taskRecord, err := s.taskRepo.GetTask(ctx, taskID)
@@ -63,6 +47,13 @@ func (s *tasksService) HandleEmailTask(task *proto.ProcessTask) *errx.Error {
 
 	if taskRecord == nil {
 		return errx.ErrNotFound
+	}
+	if taskRecord.ScheduledAt != nil && taskRecord.ScheduledAt.After(time.Now()) {
+		return nil
+	}
+	lineage, ok := s.taskRepo.(repository.WarmupLineageRepository)
+	if !ok {
+		return errx.InternalError()
 	}
 
 	if taskRecord.Status != "pending" {
@@ -83,6 +74,11 @@ func (s *tasksService) HandleEmailTask(task *proto.ProcessTask) *errx.Error {
 		return errx.ErrNotFound
 	}
 	// A mailbox enrolled in Warmbly Cloud is warmed there; the local chain ends here.
+	if !account.TestSendingAllowed() {
+		_ = s.taskRepo.UpdateTaskStatus(ctx, taskID, "cancelled")
+		executionStatus = "skipped_diagnostic_stopped"
+		return nil
+	}
 	if s.cloudLink != nil && s.cloudLink.IsEnrolled(ctx, account.ID) {
 		_ = s.taskRepo.UpdateTaskStatus(ctx, taskID, "cancelled")
 		executionStatus = "skipped_cloud_warmup"
@@ -192,13 +188,9 @@ func (s *tasksService) HandleEmailTask(task *proto.ProcessTask) *errx.Error {
 	}
 
 	if s.warmupHealth != nil {
-		if err := s.warmupHealth.EnsurePoolMembershipWithRole(ctx, account.ID, poolType, "sender_receiver"); err != nil {
-			return err
-		}
-
-		canParticipate, _, err := s.warmupHealth.CanParticipate(ctx, account.ID, poolType)
+		canParticipate, err := s.warmupRepo.IsPoolEligible(ctx, account.ID, poolType, true)
 		if err != nil {
-			return err
+			return errx.InternalError()
 		}
 		if !canParticipate {
 			_ = s.taskRepo.UpdateTaskStatus(ctx, taskID, "skipped_warmup_protected")
@@ -208,10 +200,73 @@ func (s *tasksService) HandleEmailTask(task *proto.ProcessTask) *errx.Error {
 		}
 	}
 
-	// STEP 4: Mark task as active (with advisory lock)
-	if err := s.taskRepo.UpdateTaskStatusWithLock(ctx, taskID, "active"); err != nil {
-		errs.CaptureException(err)
+	if err := s.sendAdmission(ctx, account); err != nil {
+		if errors.Is(err, repository.ErrSendAdmissionDenied) {
+			if err := lineage.RescheduleWarmupTask(ctx, taskID, time.Now().Add(5*time.Minute)); err != nil {
+				return errx.InternalError()
+			}
+			return nil
+		}
 		return errx.InternalError()
+	}
+	capable, ok := s.emailSender.(interface {
+		WarmupWorkerReady(context.Context, models.Email) (bool, error)
+	})
+	if !ok {
+		return errx.InternalError()
+	}
+	ready, capErr := capable.WarmupWorkerReady(ctx, *account)
+	if capErr != nil {
+		return errx.InternalError()
+	}
+	if !ready {
+		if err := lineage.RescheduleWarmupTask(ctx, taskID, time.Now().Add(5*time.Minute)); err != nil {
+			return errx.InternalError()
+		}
+		return nil
+	}
+	if gate, ok := s.scheduler.(interface {
+		WarmupDispatchNotBefore(context.Context, uuid.UUID, time.Time) (time.Time, error)
+	}); ok {
+		at, err := gate.WarmupDispatchNotBefore(ctx, account.ID, time.Now())
+		if errors.Is(err, scheduler.ErrWarmupTimeWindowInvalid) {
+			if err := lineage.RescheduleWarmupTask(ctx, taskID, time.Now().Add(5*time.Minute)); err != nil {
+				return errx.InternalError()
+			}
+			return nil
+		}
+		if err != nil {
+			return errx.InternalError()
+		}
+		if at.After(time.Now()) {
+			if err := lineage.RescheduleWarmupTask(ctx, taskID, at); err != nil {
+				return errx.InternalError()
+			}
+			return nil
+		}
+	} else {
+		return errx.InternalError()
+	}
+	claimed, err := lineage.ClaimWarmupTask(ctx, taskID, time.Now())
+	if err != nil {
+		return errx.InternalError()
+	}
+	if !claimed {
+		return nil
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = lineage.ReleaseUnpublishedWarmupTask(releaseCtx, taskID, time.Now().Add(5*time.Minute))
+	}()
+	if s.advanced != nil {
+		_, xerr := s.advanced.StartTaskExecution(ctx, taskID, executionKey, map[string]interface{}{"task_type": "warmup"})
+		if xerr != nil {
+			return xerr
+		}
+		defer func() {
+			_ = s.advanced.CompleteTaskExecution(ctx, taskID, executionKey, executionStatus, map[string]interface{}{"task_type": "warmup", "lane": lane})
+		}()
 	}
 
 	// STEP 5: Select warmup partner. A task directed at one partner is a
@@ -219,6 +274,13 @@ func (s *tasksService) HandleEmailTask(task *proto.ProcessTask) *errx.Error {
 	// is what makes a thread read as a conversation instead of two monologues.
 	// The directed partner still passes the same health gate as a drawn one.
 	partner := s.directedWarmupPartner(ctx, taskID, account, poolType)
+	warmupTask, err := s.taskRepo.GetWarmupTask(ctx, taskID)
+	if err != nil || warmupTask == nil {
+		return errx.InternalError()
+	}
+	if warmupTask.TargetAccountID != nil && (warmupTask.ParentTaskID == nil || partner == nil) {
+		return s.closeWarmupThread(ctx, taskID, account.ID)
+	}
 	// A directed task IS the reply; the reply-rate draw already happened when
 	// it was scheduled. Rolling again here would square the rate, so a 30%
 	// reply rate would answer 9% of the time.
@@ -244,110 +306,48 @@ func (s *tasksService) HandleEmailTask(task *proto.ProcessTask) *errx.Error {
 
 	// STEP 6: Determine if this should be a reply or a new warmup email.
 	// Replies advance the exact cached conversation plan used by the parent.
-	replyRate := account.WarmupReplyRate
-	shouldReply := directedReply || rand.Float64()*100 < float64(replyRate)
+	shouldReply := directedReply
 	var subject, emailBody, conversationTheme, contentSource string
 	var conversationID *uuid.UUID
 	var conversationTurn int
 	var inReplyTo string
+	var references []string
+	var threadID string
+	var content warmupContent
 
 	if shouldReply {
-		candidate, replyErr := s.warmupRepo.GetLatestReplyCandidate(ctx, partner.ID, account.ID)
-		if replyErr == nil && candidate != nil && candidate.MessageID != "" {
-			inReplyTo = candidate.MessageID
-			subject = strings.TrimSpace(candidate.Subject)
-			if subject == "" {
-				subject = generateWarmupSubject()
-			}
-			// "Re:" is legitimate here — this is a genuine reply with a real
-			// In-Reply-To header (synthesizeWarmupSubject no longer fabricates
-			// "Re:" on first-touch sends).
-			if !strings.HasPrefix(strings.ToLower(subject), "re:") {
-				subject = "Re: " + subject
-			}
-			nextTurn := candidate.ConversationTurn + 1
-			var conv Conversation
-			if candidate.ContentSource == models.WarmupContentSourceAI && candidate.ConversationID != nil && s.warmupContentRepo != nil {
-				cached, getErr := s.warmupContentRepo.GetConversation(ctx, *candidate.ConversationID)
-				if getErr == nil && cached != nil && cached.LintPassed && cached.ReplyEligible {
-					conv = Conversation{
-						ID:          cached.ID,
-						Theme:       cached.Theme,
-						Description: cached.Description,
-						Messages:    cached.Messages,
-					}
-					conversationTheme = cached.Theme
-					contentSource = models.WarmupContentSourceAI
-					conversationID = candidate.ConversationID
-				}
-			} else {
-				conv = conversationForTheme(candidate.ConversationTheme)
-				conversationTheme = conv.Theme
-				contentSource = models.WarmupContentSourceStatic
-				conversationID = candidate.ConversationID
-			}
-
-			var rendered bool
-			emailBody, rendered = GenerateConversationReplyEmail(conv, *account, nextTurn)
-			if rendered {
-				conversationTurn = nextTurn
-			} else {
-				// The thread is exhausted or no longer safe. Start a fresh one
-				// instead of repeating a reply or switching topics mid-thread.
-				shouldReply = false
-				inReplyTo = ""
-			}
-		} else {
-			shouldReply = false
+		candidate, replyErr := lineage.ExactWarmupParent(ctx, taskID)
+		if replyErr != nil {
+			return errx.InternalError()
+		}
+		content, inReplyTo, references, replyErr = s.exactReplyContent(ctx, candidate, *account)
+		if replyErr != nil {
+			return s.closeWarmupThread(ctx, taskID, account.ID)
+		}
+		conversationTurn = candidate.ConversationTurn + 1
+		if account.Provider == string(models.InboxProviderGoogle) && candidate.ThreadID != nil {
+			threadID = *candidate.ThreadID
 		}
 	}
 
 	// STEP 7: Build a new warmup message when not replying. Content comes from
 	// the AI bank (segment-aware) when enabled, else the static library.
 	if !shouldReply {
-		content := s.pickNewWarmupContent(ctx, *account)
-		subject = content.subject
-		emailBody = content.body
-		conversationTheme = content.theme
-		contentSource = content.contentSource
-		conversationID = content.conversationID
+		content = s.pickNewWarmupContent(ctx, *account)
 	}
+	subject, emailBody, conversationTheme, contentSource, conversationID = content.subject, content.body, content.theme, content.contentSource, content.conversationID
 
-	// STEP 7.5: Content-safety lint. Warmup mail must look unremarkable; if the
-	// chosen content trips the lint (most likely AI drift) fall back to clean
-	// static content so we never send spammy-looking warmup.
-	if err := lintWarmupContent(subject, emailBody, shouldReply); err != nil {
-		log.Warn().Err(err).
-			Str("email_account_id", account.ID.String()).
-			Str("content_source", contentSource).
-			Msg("warmup content failed lint; falling back to static")
-		conv := randomWarmupConversation()
-		conversationTheme = conv.Theme
-		fallbackID := conv.ID
-		conversationID = &fallbackID
-		conversationTurn = 0
-		contentSource = models.WarmupContentSourceStatic
-		shouldReply = false
-		inReplyTo = ""
-		subject = generateWarmupSubject()
-		emailBody = GenerateConversationEmail(conv, *account, false)
-		if err2 := lintWarmupContent(subject, emailBody, false); err2 != nil {
-			subject = "Quick note"
-			emailBody = GenerateConversationEmail(Conversation{
-				Theme:       "checkin",
-				Description: "Just checking in — hope all is well.",
-				Messages:    []string{"How have things been lately?"},
-			}, *account, false)
-		}
+	if err := lintDiagnosticContent(subject, emailBody, shouldReply, *account); err != nil {
+		return s.closeWarmupThread(ctx, taskID, account.ID)
+	}
+	if err := lineage.SaveWarmupLineage(ctx, taskID, repository.WarmupLineage{Subject: subject, References: references, ScenarioVersion: content.scenarioVersion, RenderingVersion: content.renderingVersion, MaxTurns: content.maxTurns}); err != nil {
+		return errx.InternalError()
 	}
 
 	// STEP 9: Generate Message-ID
 	messageID := generateMessageID(account.Email)
-	// Persist it now so the reply path (GetLatestReplyCandidate, which filters
-	// message_id <> '') can find this send as a thread parent on a later turn.
-	// Without this the warmup reply/threading path never fires.
 	if err := s.taskRepo.UpdateTaskMessageID(ctx, taskID, messageID); err != nil {
-		log.Warn().Err(err).Str("task_id", taskID.String()).Msg("Failed to persist warmup task message_id")
+		return errx.InternalError()
 	}
 
 	// STEP 9.5: Generate warmup verification token
@@ -391,19 +391,38 @@ func (s *tasksService) HandleEmailTask(task *proto.ProcessTask) *errx.Error {
 		BodyHTML:    "", // Warmup emails are plaintext only
 		BodyPlain:   emailBody,
 		InReplyTo:   inReplyTo,
+		References:  references,
+		ThreadID:    threadID,
 		MessageID:   messageID,
 		IsWarmup:    true,
 		Tracking:    nil, // No tracking for warmup
 		WarmupToken: warmupTokenStr,
 	}
 
+	if err := s.validateWarmupPair(ctx, account, partner, poolType, shouldReply); err != nil {
+		return s.closeWarmupThread(ctx, taskID, account.ID)
+	}
+	if err := s.sendAdmission(ctx, account); err != nil {
+		return errx.InternalError()
+	}
+	dispatch, ok := s.taskRepo.(repository.WarmupDispatchRepository)
+	if !ok || account.WorkerID == nil {
+		return errx.InternalError()
+	}
+	nonce, err := dispatch.AuthorizeWarmupDispatch(ctx, taskID, account.ID, *account.WorkerID)
+	if err != nil {
+		return errx.InternalError()
+	}
+	emailMsg.DispatchNonce = nonce.String()
 	if err := s.emailSender.Send(ctx, taskID, emailMsg, *account); err != nil {
-		s.taskRepo.RecordTaskFailure(ctx, taskID, "Send failed", err.Error())
-		if s.advanced != nil {
-			_ = s.advanced.CaptureTaskDeadLetter(ctx, taskID, "warmup", map[string]interface{}{
-				"partner_email": partner.Email,
-			}, err.Error(), 1)
-			_ = s.taskRepo.UpdateTaskStatus(ctx, taskID, "dead_lettered")
+		if !errors.Is(err, ErrSendDispatchUnknown) && !errors.Is(err, ErrWarmupDispatchDeferred) {
+			result := models.SendEmailResult{TaskID: taskID, Error: &models.EmailSendError{Failure: &errx.SendFailure{Protocol: "internal", Stage: "prepare", Disposition: errx.SendRetry, Scope: "mailbox", ObservedAt: time.Now().UTC()}}, SentAt: time.Now().UTC()}
+			recovery := s.taskRepo.(repository.SendResultRecovery)
+			if applyErr := recovery.ApplySendResult(ctx, result, func(ctx context.Context) error {
+				return s.warmupRepo.FailWarmupSend(ctx, account.ID, taskID, result.SentAt, "Send not published", "Worker authority unavailable")
+			}); applyErr != nil {
+				return errx.InternalError()
+			}
 		}
 		return nil
 	}
@@ -411,24 +430,6 @@ func (s *tasksService) HandleEmailTask(task *proto.ProcessTask) *errx.Error {
 	// STEP 11: Update task record
 	taskRecord.MessageID = messageID
 	taskRecord.Status = "completed"
-
-	// STEP 12: Update warmup statistics
-	if err := s.warmupRepo.IncrementDailyCount(ctx, account.ID, time.Now()); err != nil {
-		log.Warn().Err(err).Str("task_id", taskID.String()).Str("email_account_id", account.ID.String()).Msg("Failed to increment warmup daily count")
-	}
-	// Track replies separately so warmup reply analytics (emails_replied) is no
-	// longer always zero. Conversational replies are a healthy-traffic signal.
-	if shouldReply {
-		if err := s.warmupRepo.IncrementReplyCount(ctx, account.ID, time.Now()); err != nil {
-			log.Warn().Err(err).Str("task_id", taskID.String()).Str("email_account_id", account.ID.String()).Msg("Failed to increment warmup reply count")
-		}
-	}
-
-	// STEP 13: Mark task completed (with advisory lock)
-	if err := s.taskRepo.UpdateTaskStatusWithLock(ctx, taskID, "completed"); err != nil {
-		errs.CaptureException(err)
-		return errx.InternalError()
-	}
 
 	// STEP 14: Publish events
 	s.publishWarmupEmailSentEvent(ctx, taskRecord, account, partner, shouldReply)
@@ -607,7 +608,7 @@ func (s *tasksService) selectWarmupPartner(ctx context.Context, account Email) (
 	}
 
 	// Rank outside workspaces first while retaining siblings as a self-host fallback.
-	var buckets [8][]uuid.UUID
+	var buckets [4][]uuid.UUID
 	foreign, own := 0, 0
 	for _, c := range candidates {
 		if _, usedToday := todayPartnerSet[c.ID]; usedToday {
@@ -615,18 +616,12 @@ func (s *tasksService) selectWarmupPartner(ctx context.Context, account Email) (
 		}
 		rank := 0
 		if sameOrganization(account.OrganizationID, c.OrganizationID) {
-			rank += 4
+			rank += 2
 			own++
 		} else {
 			foreign++
 		}
 		if _, recentlyUsed := recentPartnerSet[c.ID]; recentlyUsed || partnerCounts[c.ID] >= partnerMaxSharedWindow {
-			rank += 2
-		}
-		// A borrowed partner fills in after the sender's own tier. A return
-		// visit does not: it ranks with the own tier, or a free mailbox with a
-		// hundred fresh siblings would never pay a paying inbox back.
-		if c.Borrowed() {
 			rank++
 		}
 		buckets[rank] = append(buckets[rank], c.ID)
@@ -782,7 +777,7 @@ func (sig partnerSignals) hostPenalty(partnerID uuid.UUID) float64 {
 }
 
 // pickWeightedPartner picks a partner ID using a composite weight:
-//   - inverse-frequency on the partner's recipient domain (diversity)
+//   - balanced host coverage with inverse-frequency domains within each host
 //   - this sender's recent junk rate at the partner's mail host (feedback)
 //   - how far behind the partner is on what it sent (reciprocity)
 //   - how much a small-host partner's own filter junks (recipient quality)
@@ -794,16 +789,26 @@ func pickWeightedPartner(candidates []uuid.UUID, sig partnerSignals) uuid.UUID {
 	if len(candidates) == 1 {
 		return candidates[0]
 	}
-	if len(sig.domainsByID) == 0 && len(sig.ruleWeight) == 0 && len(sig.placementByHost) == 0 && len(sig.starvation) == 0 && len(sig.filterJunk) == 0 {
+	if len(sig.hostsByID) == 0 && len(sig.domainsByID) == 0 && len(sig.ruleWeight) == 0 && len(sig.placementByHost) == 0 && len(sig.starvation) == 0 && len(sig.filterJunk) == 0 {
 		return candidates[rand.Intn(len(candidates))]
 	}
 
 	weights := make([]float64, len(candidates))
+	hostTotals := make(map[string]float64)
+	// Normalize only the coverage base; quality and customer rules still change host share.
+	for _, id := range candidates {
+		if host := sig.hostsByID[id]; host != "" {
+			hostTotals[host] += 1.0 / float64(1+sig.domainCounts[sig.domainsByID[id]])
+		}
+	}
 	var total float64
 	for i, id := range candidates {
 		domain := sig.domainsByID[id]
 		// Diversity base weight.
 		w := 1.0 / float64(1+sig.domainCounts[domain])
+		if hostTotal := hostTotals[sig.hostsByID[id]]; hostTotal > 0 {
+			w /= hostTotal
+		}
 
 		// Per-host placement feedback.
 		w *= sig.hostPenalty(id)
@@ -902,6 +907,29 @@ func (s *tasksService) scheduleWarmupRecovery(ctx context.Context, accountID uui
 // pending task is never created. Returns ErrWarmupNotEnabled (benign) when
 // the mailbox is neither warming nor backing a live campaign.
 func (s *tasksService) EnsureWarmupScheduled(ctx context.Context, accountID uuid.UUID) error {
+	account, xerr := s.emailRepo.GetByID(ctx, accountID)
+	if xerr != nil {
+		return xerr
+	}
+	if account == nil {
+		return errors.New("mailbox unavailable")
+	}
+	if s.warmupHealth != nil {
+		pool := s.resolveWarmupPoolType(ctx, account)
+		_, xerr := s.warmupHealth.MovePoolMembership(ctx, accountID, pool)
+		if xerr != nil {
+			return xerr
+		}
+		health, err := s.warmupRepo.GetParticipantHealth(ctx, accountID, pool)
+		if err != nil {
+			return err
+		}
+		if health == nil {
+			if xerr := s.warmupHealth.EnsurePoolMembershipWithRole(ctx, accountID, pool, "sender_receiver"); xerr != nil {
+				return xerr
+			}
+		}
+	}
 	nextTime, err := s.scheduler.CalculateNextWarmupTime(ctx, accountID)
 	if err != nil {
 		return err
@@ -945,8 +973,16 @@ func (s *tasksService) createWarmupTask(ctx context.Context, accountID uuid.UUID
 	}
 
 	// Update task with cloud task name
-	if err := s.taskRepo.UpdateTaskScheduledAt(ctx, newTaskID, scheduleTime, cloudTaskName); err != nil {
+	lineage, ok := s.taskRepo.(repository.WarmupLineageRepository)
+	if !ok {
+		return errors.New("warmup queue authority unavailable")
+	}
+	acked, err := lineage.AckWarmupQueue(ctx, repository.WarmupQueueRevision{TaskID: newTaskID, At: scheduleTime, Revision: 1}, cloudTaskName)
+	if err != nil {
 		return err
+	}
+	if !acked {
+		_ = s.tasksClient.DeleteTask(ctx, cloudTaskName)
 	}
 
 	return nil

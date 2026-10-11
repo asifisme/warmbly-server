@@ -78,6 +78,46 @@ const (
 	WarmupRemovalUnknown = "unknown"
 )
 
+type WarmupActionRequest struct {
+	MailboxID uuid.UUID `json:"mailbox_id"`
+	WorkerID  uuid.UUID `json:"worker_id"`
+	Actions   []string  `json:"actions"`
+	FilingID  string    `json:"filing_id,omitempty"`
+}
+
+type WarmupActionDecision struct {
+	Actions        []string                   `json:"actions"`
+	FilingPending  bool                       `json:"filing_pending,omitempty"`
+	FilingRecovery *WarmupFilingRecoveryProof `json:"filing_recovery,omitempty"`
+}
+
+const WarmupFilingRecoveryProtocol = 1
+
+type WarmupFilingRecoveryProof struct {
+	Protocol        int        `json:"protocol"`
+	MailboxID       uuid.UUID  `json:"mailbox_id"`
+	WorkerID        uuid.UUID  `json:"worker_id"`
+	FilingID        uuid.UUID  `json:"filing_id"`
+	ProviderRetryAt *time.Time `json:"provider_retry_at,omitempty"`
+}
+
+func (p *WarmupFilingRecoveryProof) ValidFor(mailbox, worker, filing uuid.UUID) bool {
+	return p != nil && p.Protocol == WarmupFilingRecoveryProtocol && mailbox != uuid.Nil && worker != uuid.Nil && filing != uuid.Nil &&
+		p.MailboxID == mailbox && p.WorkerID == worker && p.FilingID == filing && (p.ProviderRetryAt == nil || !p.ProviderRetryAt.IsZero())
+}
+
+type WarmupFilingDeferralRequest struct {
+	MailboxID       uuid.UUID `json:"mailbox_id"`
+	WorkerID        uuid.UUID `json:"worker_id"`
+	FilingID        uuid.UUID `json:"filing_id"`
+	ProviderRetryAt time.Time `json:"provider_retry_at"`
+}
+
+type WarmupFilingDeferralDecision struct {
+	FilingRecovery *WarmupFilingRecoveryProof `json:"filing_recovery"`
+	Persisted      bool                       `json:"persisted"`
+}
+
 // WarmupEmailAction represents actions to perform on a detected warmup email.
 //
 // For Gmail accounts the worker uses GmailID to issue Users.Messages.Modify
@@ -115,6 +155,7 @@ type WarmupEmailAction struct {
 	// know it (the sender's own copy of a send), in which case the worker
 	// resolves it from the provider id it acted on.
 	InternalID string `json:"internal_id,omitempty" avro:"internal_id"`
+	FilingID   string `json:"filing_id,omitempty" avro:"filing_id"`
 
 	// Recheck marks a verify_removal for a strike recorded before removals
 	// were searched; the answer echoes it.
@@ -175,8 +216,7 @@ type WarmupPartnerOrigin string
 const (
 	// WarmupPartnerOwnTier is a member of the sender's own pool.
 	WarmupPartnerOwnTier WarmupPartnerOrigin = "own"
-	// WarmupPartnerBorrowed is a proven free mailbox filling in a thin premium
-	// tier. Drawn after the sender's own tier.
+	// WarmupPartnerBorrowed is a proven free mailbox available to a premium sender.
 	WarmupPartnerBorrowed WarmupPartnerOrigin = "borrowed"
 	// WarmupPartnerReturn is a paying mailbox that wrote to this free sender
 	// recently. Drawn alongside the sender's own tier: returning the visit is

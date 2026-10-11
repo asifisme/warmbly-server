@@ -2,6 +2,7 @@ package wmail
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,8 +59,19 @@ type SmtpImapData struct {
 }
 
 type WMail struct {
-	UserID uuid.UUID
-	ID     uuid.UUID
+	TransportGeneration uuid.UUID
+	lifecycleMu         sync.Mutex
+	stopped             bool
+	stopDone            chan struct{}
+	active              sync.WaitGroup
+	syncMu              sync.Mutex
+	executionKeys       map[[32]byte]struct{}
+	initialExecutionKey [32]byte
+	executionData       *models.AddWorkerEmail
+	diagnosticRetries   map[uuid.UUID]diagnosticRetry
+	ExecutorID          uuid.UUID
+	UserID              uuid.UUID
+	ID                  uuid.UUID
 	// OrgID scopes the organization-wide sync budget; nil for a legacy
 	// personal mailbox.
 	OrgID *uuid.UUID
@@ -144,13 +156,14 @@ func NewWMail(
 	mailCtx, cancel := context.WithCancel(context.Background())
 
 	mail := &WMail{
-		ID:        data.ID,
-		UserID:    data.UserID,
-		OrgID:     data.OrganizationID,
-		Email:     data.Email,
-		FirstName: data.FirstName,
-		LastName:  data.LastName,
-		EmailType: data.Type,
+		ID:                  data.ID,
+		UserID:              data.UserID,
+		TransportGeneration: data.TransportGeneration,
+		OrgID:               data.OrganizationID,
+		Email:               data.Email,
+		FirstName:           data.FirstName,
+		LastName:            data.LastName,
+		EmailType:           data.Type,
 		// Unset in the payload means yes; see AddWorkerEmail.SavesSentCopy.
 		SaveToSent: data.Type == models.InboxProviderSMTPIMAP && data.SavesSentCopy(),
 		onEvent: func(jobType models.JobEventType, body any) error {
@@ -167,6 +180,13 @@ func NewWMail(
 		SyncContext:               syncContext,
 		CipherService:             cipherService,
 	}
+	mail.rememberExecution(data)
+	ready := false
+	defer func() {
+		if !ready {
+			mail.Discard()
+		}
+	}()
 
 	// A publisher older than the sync policy sends no Sync block; compiled
 	// defaults then apply and the mailbox starts its backfill from scratch.
@@ -189,6 +209,7 @@ func NewWMail(
 			State:   st,
 		})
 	})
+	mail.tracker.transportGeneration = mail.TransportGeneration
 
 	switch data.Type {
 	case models.InboxProviderGoogle:
@@ -249,9 +270,10 @@ func NewWMail(
 				FirstName: data.FirstName,
 				LastName:  data.LastName,
 
-				User:       data.Graph.User,
-				Cache:      mail.Cache,
-				DeltaLinks: cloneStringMap(deltaLinks),
+				User:         data.Graph.User,
+				Cache:        mail.Cache,
+				DeltaLinks:   cloneStringMap(deltaLinks),
+				ImmutableIDs: mail.SyncContext != nil,
 
 				OnMessageSeen:   mail.onGraphMessageSeen,
 				OnMessageRemove: mail.onGraphMessageRemove,
@@ -284,6 +306,7 @@ func NewWMail(
 
 		if data.ImapSync {
 			conn := &imap.Client{
+				Context:     mailCtx,
 				Email:       data.Email,
 				AuthType:    models.AuthPlain,
 				Credentials: data.SmtpImap.Credentials.IMAP,
@@ -292,13 +315,11 @@ func NewWMail(
 				return nil, err
 			}
 			mail.SmtpImapData.ImapClient = conn
-			// Saved folder cursors: live sync resumes from each folder's stored
-			// HIGHESTMODSEQ instead of re-baselining (and, before this, instead
-			// of re-walking every folder on every worker restart).
-			for i := range data.SmtpImap.Mailboxes {
-				box := data.SmtpImap.Mailboxes[i]
-				mail.SmtpImapData.Mailboxes = append(mail.SmtpImapData.Mailboxes, &box)
-			}
+		}
+		// Keep saved cursors even while IMAP sync is temporarily disabled.
+		for i := range data.SmtpImap.Mailboxes {
+			box := data.SmtpImap.Mailboxes[i]
+			mail.SmtpImapData.Mailboxes = append(mail.SmtpImapData.Mailboxes, &box)
 		}
 
 		mail.SmtpImapData.SmtpClient = &smtp.Client{
@@ -317,6 +338,7 @@ func NewWMail(
 		)
 	}
 
+	ready = true
 	return mail, nil
 }
 
@@ -333,13 +355,5 @@ func (w *WMail) ApplySyncPolicy(data *models.AddWorkerEmailSyncData) {
 
 // Discard releases a WMail that was built but never put to work.
 func (w *WMail) Discard() {
-	if w.Cancel != nil {
-		w.Cancel()
-	}
-	if w.SmtpImapData == nil || w.SmtpImapData.ImapClient == nil {
-		return
-	}
-	if c, ok := w.SmtpImapData.ImapClient.(interface{ Close() error }); ok {
-		_ = c.Close()
-	}
+	w.Stop()
 }

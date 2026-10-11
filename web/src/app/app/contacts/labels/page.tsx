@@ -3,10 +3,12 @@
 // list filtered to that category.
 
 import React from "react";
+import useBrowseState from "@/hooks/useBrowseState";
+import { browseText } from "@/lib/browse-contacts-campaigns";
 import { useNavigate } from "@tanstack/react-router";
 import { useQueries } from "@tanstack/react-query";
 import { CheckIcon, MoreHorizontalIcon, PlusIcon, XIcon } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 
 import { EmptyBlock, Page, PageBody, PageTopbar, SectionBar, TopbarAction } from "@/components/layout/Page";
 import { SearchInput, TextInput } from "@/components/ui/field";
@@ -36,7 +38,7 @@ export default function LabelsPage() {
     const write = useWriteGuard("MANAGE_CONTACTS");
     const guarded = (fn: () => void) => () => write.guard(fn)({});
     const create = useCreateCategory();
-    const [query, setQuery] = React.useState("");
+    const [query, setQuery] = useBrowseState("contacts:labels:query", "", browseText);
     const [creating, setCreating] = React.useState(false);
     const [newTitle, setNewTitle] = React.useState("");
 

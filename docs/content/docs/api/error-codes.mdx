@@ -22,6 +22,18 @@ All errors follow this structure:
 
 ## HTTP status codes
 
+### Campaign send-admission diagnostics
+
+These codes appear in campaign activity and task failure metadata, not as HTTP response codes:
+
+| Code | Meaning |
+|------|---------|
+| `CAMPAIGN_DAILY_LIMIT_REACHED` | This campaign has reached its configured UTC-day maximum for this sending mailbox. Other mailboxes have separate campaign allowances. |
+| `MAILBOX_SENDING_PLAN_DENIED` | The mailbox's enabled local-day sending plan is unavailable, outside working hours or on a break, or its daily/hourly quota is exhausted. The scheduler retries when capacity opens. |
+| `SEND_ADMISSION_DENIED` | Another current send-authority, recipient or mailbox capacity check denied admission. |
+
+Admission denial before dispatch releases the send reservation without spending a failed-send attempt. See [campaigns](/guides/campaigns/) and [sending behavior](/guides/sending-behavior/) for the separate configurable ceilings and daily targets.
+
 ### Client errors (4xx)
 
 | Code | Error | Description |
@@ -75,9 +87,14 @@ When the body cannot be read, the `message` says why:
 | is the wrong JSON type at the top level | `The request body must be a JSON array, not a JSON object.` |
 | has a field of the wrong JSON type | `Field "to" must be a JSON array, not a JSON string.` |
 | has a time that is not RFC 3339 | `The request body has a time that is not RFC 3339 (such as 2026-10-01T09:00:00Z): "tomorrow".` |
+| has a text field containing a NUL character | `Field "<name>" contains a NUL character, which is not supported.` |
 | is missing required fields or has values out of range | `The request body is missing or has invalid fields: "to" is required; ...` (up to five fields, then a count of the rest) |
 
 Fields are named by their JSON key, with nested fields as a dotted path (`inner.name`). The `code` is `bad_request` in every case, so branch on `code` and show or log `message`.
+
+Versioned API routes check every query parameter name and value before the endpoint runs, including endpoints that read filters directly. The legacy `/invitations/lookup` alias applies the same validation. NUL characters, invalid UTF-8 and malformed query encoding return `400` rather than sending unsupported text to the database. For example, `?q=%00` returns `Query parameter "q[0]" contains a NUL character, which is not supported.` Valid Unicode text and properly encoded punctuation remain unchanged.
+
+Resource IDs on email, campaign and contact routes must be UUIDs. Email `tags` and campaign `email_tags` and `folders` arrays also require UUID values. Malformed values return `400` with `code: "bad_request"` and a `request_id` before a database write. Valid UUIDs are normalized and repeated relation IDs are deduplicated; workspace ownership checks still apply.
 
 **How to fix:**
 - Check that your JSON is valid
@@ -136,6 +153,16 @@ A password must be 8 to 128 characters. There is no composition rule, but it is 
 }
 ```
 
+#### Cloud connection refusals
+
+| `code` | Status | Meaning |
+|--------|--------|---------|
+| `cloud_link_workspace_required` | 409 | Disconnecting a shared server connection requires explicit confirmation of the server-wide scope; it affects all local workspaces using that connection |
+| `pool_link_workspace_required` | 409 | Cloud refused a new connection request without local workspace scope. Update the self-hosted instance before creating a new connection; existing connections can still enroll mailboxes and start placement tests |
+| `pool_link_workspace_connected` | 409 | The Cloud workspace already has an active self-hosted connection, including a legacy link. Use another Cloud workspace and plan, or disconnect the existing link first |
+| `cloud_link_upgrade_required` | 409 | This Cloud deployment does not support workspace-scoped connections. Upgrade Cloud first |
+| `organization_cloud_connected` | 409 | Disconnect the workspace's Cloud connection before deleting it or scheduling deletion of it or its owner account |
+
 #### Name refusals
 
 | `code` | Status | Meaning |
@@ -148,6 +175,7 @@ Names are shown to other people, including in invitation and notification emails
 - no links, web addresses or email addresses: nothing with `@`, `//`, `www.` or a scheme such as `https:`, no hostname such as `example.com`, and no IP address. Full-width and ideographic dots count as dots
 - no control characters, invisible formatting characters (zero-width and bidirectional overrides), `<`, `>`, `` ` `` or `\`, and no more than three stacked combining marks
 - leading and trailing spaces are trimmed and runs of spaces become one, and that is the form stored
+- an OAuth app name cannot include Warmbly, spaced out or spelled with look-alike characters included. An app that already had such a name keeps it until the name is changed
 
 ```json
 {
@@ -221,6 +249,8 @@ The [inbox vendor](/guides/mailbox-import/#import-from-an-inbox-vendor) routes (
 | `pool_link_instance_url` | 422 | Starting a Google or Microsoft sign-in through [Warmbly Cloud](/guides/warmbly-cloud/#google-and-microsoft-mailboxes-sign-in-through-warmbly-cloud) from an instance that registered no address of its own when it was linked, so Cloud has nowhere to return the sign-in to. Set `APP_URL` on the instance, disconnect it and link it again |
 | `pool_link_return_url` | 400 | The same sign-in named a return address that is not on the instance's registered address (same scheme and host) |
 | `pool_link_oauth_browser` | 400 | The brokered sign-in was not continued from the Warmbly Cloud page that started it, or returned to a different browser. Nothing was connected. Start again from the instance |
+| `cloud_link_managed_protocol` | 409 | Cloud does not advertise durable managed-consent protocol 1. Upgrade all Cloud control-plane replicas before opening a new managed connection or adoption. Existing mailboxes are unchanged |
+| `pool_link_oauth_unknown` | 409 | The provider exchange has no confirmed committed mailbox. Do not retry the authorization code or infer success; remove the pending connection before starting new explicit consent |
 | `cli_auth_scopes_role` | 403 | Approving a [CLI sign-in](/api/cli/#scopes): your role in the chosen workspace allows none of the scopes the CLI asked for. Pick another workspace, or ask for narrower scopes with `--scopes` |
 | `sending_domain_bulk_invalid` | 400 | A bulk setup named no domain, more than 100, neither a `tracking_label` nor a `redirect_url`, a `tracking_label` that is not one DNS label, or a `served_by` other than `instance` or `cloud` |
 | `tracking_domain_taken` | 409 | Another workspace on this instance has already verified this tracking domain, on a mailbox or as a campaign's override. Returned when saving or verifying a mailbox's tracking domain, applying one to a sending domain (including bulk setup), and verifying a campaign's override. Nothing changes |
@@ -418,6 +448,7 @@ Returned when authenticated but lacking necessary permissions.
 - Request IP not in allowlist
 - Email account not in allowlist
 - Organization access restricted
+- The member is restricted to selected resources (`member_access_restricted`)
 
 **Example:**
 
@@ -511,6 +542,33 @@ Turning on two-factor authentication (`POST /auth/2fa/enroll/start` and `/confir
   "request_id": "4bbbd1b2-8f86-47dd-8a7f-9476501ad20e"
 }
 ```
+
+#### Member access scope
+
+A member restricted to [selected resources](/guides/team-roles/#access-scope), and any API key or OAuth app acting for one, reaches only the read routes that filter to their grants. The scope's own refusals:
+
+| `code` | Status | Meaning |
+|--------|--------|---------|
+| `member_access_restricted` | 403 | The caller's selected-resource scope does not cover this route. Resource writes and workspace-wide surfaces such as contacts and settings are refused. Workspace creation is refused to accounts with only restricted memberships, except instance administrators; limit-request operations require an unrestricted membership in the target workspace |
+| `invalid_access_resource` | 400 | `PUT /organization/members/:id/access` or an invitation named a campaign folder, campaign or mailbox that is not in this workspace |
+| `invalid_access_scope` | 400 | The scope is neither `workspace` nor `restricted` |
+| `too_many_access_grants` | 400 | More than 500 folders, campaigns or mailboxes in one list |
+| `owner_access_unrestricted` | 403 | The workspace owner always reaches the entire workspace and cannot be restricted |
+
+A campaign or mailbox outside a restricted caller's grants answers `404`, the same as one that does not exist, so a scope does not reveal what else the workspace holds. `GET /unibox/thread/labels` likewise returns the same `404` for an unknown thread, a thread outside the selected workspace, or a thread with no message in an accessible mailbox. An accessible thread with no labels returns an empty list.
+
+Failure to resolve a restricted scope or its scoped counts fails the request rather than returning workspace-wide data. Realtime authorization lookup errors stop campaign, mailbox and organization channels; user-channel events whose authorization cannot be verified are withheld. See [bounded realtime authorization](/api/realtime/#channels).
+
+```json
+{
+  "error": "Forbidden",
+  "message": "Your access to this workspace is limited to selected campaigns and mailboxes, and this is outside it.",
+  "code": "member_access_restricted",
+  "request_id": "4bbbd1b2-8f86-47dd-8a7f-9476501ad20e"
+}
+```
+
+**How to fix:** ask a member with **Manage team** to widen the access under **Settings > Members**.
 
 #### `slack_link_email_mismatch`
 
@@ -1020,6 +1078,18 @@ Retry-After: 60
 ```
 
 Use the `Retry-After` header to determine when to retry.
+
+## Admin device request errors
+
+The [admin device flow](/api/authentication/#platform-admin-device-sessions)
+adds `admin_device_expired` (404, indistinguishable invalid/unknown/expired/
+consumed request), `admin_device_resolved` (409, already decided or mismatched/
+replayed consent), and `admin_device_slow_down` (429, poll faster than five
+seconds). Start again on expiry and never auto-approve on conflict.
+Attempt budgets use existing `rate_limit_exceeded`. Auth/MFA/reauth and
+dependency failures keep existing codes. Redis failures never authorize a
+single-factor or anonymous admin. [Node diagnostics](/api/endpoints/#platform-node-diagnostics)
+use generic errors and explicit unavailable/stale coverage, not outage inference.
 
 ## See also
 

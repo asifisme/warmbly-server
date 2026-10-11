@@ -9,6 +9,8 @@
 // from the marketing site's pricing.astro.
 
 import React from "react";
+import useBrowseState from "@/hooks/useBrowseState";
+import { billingIntervalSchema } from "@/lib/browse-other-lists";
 import {
     ArrowUpRightIcon,
     CheckIcon,
@@ -25,7 +27,7 @@ import {
 } from "lucide-react";
 import { Link, Navigate, useNavigate, useParams } from "@tanstack/react-router";
 import { AnimatePresence, motion } from "framer-motion";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { TopbarAction } from "@/components/layout/Page";
 import { useSearchParams } from "@/hooks/useSearchParams";
 import useFeatureAccess from "@/hooks/useFeatureAccess";
@@ -88,7 +90,7 @@ export default function BillingSettingsPage() {
     const [codeInput, setCodeInput] = React.useState("");
     const [applied, setApplied] = React.useState<DiscountPreview | null>(null);
     const [billingInterval, setBillingInterval] =
-        React.useState<BillingInterval>("annual");
+        useBrowseState<BillingInterval>("settings.billing.interval", "annual", billingIntervalSchema);
     const [salesOpen, setSalesOpen] = React.useState(false);
 
     // ?pool=1 is where a linked instance's "Premium" button lands (and what

@@ -4,8 +4,11 @@
 // entry the recipient made themselves is confirmed with a stronger warning.
 
 import React from "react";
+import useBrowseState from "@/hooks/useBrowseState";
+import { browseText } from "@/lib/browse-contacts-campaigns";
+import useBrowseDebouncedValue from "@/hooks/useBrowseDebouncedValue";
 import { GlobeIcon, MailIcon, MoreHorizontalIcon, PlusIcon, XIcon } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 
 import { EmptyBlock, Page, PageBody, PageTopbar, SectionBar, TopbarAction } from "@/components/layout/Page";
 import { SearchInput } from "@/components/ui/field";
@@ -22,13 +25,9 @@ import AddSuppressionsDialog from "@/components/app/contacts/AddSuppressionsDial
 export default function SuppressionsPage() {
     const write = useWriteGuard("MANAGE_CONTACTS");
     const guarded = (fn: () => void) => () => write.guard(fn)({});
-    const [query, setQuery] = React.useState("");
-    const [debounced, setDebounced] = React.useState("");
+    const [query, setQuery] = useBrowseState("contacts:suppressions:query", "", browseText);
+    const debounced = useBrowseDebouncedValue(query.trim(), "contacts:suppressions", 200);
     const [adding, setAdding] = React.useState(false);
-    React.useEffect(() => {
-        const t = setTimeout(() => setDebounced(query.trim()), 200);
-        return () => clearTimeout(t);
-    }, [query]);
 
     const list = useSuppressions(debounced);
 

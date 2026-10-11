@@ -34,6 +34,27 @@ type EmailSyncStateRepository interface {
 	// ListProviderFolderMessages returns the newest rows the provider last
 	// placed in one of folders, for providers that key messages by id.
 	ListProviderFolderMessages(ctx context.Context, userID, emailID uuid.UUID, folders []string, limit int) ([]ProviderFolderMessage, error)
+	ListProviderMessages(ctx context.Context, userID, emailID uuid.UUID, after *uuid.UUID, limit int) ([]ProviderFolderMessage, error)
+}
+
+func (r *pgEmailSyncStateRepository) ListProviderMessages(ctx context.Context, userID, emailID uuid.UUID, after *uuid.UUID, limit int) ([]ProviderFolderMessage, error) {
+	const q = `SELECT id, gmail_id, message_id, provider_folder, internal_date, flags FROM unibox_emails
+		WHERE user_id = $1 AND email_id = $2 AND gmail_id <> '' AND ($3::uuid IS NULL OR id > $3)
+		ORDER BY id LIMIT $4`
+	rows, err := r.db.Query(ctx, q, userID, emailID, after, limit)
+	if err != nil {
+		return nil, fmt.Errorf("email_sync_state: list provider messages: %w", err)
+	}
+	defer rows.Close()
+	out := make([]ProviderFolderMessage, 0)
+	for rows.Next() {
+		var m ProviderFolderMessage
+		if err := rows.Scan(&m.ID, &m.ProviderID, &m.MessageID, &m.ProviderFolder, &m.InternalDate, &m.Flags); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 type pgEmailSyncStateRepository struct {
@@ -61,7 +82,8 @@ func (r *pgEmailSyncStateRepository) Put(ctx context.Context, userID, emailID uu
 			email_id, user_id, backfill_status, backfill_cursor, backfill_synced,
 			backfill_since, backfill_started_at, backfill_completed_at,
 			throttled_until, throttle_reason, deferred, last_synced_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+		    CASE WHEN $12::timestamptz > to_timestamp(0) AND $12 <= now() THEN $12 END, now())
 		ON CONFLICT (email_id) DO UPDATE SET
 			user_id = EXCLUDED.user_id,
 			backfill_status = EXCLUDED.backfill_status,
@@ -73,7 +95,7 @@ func (r *pgEmailSyncStateRepository) Put(ctx context.Context, userID, emailID uu
 			throttled_until = EXCLUDED.throttled_until,
 			throttle_reason = EXCLUDED.throttle_reason,
 			deferred = EXCLUDED.deferred,
-			last_synced_at = COALESCE(EXCLUDED.last_synced_at, email_sync_state.last_synced_at),
+			last_synced_at = GREATEST(EXCLUDED.last_synced_at, email_sync_state.last_synced_at),
 			updated_at = now()
 	`
 	if _, err := r.db.Exec(ctx, q,
@@ -85,7 +107,8 @@ func (r *pgEmailSyncStateRepository) Put(ctx context.Context, userID, emailID uu
 		return fmt.Errorf("email_sync_state: put: %w", err)
 	}
 	if state.LastSyncedAt != nil {
-		const touch = `UPDATE email_accounts SET last_synced_at = $2 WHERE id = $1 AND (last_synced_at IS NULL OR last_synced_at < $2)`
+		const touch = `UPDATE email_accounts SET last_synced_at = $2 WHERE id = $1 AND (last_synced_at IS NULL OR last_synced_at < $2)
+		    AND $2::timestamptz > to_timestamp(0) AND $2 <= now()`
 		if _, err := r.db.Exec(ctx, touch, emailID, *state.LastSyncedAt); err != nil {
 			return fmt.Errorf("email_sync_state: touch last_synced_at: %w", err)
 		}

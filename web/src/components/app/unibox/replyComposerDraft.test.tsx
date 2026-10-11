@@ -19,7 +19,7 @@ vi.mock("framer-motion", async (importOriginal) => ({
     ...(await importOriginal<Record<string, unknown>>()),
     AnimatePresence: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
-vi.mock("react-hot-toast", () => ({
+vi.mock("react-hot-toast/headless", () => ({
     default: { success: () => {}, error: () => {} },
 }));
 const sendReply = vi.hoisted(() => vi.fn(async () => ({})));
@@ -33,7 +33,8 @@ vi.mock("@/lib/api/hooks/app/unibox/useUniboxOverview", () => ({
 vi.mock("@/lib/api/hooks/app/unibox/useDraftReply", () => ({
     default: () => ({ mutateAsync: async () => ({}), isPending: false }),
 }));
-vi.mock("@/hooks/context/user", () => ({
+vi.mock("@/hooks/context/user", async (original) => ({
+    ...await original<Record<string, unknown>>(),
     useUserProfile: () => ({ user: { id: "u1", email: "me@example.com", name: "Me" } }),
 }));
 const mailboxes = vi.hoisted(() => {

@@ -171,9 +171,11 @@ func (s *service) syncCloud(ctx context.Context) map[uuid.UUID]bool {
 		errs.CaptureException(err)
 		return touched
 	}
-	byTest := map[uuid.UUID][]int{}
+	type remoteKey struct{ instanceID, testID uuid.UUID }
+	byTest := map[remoteKey][]int{}
 	for i, r := range reports {
-		byTest[r.RemoteTestID] = append(byTest[r.RemoteTestID], i)
+		key := remoteKey{instanceID: r.InstanceID, testID: r.RemoteTestID}
+		byTest[key] = append(byTest[key], i)
 	}
 	for remoteTest, idx := range byTest {
 		sends := make([]models.PlacementCloudSend, 0, len(idx))
@@ -187,7 +189,7 @@ func (s *service) syncCloud(ctx context.Context) map[uuid.UUID]bool {
 			sends = append(sends, snd)
 			ids = append(ids, r.ResultID)
 		}
-		if xerr := s.Cloud.ReportPlacementSends(ctx, remoteTest, sends); xerr != nil {
+		if xerr := s.Cloud.ReportPlacementSends(ctx, remoteTest.instanceID, remoteTest.testID, sends); xerr != nil {
 			continue
 		}
 		if err := s.Repo.MarkRemoteReported(ctx, ids); err != nil {
@@ -201,10 +203,10 @@ func (s *service) syncCloud(ctx context.Context) map[uuid.UUID]bool {
 		return touched
 	}
 	for _, t := range open {
-		if t.RemoteTestID == nil {
+		if t.RemoteTestID == nil || t.RemoteInstanceID == nil {
 			continue
 		}
-		answer, xerr := s.Cloud.PlacementVerdicts(ctx, *t.RemoteTestID)
+		answer, xerr := s.Cloud.PlacementVerdicts(ctx, *t.RemoteInstanceID, *t.RemoteTestID)
 		if xerr != nil || answer == nil {
 			continue
 		}

@@ -17,6 +17,8 @@ type User struct {
 
 	ReferralSource        *string    `json:"referral_source"`
 	OnboardingCompletedAt *time.Time `json:"onboarding_completed_at"`
+	// When the dashboard's product tour was finished or skipped; nil shows it.
+	ProductTourCompletedAt *time.Time `json:"product_tour_completed_at"`
 
 	MaxOrganizations int  `json:"max_organizations"`
 	FreeTrialUsed    bool `json:"free_trial_used"`
@@ -69,5 +71,13 @@ type LoginCodeExemption struct {
 	Reason    *string    `json:"reason,omitempty"`
 	GrantedAt *time.Time `json:"granted_at,omitempty"`
 	// PasswordExpiresAt is set on a tester whose password was handed out.
-	PasswordExpiresAt *time.Time `json:"password_expires_at,omitempty"`
+	PasswordExpiresAt  *time.Time `json:"password_expires_at,omitempty"`
+	TestWorkspaceID    *uuid.UUID `json:"test_workspace_id,omitempty"`
+	SampleDataSeededAt *time.Time `json:"sample_data_seeded_at,omitempty"`
+}
+
+type TesterSampleData struct {
+	OrganizationID uuid.UUID `json:"organization_id"`
+	Created        bool      `json:"created"`
+	SeededAt       time.Time `json:"seeded_at"`
 }

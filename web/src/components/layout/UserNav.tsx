@@ -1,3 +1,5 @@
+import { DashboardImage } from "@/components/ui/dashboard-image";
+
 // User menu — bottom of the sidebar.
 //
 // Moved off the shadcn DropdownMenu onto the same PopoverMenu primitive
@@ -9,6 +11,7 @@
 
 import { useNavigate } from "@tanstack/react-router";
 import {
+    CompassIcon,
     LogOutIcon,
     SettingsIcon,
 } from "lucide-react";
@@ -28,6 +31,7 @@ export function UserNav({ collapsed = false }: { collapsed?: boolean }) {
     const navigate = useNavigate();
     const user = useAppStore((s) => s.user);
     const logoutMutation = useLogout();
+    const setProductTourOpen = useAppStore((s) => s.setProductTourOpen);
 
     if (!user) return null;
 
@@ -58,7 +62,7 @@ export function UserNav({ collapsed = false }: { collapsed?: boolean }) {
                 >
                     <div className="w-7 h-7 rounded-full bg-slate-900 flex items-center justify-center shrink-0 overflow-hidden">
                         {user.avatar_url ? (
-                            <img
+                            <DashboardImage
                                 src={user.avatar_url}
                                 alt=""
                                 className="w-full h-full object-cover"
@@ -109,6 +113,12 @@ export function UserNav({ collapsed = false }: { collapsed?: boolean }) {
                     icon={<SettingsIcon className="w-3 h-3" />}
                 >
                     Settings
+                </PopoverMenuItem>
+                <PopoverMenuItem
+                    onSelect={() => setProductTourOpen(true)}
+                    icon={<CompassIcon className="w-3 h-3" />}
+                >
+                    Take the tour
                 </PopoverMenuItem>
                 <PopoverMenuSeparator />
                 <PopoverMenuItem

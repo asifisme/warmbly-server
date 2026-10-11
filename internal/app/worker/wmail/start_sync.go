@@ -8,6 +8,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/warmbly/warmbly/internal/errx"
+	"github.com/warmbly/warmbly/internal/pkg/nodeevidence"
 )
 
 // syncBackoffMax is the normal ceiling between passes. An explicit provider
@@ -45,13 +46,12 @@ func (w *WMail) nextSyncDelay(base time.Duration, last *errx.MailError) time.Dur
 	d := base
 	minimum := base / 2
 	switch {
+	case last != nil && last.RetryAfter > 0 && (isTransportError(last) || last.Code == errx.MailErrorCodeSendingTooFast):
+		// Service-unavailable responses can supply the same retry window as 429.
+		d = max(last.RetryAfter, base)
+		minimum = d
 	case last != nil && last.Code == errx.MailErrorCodeSendingTooFast:
-		// The provider returned 429. Respect its window when supplied.
 		d = syncBackoffMax
-		if last.RetryAfter > 0 {
-			d = max(last.RetryAfter, base)
-			minimum = d
-		}
 	case last != nil && isTransportError(last):
 		// The server is unreachable. Retry soon after the first failure (a
 		// dropped session reconnects on the next pass and costs one dial),
@@ -78,29 +78,54 @@ func (w *WMail) nextSyncDelay(base time.Duration, last *errx.MailError) time.Dur
 // so one mailbox's bad server response must not take down every other
 // account's sync and send loops.
 func (w *WMail) syncOnce(ctx context.Context) (result *errx.MailError) {
+	if w.tracker != nil {
+		w.tracker.tickComplete = false
+	}
 	defer func() {
 		if r := recover(); r != nil {
+			if w.tracker != nil {
+				w.tracker.tickComplete = false
+			}
 			err := fmt.Errorf("mail sync panic: %v", r)
-			w.CaptureError(err)
+			w.captureSyncError(err)
 			log.Error().Err(err).Str("email_id", w.ID.String()).Msg("mail sync panicked")
+			result = &errx.MailError{Code: errx.MailErrorCodeImapUnknown, Type: errx.MailErrorWarning, Message: "mail sync pass interrupted"}
 		}
 	}()
 	if err := w.SyncMail(ctx); err != nil {
-		// A server that is down answers every pass the same way. Report the
-		// first one and then stay quiet until it comes back, so one outage is
-		// one warning in the drawer rather than one a minute.
+		w.lifecycleMu.Lock()
+		stopped := w.stopped
+		w.lifecycleMu.Unlock()
+		if stopped || ctx.Err() != nil {
+			return err
+		}
+		switch err.Code {
+		case errx.MailErrorCodeServerUnreachable, errx.MailErrorCodeConnectionLost:
+			nodeevidence.Emit(nodeevidence.ProviderUnreachable, w.ID, 0, 1)
+		case errx.MailErrorCodeGoogleAuth, errx.MailErrorCodeAuthenticationFailed, errx.MailErrorCodeAuthorizationFailed:
+			nodeevidence.Emit(nodeevidence.ProviderAuth, w.ID, 0, 1)
+		case errx.MailErrorCodeSendingTooFast:
+			nodeevidence.Emit(nodeevidence.ProviderThrottled, w.ID, 0, 1)
+		}
+		// Keep observations fresh; the consumer deduplicates user notifications.
 		if isTransportError(err) {
 			w.transportFailures++
 			if w.transportFailures > 1 {
+				w.captureSyncError(err)
 				log.Debug().Err(err).Str("email_id", w.ID.String()).Int("consecutive", w.transportFailures).Msg("mail server still unreachable")
 				return err
 			}
 		}
-		w.CaptureError(err)
+		w.captureSyncError(err)
 		log.Warn().Err(err).Str("email_id", w.ID.String()).Msg("mail sync error")
 		return err
 	}
-	w.transportFailures = 0
+	if w.tracker != nil && w.tracker.tickComplete {
+		if w.transportFailures > 0 {
+			nodeevidence.Emit(nodeevidence.ProviderRecovered, w.ID, 0, 1)
+		}
+		w.transportFailures = 0
+	}
 	return nil
 }
 

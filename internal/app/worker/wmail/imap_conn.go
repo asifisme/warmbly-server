@@ -7,7 +7,6 @@ import (
 	goimap "github.com/emersion/go-imap/v2"
 	"github.com/warmbly/warmbly/internal/client/smtpimap/imap"
 	"github.com/warmbly/warmbly/internal/errx"
-	"github.com/warmbly/warmbly/internal/models"
 )
 
 // ImapConn is everything the worker drives on one IMAP connection.
@@ -16,7 +15,7 @@ import (
 // holds an *imap.Client.
 type ImapConn interface {
 	// Sync pass.
-	Folders() ([]models.Mailbox, *errx.MailError)
+	ListFolders() (imap.FolderListing, *errx.MailError)
 	// FolderOverflow is how many folders the last listing left out for the
 	// cap, FolderConflicts how many it left out for a duplicate UIDVALIDITY.
 	FolderOverflow() int
@@ -40,7 +39,7 @@ type ImapConn interface {
 	FetchFlags(ctx context.Context, uidFrom uint32) (map[uint32]imap.FlagState, *errx.MailError)
 	SearchSince(since time.Time) ([]goimap.UID, *errx.MailError)
 	FetchEnvelopes(ctx context.Context, uids []goimap.UID) ([]*imap.Fetched, *errx.MailError)
-	FetchBody(f *imap.Fetched)
+	FetchBody(f *imap.Fetched) *errx.MailError
 
 	// Send path.
 	AppendToSent(ctx context.Context, raw []byte, sentAt time.Time) error

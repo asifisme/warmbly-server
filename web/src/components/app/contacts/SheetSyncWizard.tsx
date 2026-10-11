@@ -28,7 +28,7 @@ import {
     SheetIcon,
     XIcon,
 } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 
 import MapStep from "./import/MapStep";
 import ResultStep from "./import/ResultStep";
@@ -324,6 +324,7 @@ export default function SheetSyncWizard({ open, onClose, lockedCampaign, lockedS
                             )}
                             {step === "map" && preview && (
                                 <MapStep
+                                    importId={`sheet:${connectionId}:${sheetId}:${tabTitle}`}
                                     preview={preview}
                                     mapping={mapping}
                                     setMapping={setMapping}
@@ -721,4 +722,3 @@ function OptionsStep({
         </div>
     );
 }
-

@@ -152,12 +152,14 @@ export function TopbarAction({
  * StatStrip — full-width grid of stats with vertical-rule dividers and a
  * bottom hairline. Use Stat as children.
  */
-export function StatStrip({ children, cols = 4 }: { children: React.ReactNode; cols?: 2 | 3 | 4 | 5 }) {
+export function StatStrip({ children, cols = 4 }: { children: React.ReactNode; cols?: 2 | 3 | 4 | 5 | 6 }) {
     const gridCls = {
         2: "grid-cols-2",
         3: "grid-cols-2 md:grid-cols-3 max-md:[&>*:last-child]:col-span-2",
         4: "grid-cols-2 md:grid-cols-4",
         5: "grid-cols-2 md:grid-cols-5 max-md:[&>*:last-child]:col-span-2",
+        // Two rows of three until there is room for six across.
+        6: "grid-cols-2 md:grid-cols-3 xl:grid-cols-6 md:max-xl:[&>*:nth-child(3n)]:border-r-0",
     }[cols];
     return (
         <div
@@ -211,7 +213,7 @@ export function Stat({
                     </span>
                 )}
             </div>
-            <div className="text-[26px] text-slate-900 font-light leading-none mt-2 tabular-nums">
+            <div className="text-[22px] md:text-[26px] text-slate-900 font-light leading-none mt-1.5 md:mt-2 tabular-nums">
                 {typeof value === "number" ? value.toLocaleString() : value}
             </div>
             {sub && (
@@ -220,7 +222,7 @@ export function Stat({
         </>
     );
     const cls = cn(
-        "group px-5 py-3 md:py-4 transition-colors",
+        "group px-5 py-2.5 md:py-4 transition-colors",
         !last && "border-r border-slate-200",
         (href || onClick) && "hover:bg-slate-50 cursor-pointer",
     );
@@ -274,8 +276,8 @@ export function SectionBar({
     return (
         <div
             className={cn(
-                // Single 36px row on >=md; on mobile it wraps so a full-width
-                // search + filters stack instead of crowding off the edge.
+                // Single 36px row on >=md; on mobile a toolbar holding a search
+                // takes its own full-width row instead of crowding the label.
                 "min-h-9 md:h-9 px-5 py-1.5 md:py-0 border-b border-slate-200/60 flex flex-wrap md:flex-nowrap items-center gap-x-2.5 gap-y-1.5 shrink-0",
                 className,
             )}
@@ -289,7 +291,7 @@ export function SectionBar({
                 </span>
             )}
             {children && (
-                <div className="ml-auto flex items-center gap-1.5 flex-wrap justify-end min-w-0">
+                <div className="ml-auto flex items-center gap-1.5 flex-wrap justify-end min-w-0 max-md:has-[[data-search-input]]:basis-full">
                     {children}
                 </div>
             )}

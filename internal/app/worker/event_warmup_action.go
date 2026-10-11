@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 	"github.com/warmbly/warmbly/internal/app/worker/wmail"
+	"github.com/warmbly/warmbly/internal/client/msgraph"
 	"github.com/warmbly/warmbly/internal/client/smtpimap/imap"
 	"github.com/warmbly/warmbly/internal/config"
+	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/infrastructure/storage"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/repository"
@@ -26,6 +29,43 @@ import (
 // DelaySeconds=0. That makes the dwell survive a worker restart, which the old
 // in-process time.AfterFunc here could not.
 func (w *WorkerService) HandleWarmupAction(ctx context.Context, action models.WarmupEmailAction) error {
+	filingPending := false
+	var filingProof *models.WarmupFilingRecoveryProof
+	if gate, ok := w.SyncContextRepository.(repository.WarmupActionAdmission); ok {
+		worker, err := uuid.Parse(w.ID)
+		if err != nil {
+			return err
+		}
+		if recovery, ok := w.SyncContextRepository.(repository.WarmupActionRecoveryAdmission); ok && action.FilingID != "" && len(action.Actions) == 1 && action.Actions[0] == models.WarmupActionFile {
+			decision, xerr := recovery.AdmitWarmupAction(ctx, models.WarmupActionRequest{MailboxID: action.EmailID, WorkerID: worker, Actions: action.Actions, FilingID: action.FilingID})
+			action.Actions, filingPending, filingProof, err = decision.Actions, decision.FilingPending, decision.FilingRecovery, xerr
+			if err == nil {
+				filing, perr := uuid.Parse(action.FilingID)
+				if filingProof != nil && (perr != nil || !filingPending || len(action.Actions) != 1 || action.Actions[0] != models.WarmupActionFile || !filingProof.ValidFor(action.EmailID, worker, filing)) {
+					return errors.New("invalid warmup filing recovery proof")
+				}
+				if pending, ok := w.pendingFilingDeferrals.Load(filing); ok {
+					request := pending.(models.WarmupFilingDeferralRequest)
+					if request.MailboxID == action.EmailID && request.WorkerID == worker && len(action.Actions) == 1 && action.Actions[0] == models.WarmupActionFile && (filingProof == nil || filingProof.ProviderRetryAt == nil || filingProof.ProviderRetryAt.Before(request.ProviderRetryAt)) {
+						return w.deferWarmupFiling(ctx, request)
+					}
+					if filingProof != nil {
+						w.pendingFilingDeferrals.CompareAndDelete(filing, request)
+					}
+				}
+				if filingProof != nil && filingProof.ProviderRetryAt != nil && filingProof.ProviderRetryAt.After(time.Now()) {
+					return nil
+				}
+			}
+		} else {
+			action.Actions, err = gate.PermittedWarmupActions(ctx, action.EmailID, worker, action.Actions)
+		}
+		if err != nil {
+			return err
+		}
+	} else if w.SyncContextRepository != nil {
+		return errors.New("warmup action authority unavailable")
+	}
 	log.Info().
 		Str("email_id", action.EmailID.String()).
 		Str("gmail_id", action.GmailID).
@@ -35,10 +75,23 @@ func (w *WorkerService) HandleWarmupAction(ctx context.Context, action models.Wa
 		Msg("Processing warmup email action")
 
 	if len(action.Actions) == 0 {
+		if filing, err := uuid.Parse(action.FilingID); err == nil {
+			w.pendingFilingDeferrals.Delete(filing)
+		}
 		return nil
 	}
 
 	mail, exists := w.loadedMailbox(ctx, action.EmailID)
+	if exists {
+		if done, ok := mail.BeginExecution(); ok {
+			defer done()
+			var cancel func()
+			ctx, cancel = mail.ExecutionContext(ctx)
+			defer cancel()
+		} else {
+			exists = false
+		}
+	}
 	var err error
 	switch {
 	case !exists:
@@ -48,7 +101,7 @@ func (w *WorkerService) HandleWarmupAction(ctx context.Context, action models.Wa
 		// are redelivered instead, in case the mailbox is still loading.
 		log.Warn().Str("email_id", action.EmailID.String()).Msg("Email account not found for warmup action")
 		if hasWarmupAction(action.Actions, models.WarmupActionDelete) ||
-			hasWarmupAction(action.Actions, models.WarmupActionVerifyRemoval) {
+			hasWarmupAction(action.Actions, models.WarmupActionVerifyRemoval) || action.FilingID != "" {
 			err = errors.New("mailbox not loaded on this worker")
 		}
 	case hasWarmupAction(action.Actions, models.WarmupActionVerifyRemoval):
@@ -60,17 +113,40 @@ func (w *WorkerService) HandleWarmupAction(ctx context.Context, action models.Wa
 	case mail.SmtpImapData != nil && mail.SmtpImapData.ImapClient != nil:
 		err = w.runImapWarmupActions(ctx, mail, action)
 	default:
+		if action.FilingID != "" {
+			err = errors.New("mailbox has no provider client for warmup filing")
+		}
 		log.Warn().
 			Str("email_id", action.EmailID.String()).
 			Msg("No mail client available for warmup actions; skipping")
 	}
 	if err == nil {
+		if action.FilingID != "" {
+			id, perr := uuid.Parse(action.FilingID)
+			if perr != nil {
+				return perr
+			}
+			return w.Produce(models.JobEventTypeWarmupFiled, action.EmailID.String(),
+				&models.JobEventWarmupFiled{EmailID: action.EmailID, FilingID: id})
+		}
+		return nil
+	}
+	if filingPending && len(action.Actions) == 1 && action.Actions[0] == models.WarmupActionFile {
+		if at := warmupProviderRetryAt(err); filingProof != nil && !at.IsZero() {
+			request := models.WarmupFilingDeferralRequest{MailboxID: action.EmailID, WorkerID: filingProof.WorkerID, FilingID: filingProof.FilingID, ProviderRetryAt: at}
+			if deferErr := w.deferWarmupFiling(ctx, w.retainFilingDeferral(request)); deferErr != nil {
+				return deferErr
+			}
+		}
+		// Only the confirmed durable filing queue can take over this failed command.
+		log.Warn().Err(err).Str("email_id", action.EmailID.String()).Str("filing_id", action.FilingID).
+			Msg("Warmup filing deferred to durable recovery")
 		return nil
 	}
 	// Engagement is best effort and never returns here. A retention delete
 	// (the row is already retired) and a removal check are redelivered, a
 	// bounded number of times.
-	if d := deliveryOf(ctx); d.redelivers && d.attempt < warmupDeleteRedeliveries {
+	if d := deliveryOf(ctx); (d.redelivers || action.FilingID != "") && d.attempt < warmupDeleteRedeliveries {
 		return err
 	}
 	log.Error().Err(err).
@@ -85,6 +161,46 @@ func (w *WorkerService) HandleWarmupAction(ctx context.Context, action models.Wa
 // removal check is redelivered before it is given up.
 const warmupDeleteRedeliveries = 5
 
+func warmupProviderRetryAt(err error) time.Time {
+	var mailErr *errx.MailError
+	if !errors.As(err, &mailErr) || mailErr.Failure == nil || mailErr.Failure.RetryAt == nil {
+		return time.Time{}
+	}
+	return mailErr.Failure.RetryAt.UTC()
+}
+
+func (w *WorkerService) retainFilingDeferral(request models.WarmupFilingDeferralRequest) models.WarmupFilingDeferralRequest {
+	for {
+		old, loaded := w.pendingFilingDeferrals.LoadOrStore(request.FilingID, request)
+		if !loaded {
+			return request
+		}
+		prior := old.(models.WarmupFilingDeferralRequest)
+		if prior.MailboxID == request.MailboxID && prior.WorkerID == request.WorkerID && prior.ProviderRetryAt.After(request.ProviderRetryAt) {
+			return prior
+		}
+		if w.pendingFilingDeferrals.CompareAndSwap(request.FilingID, prior, request) {
+			return request
+		}
+	}
+}
+
+func (w *WorkerService) deferWarmupFiling(ctx context.Context, request models.WarmupFilingDeferralRequest) error {
+	authority, ok := w.SyncContextRepository.(repository.WarmupFilingDeferralAuthority)
+	if !ok {
+		return errors.New("warmup filing deferral authority unavailable")
+	}
+	out, err := authority.DeferWarmupFiling(ctx, request)
+	if err != nil {
+		return err
+	}
+	if !out.Persisted || !out.FilingRecovery.ValidFor(request.MailboxID, request.WorkerID, request.FilingID) || out.FilingRecovery.ProviderRetryAt == nil || out.FilingRecovery.ProviderRetryAt.Before(request.ProviderRetryAt) {
+		return errors.New("unconfirmed warmup filing deferral")
+	}
+	w.pendingFilingDeferrals.CompareAndDelete(request.FilingID, request)
+	return nil
+}
+
 func (w *WorkerService) runGoogleWarmupActions(ctx context.Context, mail *wmail.WMail, action models.WarmupEmailAction) error {
 	placement, folder := warmupFiling(action)
 	// The archive placement wants the message out of every view without a label
@@ -98,7 +214,7 @@ func (w *WorkerService) runGoogleWarmupActions(ctx context.Context, mail *wmail.
 	// keyed by the provider's id and the control plane only knows the
 	// Message-ID, so it is resolved here.
 	gmailID := action.GmailID
-	if gmailID == "" && action.RFCMessageID != "" && hasWarmupAction(action.Actions, models.WarmupActionDelete) {
+	if (gmailID == "" || action.FilingID != "") && action.RFCMessageID != "" && (hasWarmupAction(action.Actions, models.WarmupActionDelete) || hasWarmupAction(action.Actions, models.WarmupActionFile)) {
 		id, err := mail.GoogleData.Client.FindByRFCMessageID(ctx, action.RFCMessageID)
 		if err != nil {
 			return fmt.Errorf("search Gmail for the warmup message: %w", err)
@@ -109,8 +225,11 @@ func (w *WorkerService) runGoogleWarmupActions(ctx context.Context, mail *wmail.
 	for _, act := range action.Actions {
 		switch act {
 		case models.WarmupActionFile:
-			if err := mail.GoogleData.Client.FileWarmup(ctx, action.GmailID, label); err != nil {
-				log.Error().Err(err).Str("gmail_id", action.GmailID).Str("folder", label).Msg("Failed to file warmup message (Gmail)")
+			if placement == models.WarmupPlacementInbox || gmailID == "" {
+				continue
+			}
+			if err := mail.GoogleData.Client.FileWarmup(ctx, gmailID, label); err != nil {
+				return fmt.Errorf("file warmup message (Gmail): %w", err)
 			}
 		case models.WarmupActionDelete:
 			if gmailID != "" {
@@ -157,12 +276,27 @@ func (w *WorkerService) runGraphWarmupActions(ctx context.Context, mail *wmail.W
 	// leg may run after an earlier leg already moved the message to Warmbly.
 	msgID := action.GmailID
 	if action.RFCMessageID != "" {
-		if resolved, err := client.ResolveMessageID(ctx, action.RFCMessageID); err == nil && resolved != "" {
+		if resolved, err := client.ResolveMessageID(ctx, action.RFCMessageID); err != nil {
+			if hasWarmupAction(action.Actions, models.WarmupActionFile) || hasWarmupAction(action.Actions, models.WarmupActionDelete) {
+				return fmt.Errorf("locate warmup message (Graph): %w", err)
+			}
+		} else if resolved != "" {
 			msgID = resolved
+		} else if hasWarmupAction(action.Actions, models.WarmupActionFile) {
+			return nil
 		}
 	}
 
 	placement, folder := warmupFiling(action)
+	if msgID != "" && hasWarmupAction(action.Actions, models.WarmupActionFile) && placement != models.WarmupPlacementInbox {
+		inTrash, err := client.IsMessageInFolder(ctx, msgID, msgraph.FolderDeletedItems)
+		if err != nil {
+			return fmt.Errorf("check warmup message trash placement (Graph): %w", err)
+		}
+		if inTrash {
+			return nil
+		}
+	}
 
 	for _, act := range action.Actions {
 		switch act {
@@ -170,6 +304,9 @@ func (w *WorkerService) runGraphWarmupActions(ctx context.Context, mail *wmail.W
 			// Out of Junk into the destination is one move, and on Exchange it
 			// is also the "not junk" signal, so the rescue below finds nothing
 			// left in Junk and correctly does nothing.
+			if placement == models.WarmupPlacementInbox {
+				continue
+			}
 			var newID string
 			var err error
 			if placement == models.WarmupPlacementArchive {
@@ -178,8 +315,7 @@ func (w *WorkerService) runGraphWarmupActions(ctx context.Context, mail *wmail.W
 				newID, err = client.MoveToFolder(ctx, msgID, folder)
 			}
 			if err != nil {
-				log.Error().Err(err).Str("graph_id", msgID).Str("folder", folder).Msg("Failed to file warmup message (Graph)")
-				continue
+				return fmt.Errorf("file warmup message (Graph): %w", err)
 			}
 			if newID != "" {
 				w.remapProviderID(ctx, mail, msgID, newID)
@@ -287,7 +423,7 @@ func (w *WorkerService) runImapWarmupActions(ctx context.Context, mail *wmail.WM
 	deletes := hasWarmupAction(action.Actions, models.WarmupActionDelete)
 	boxName, uid, searchErr := w.locateWarmupMessage(ctx, imapClient, action, sourceBox, files, dst, inboxName, sentName)
 	if boxName == "" {
-		if deletes && searchErr != nil {
+		if (deletes || files) && searchErr != nil {
 			// A folder could not be searched, so absence is not established;
 			// deleting the body now would leave the message with nothing to
 			// key a retry by.
@@ -326,14 +462,13 @@ func (w *WorkerService) runImapWarmupActions(ctx context.Context, mail *wmail.WM
 			log.Debug().Err(err).Uint32("uid", uid).Msg("Server refused not-junk keywords (IMAP)")
 		}
 	}
-
 	for _, act := range action.Actions {
 		if moved {
 			continue
 		}
 		switch act {
 		case models.WarmupActionFile:
-			if dst == "" {
+			if dst == "" || boxName == dst {
 				continue
 			}
 			unjunk()
@@ -341,8 +476,7 @@ func (w *WorkerService) runImapWarmupActions(ctx context.Context, mail *wmail.WM
 			// still good for the actions after this one.
 			did, err := imapClient.MoveToFolder(ctx, boxName, dst, uid)
 			if err != nil {
-				log.Error().Err(err).Uint32("uid", uid).Str("folder", dst).Msg("Failed to file warmup message (IMAP)")
-				continue
+				return fmt.Errorf("file warmup message (IMAP): %w", err)
 			}
 			moved = did
 		case models.WarmupActionMarkRead:
@@ -448,7 +582,7 @@ func (w *WorkerService) locateWarmupMessage(
 	files bool,
 	dst, inboxName, sentName string,
 ) (string, uint32, error) {
-	if files && sourceBox != nil {
+	if files && sourceBox != nil && (action.FilingID == "" || action.RFCMessageID == "") {
 		return sourceBox.Name, action.UID, nil
 	}
 	var searchErr error
@@ -477,7 +611,7 @@ func (w *WorkerService) locateWarmupMessage(
 			}
 		}
 	}
-	if sourceBox != nil {
+	if sourceBox != nil && (action.FilingID == "" || action.RFCMessageID == "") {
 		return sourceBox.Name, action.UID, nil
 	}
 	return "", 0, searchErr

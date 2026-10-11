@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -32,8 +30,10 @@ type StoredFolderMessage struct {
 type ProviderFolderMessage struct {
 	ID             uuid.UUID `json:"id"`
 	ProviderID     string    `json:"provider_id"`
+	MessageID      string    `json:"message_id,omitempty"`
 	ProviderFolder string    `json:"provider_folder"`
 	InternalDate   time.Time `json:"internal_date"`
+	Flags          []string  `json:"flags,omitempty"`
 }
 
 // SyncContextRepository is the worker's view of the control plane's answer to
@@ -50,6 +50,43 @@ type SyncContextRepository interface {
 	// ListProviderFolderMessages returns the newest rows the provider last
 	// placed in one of folders, at most limit of them.
 	ListProviderFolderMessages(ctx context.Context, userID, emailID uuid.UUID, folders []string, limit int) ([]ProviderFolderMessage, error)
+	ListProviderMessages(ctx context.Context, userID, emailID uuid.UUID, after *uuid.UUID, limit int) ([]ProviderFolderMessage, error)
+}
+
+var ErrSyncContextUnsupported = errors.New("provider message enumeration unavailable; upgrade backend first")
+
+func (r *httpSyncContextRepository) ListProviderMessages(ctx context.Context, userID, emailID uuid.UUID, after *uuid.UUID, limit int) ([]ProviderFolderMessage, error) {
+	q := url.Values{}
+	q.Set("user_id", userID.String())
+	q.Set("email_id", emailID.String())
+	q.Set("limit", strconv.Itoa(limit))
+	if after != nil {
+		q.Set("after", after.String())
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.baseURL+"/api/v1/internal/sync/provider-messages?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+r.token)
+	req.Header.Set("User-Agent", "warmbly-worker/sync-context-http")
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return nil, ErrSyncContextUnsupported
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &ControlPlaneHTTPError{Status: resp.StatusCode}
+	}
+	var out struct {
+		Messages []ProviderFolderMessage `json:"messages"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Messages, nil
 }
 
 type httpSyncContextRepository struct {
@@ -94,8 +131,7 @@ func (r *httpSyncContextRepository) IsOwnConversation(ctx context.Context, userI
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return false, fmt.Errorf("sync_context.http: %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return false, &ControlPlaneHTTPError{Status: resp.StatusCode}
 	}
 	var out struct {
 		Own bool `json:"own"`
@@ -125,8 +161,7 @@ func (r *httpSyncContextRepository) ListFolderMessages(ctx context.Context, user
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("sync_context.http: folder messages: %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, &ControlPlaneHTTPError{Status: resp.StatusCode}
 	}
 	var out struct {
 		Messages []StoredFolderMessage `json:"messages"`
@@ -157,8 +192,7 @@ func (r *httpSyncContextRepository) ListProviderFolderMessages(ctx context.Conte
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("sync_context.http: provider folder messages: %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, &ControlPlaneHTTPError{Status: resp.StatusCode}
 	}
 	var out struct {
 		Messages []ProviderFolderMessage `json:"messages"`

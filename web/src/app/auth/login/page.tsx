@@ -5,7 +5,7 @@ import { useForm } from "react-hook-form";
 import { useQueryClient } from "@tanstack/react-query";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { ArrowLeft, Pencil, LockIcon, Loader2Icon } from "lucide-react";
 import { usePasswordStrength } from "@/hooks/usePasswordStrength";
 
@@ -30,7 +30,7 @@ import type { SSOLinkChallenge } from "@/lib/api/models/auth/LoginResult";
 import beginSSO from "@/lib/api/client/auth/beginSSO";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
-import safeNext from "@/lib/helper/safeNext";
+import { postAuthNext } from "@/lib/helper/safeNext";
 import { hrefTarget } from "@/lib/routerSearch";
 import { captureException } from "@/lib/observability";
 import { isEmpty, readAcquisition } from "@/lib/acquisition";
@@ -46,6 +46,7 @@ import {
     safariNeedsExplicitPasskeyGesture,
     cancelPasskeyCeremony,
     PasskeyCancelled,
+    PasskeyAutofillUnavailable,
     SUGGEST_PASSKEY_FLAG,
     type PasskeyLoginChallenge,
 } from "@/lib/passkey";
@@ -244,16 +245,22 @@ export default function LoginPage() {
     const passkeysEnabled = authConfig.passkeys;
 
     /* Mode change — update URL without remounting */
+    const invitationConsumed = useRef(false);
     const handleModeChange = (m: "signin" | "signup") => {
         setMode(m);
         setRefusal(null);
         // Keep the query string: dropping it is how ?invite= and ?next= were
         // silently lost on a toggle, turning an invited signup into a refused one.
         // The current state carries the router's entry key; null would wipe it.
+        const params = new URLSearchParams(location.searchStr);
+        if (invitationConsumed.current) {
+            params.delete("invite");
+            params.set("next", postAuthNext(params.get("next"), true));
+        }
         window.history.replaceState(
             window.history.state,
             "",
-            `${m === "signin" ? "/auth/login" : "/auth/register"}${location.searchStr}`,
+            `${m === "signin" ? "/auth/login" : "/auth/register"}${params.size ? `?${params}` : ""}`,
         );
     };
     // /invite sends the invited address along, because the backend only accepts
@@ -293,6 +300,7 @@ export default function LoginPage() {
     const [passkeyStatus, setPasskeyStatus] = useState<PasskeyStatus>("preparing");
     const explicitPasskeyChallengeRef = useRef<PasskeyLoginChallenge | null>(null);
     const explicitPasskeyChallengePendingRef = useRef(false);
+    const passkeyAutofillUnavailableRef = useRef(false);
 
     const completeSession = useCallback(async (token: Token) => {
         saveTokens(token as unknown as Record<string, unknown>);
@@ -316,7 +324,7 @@ export default function LoginPage() {
         // home. Powers the /invite link: sign in, then bounce back to accept.
         const params = new URLSearchParams(location.searchStr);
         const next = params.get("next");
-        navigate(hrefTarget(safeNext(next, "/app/emails")));
+        navigate(hrefTarget(postAuthNext(next, invitationConsumed.current)));
     }, [navigate, queryClient, location.searchStr]);
 
     // Conditional UI: surface passkeys inside the email field's native autofill
@@ -324,6 +332,7 @@ export default function LoginPage() {
     // (or it's aborted). Cancellation is silent by design. Extracted so it can
     // be re-armed after an explicit-button ceremony settles.
     const runConditionalPasskey = useCallback(async (signal?: AbortSignal) => {
+        if (passkeyAutofillUnavailableRef.current) return;
         if (safariNeedsExplicitPasskeyGesture()) return;
         if (!passkeySupported() || !(await passkeyAutofillSupported())) return;
         try {
@@ -331,6 +340,10 @@ export default function LoginPage() {
             toast.success("Welcome back!");
             await completeSession(token);
         } catch (e) {
+            if (e instanceof PasskeyAutofillUnavailable) {
+                passkeyAutofillUnavailableRef.current = true;
+                return;
+            }
             // Cancel / no-passkey is expected here; report only real failures.
             if (e instanceof PasskeyCancelled || passkeyChallengeUnavailable(e)) return;
             captureException(e);
@@ -593,6 +606,7 @@ export default function LoginPage() {
                 // Email verification off means the account already exists and
                 // is signed in: land in the dashboard.
                 if (!res.code_required) {
+                    invitationConsumed.current = !!inviteToken;
                     if (res.token) {
                         toast.success("Welcome to Warmbly!");
                         await completeSession(res.token);
@@ -656,6 +670,7 @@ export default function LoginPage() {
                     await completeSession(res as unknown as Token);
                 } else {
                     const created = await registerConfirmMutation.mutateAsync({ session, code });
+                    invitationConsumed.current = !!inviteToken;
                     if (created?.token) {
                         toast.success("Welcome to Warmbly!");
                         await completeSession(created.token);

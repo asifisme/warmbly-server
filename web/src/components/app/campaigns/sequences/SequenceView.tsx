@@ -6,7 +6,7 @@
 
 import React from "react";
 import { Loader2Icon, ReplyIcon } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import type Sequence from "@/lib/api/models/app/campaigns/sequences/Sequence";
 import EmailContentEditor from "./EmailContentEditor";
 import StepAttachments from "./StepAttachments";
@@ -16,6 +16,7 @@ import { SettingRow, Toggle } from "@/components/app/campaigns/preferences/compo
 import useUpdateSequence from "@/lib/api/hooks/app/campaigns/sequences/useUpdateSequence";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
+import { useReportDirty } from "@/components/app/flow/dirty";
 
 // Body fields the composer owns. body_code records that this step is authored
 // as raw HTML, so reopening it shows the markup instead of handing it to the
@@ -78,6 +79,7 @@ export default function SequenceView({
     // the step keeps writing its own. Mirrors models.StepSubject on the server.
     const inheritsSubject = threads && !!conversationSubject;
     const savable = React.useMemo(() => JSON.stringify(baseline) !== JSON.stringify(draft), [baseline, draft]);
+    useReportDirty(savable);
     const patch = (p: Partial<Draft>) => setDraft((d) => ({ ...d, ...p }));
 
     async function submit() {

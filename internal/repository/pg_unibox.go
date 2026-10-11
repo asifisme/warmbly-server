@@ -39,6 +39,7 @@ type UniboxRepository interface {
 	UpdateEntry(ctx context.Context, userID, emailID, id uuid.UUID, e *UpdateUniboxEntry) error
 	GetIncoming(ctx context.Context, userID uuid.UUID, limit int, cursor string) (*models.MailSearchResult, error)
 	GetByID(ctx context.Context, userID, id uuid.UUID) (*models.EmailMessageStoreData, error)
+	GetForSync(ctx context.Context, userID, emailID, id uuid.UUID) (*models.EmailMessageStoreData, error)
 	// GetByIDForOrg is the org-scoped read for the unibox detail view: any
 	// member with unibox access can open a message in the org-wide list. It
 	// returns the row plus the mailbox OWNER's user_id, which the S3 body key
@@ -46,6 +47,8 @@ type UniboxRepository interface {
 	// the owner even when a different teammate opens it.
 	GetByIDForOrg(ctx context.Context, orgID, id uuid.UUID) (*models.EmailMessageStoreData, uuid.UUID, error)
 	GetByThread(ctx context.Context, orgID, emailID uuid.UUID, threadID string, limit int, cursor string) (*models.MailSearchResult, error)
+	// GetByThreadWithin is GetByThread held to the allowed mailboxes before paging; nil allows every mailbox.
+	GetByThreadWithin(ctx context.Context, orgID, emailID uuid.UUID, threadID string, limit int, cursor string, allowed []uuid.UUID) (*models.MailSearchResult, error)
 	GetBySender(ctx context.Context, userID uuid.UUID, sender string, limit int, cursor string) (*models.MailSearchResult, error)
 	Search(ctx context.Context, orgID uuid.UUID, params *models.MailSearchParams) (*models.MailSearchResult, error)
 	GetUnseenCount(ctx context.Context, orgID uuid.UUID, emailAccountID *uuid.UUID) (int64, error)
@@ -84,7 +87,7 @@ type UniboxRepository interface {
 	// ListUnprocessedCampaignReplies pages inbound messages that reply
 	// processing never claimed and that look like campaign replies: they
 	// answer a campaign send, or come from one of the workspace's contacts.
-	ListUnprocessedCampaignReplies(ctx context.Context, since time.Time, afterID uuid.UUID, limit int) ([]models.JobEventNewEmail, error)
+	ListUnprocessedCampaignReplies(ctx context.Context, since time.Time, afterID uuid.UUID, limit int) (CampaignReplyRepairPage, error)
 	// ListInboundFrom returns a workspace's inbound mail from one address,
 	// newest first: the evidence behind an opt-out that address triggered.
 	ListInboundFrom(ctx context.Context, orgID uuid.UUID, address string, limit int) ([]InboundMessage, error)
@@ -113,6 +116,7 @@ type UniboxRepository interface {
 	// MessageMailboxes lists the mailboxes holding the named messages and every
 	// message in the named conversations, within the organization.
 	MessageMailboxes(ctx context.Context, orgID uuid.UUID, ids []uuid.UUID, threadIDs []string) ([]uuid.UUID, error)
+	CategoriesForMailboxes(ctx context.Context, orgID uuid.UUID, accountIDs []uuid.UUID) ([]models.Group, error)
 	// UnseenCountForMailboxes is GetUnseenCount over a set of mailboxes.
 	UnseenCountForMailboxes(ctx context.Context, orgID uuid.UUID, accountIDs []uuid.UUID) (int64, error)
 
@@ -122,6 +126,7 @@ type UniboxRepository interface {
 	// ListThreadLabels returns the current set for one thread.
 	SetThreadLabels(ctx context.Context, orgID, userID uuid.UUID, threadID string, categoryIDs []uuid.UUID) ([]models.MiniCategory, error)
 	ListThreadLabels(ctx context.Context, orgID uuid.UUID, threadID string) ([]models.MiniCategory, error)
+	ListThreadLabelsWithin(ctx context.Context, orgID uuid.UUID, threadID string, accountIDs []uuid.UUID) ([]models.MiniCategory, error)
 	// AddThreadLabels attaches labels to a thread WITHOUT removing existing ones
 	// (additive; for automation/step "label email" actions). LatestThreadIDForContact
 	// finds the workspace's most recent conversation with an address, so a campaign
@@ -132,6 +137,10 @@ type UniboxRepository interface {
 	// a reply that arrives with only a provider thread id can still carry the
 	// In-Reply-To header the recipient's mail client threads on.
 	LatestMessageIDInThread(ctx context.Context, orgID uuid.UUID, threadID string) (string, error)
+	// FileSentForward files the sending mailbox's stored copy of a Unibox
+	// forward into the conversation it was forwarded from, for a copy synced
+	// before the send's Message-ID was known. Returns the rows it moved.
+	FileSentForward(ctx context.Context, taskID uuid.UUID) ([]FiledSentForward, error)
 
 	// ListMissingBodyText pages through messages stored before bodies were
 	// indexed for search, oldest id first from afterID. SetBodyText writes the
@@ -230,17 +239,21 @@ func ownAddressSQL(arrayExpr, orgArg string) string {
 			)`, arrayExpr, bareAddrSQL("own.addr"), orgArg)
 }
 
+// CreateEntry stores a synced message. A mailbox's copy of a forward it sent
+// from Unibox is filed into the conversation it was forwarded from, and e
+// carries the thread it was stored under.
 func (r *uniboxRepository) CreateEntry(ctx context.Context, userID uuid.UUID, e *models.EmailMessageStoreData) error {
 	query := `
+		WITH fwd AS (` + sentForwardThreadSQL + `)
 		INSERT INTO unibox_emails (
 			id, user_id, email_id, mailbox, folder_path, thread_id, message_id,
 			gmail_id, parent_id, uid, mod_seq,
 			flags, bcc, cc, from_addr, in_reply_to, reply_to,
 			to_addr, subject, size, internal_date, sent_date,
 			snippet, seen, created_at, updated_at, body_text, folder,
-			provider_folder, automated
+			provider_folder, automated, filed_forward
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7,
+			$1, $2, $3, $4, $5, COALESCE((SELECT thread_id FROM fwd), $6), $7,
 			$8, $9, $10, $11,
 			$12, $13, $14, $15, $16, $17,
 			$18, $19, $20, $21, $22,
@@ -252,14 +265,17 @@ func (r *uniboxRepository) CreateEntry(ctx context.Context, userID uuid.UUID, e 
 				WHERE r.organization_id = (SELECT organization_id FROM email_accounts WHERE id = $3)
 				  AND r.message_id = $7 AND $7 <> ''
 				  AND r.automated
-			)
+			),
+			EXISTS (SELECT 1 FROM fwd)
 		)
 		ON CONFLICT (id) DO NOTHING
+		RETURNING thread_id
 	`
 
 	// The array columns are NOT NULL. A nil Go slice binds as SQL NULL, so a
 	// message with no In-Reply-To (any thread root) would fail the insert.
-	_, err := r.db.Exec(ctx, query,
+	var threadID string
+	err := r.db.QueryRow(ctx, query,
 		e.ID, userID, e.EmailID, e.Mailbox, e.FolderPath, e.ThreadID, e.MessageID,
 		e.GmailID, e.ParentID, e.UID, e.ModSeq,
 		textArray(e.Flags), textArray(e.BCC), textArray(e.CC), textArray(e.FromAddr),
@@ -269,9 +285,72 @@ func (r *uniboxRepository) CreateEntry(ctx context.Context, userID uuid.UUID, e 
 		// $28 is both columns: a message starts out where the provider put it,
 		// and only diverges once someone files it in Warmbly.
 		models.NormalizeFolder(e.Folder, e.Flags),
-	)
-	return err
+	).Scan(&threadID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Already stored: the conflict leaves the row as it was.
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	e.ThreadID = threadID
+	return nil
 }
+
+// FiledSentForward is a stored copy FileSentForward moved, with its mailbox owner.
+type FiledSentForward struct {
+	UserID  uuid.UUID
+	Message models.EmailMessageStoreData
+}
+
+func (r *uniboxRepository) FileSentForward(ctx context.Context, taskID uuid.UUID) ([]FiledSentForward, error) {
+	// Only the Sent copy can have raced the result, and (email_id, folder) is indexed.
+	rows, err := r.db.Query(ctx, `
+		UPDATE unibox_emails ue
+		SET thread_id = et.forward_thread_id,
+		    filed_forward = true,
+		    updated_at = NOW()
+		FROM tasks t
+		JOIN email_tasks et ON et.task_id = t.id
+		WHERE t.id = $1
+		  AND t.task_type = 'email'
+		  AND t.message_id <> ''
+		  AND COALESCE(et.forward_thread_id, '') <> ''
+		  AND ue.email_id = t.email_account_id
+		  AND ue.folder = $2
+		  AND ue.message_id IN (t.message_id, btrim(t.message_id, '<> '), '<' || btrim(t.message_id, '<> ') || '>')
+		  AND NOT (ue.filed_forward AND ue.thread_id = et.forward_thread_id)
+		RETURNING ue.id, ue.user_id, ue.email_id, ue.thread_id, ue.subject, ue.from_addr, ue.snippet, ue.folder, ue.flags
+	`, taskID, models.FolderSent)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FiledSentForward
+	for rows.Next() {
+		var f FiledSentForward
+		m := &f.Message
+		if err := rows.Scan(&m.ID, &f.UserID, &m.EmailID, &m.ThreadID, &m.Subject, &m.FromAddr, &m.Snippet, &m.Folder, &m.Flags); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// sentForwardThreadSQL finds the conversation a mailbox's message ($3, $7) was
+// forwarded from, when it is the mailbox's own copy of a Unibox forward.
+const sentForwardThreadSQL = `
+			SELECT et.forward_thread_id AS thread_id
+			FROM tasks t
+			JOIN email_tasks et ON et.task_id = t.id
+			WHERE $7 <> ''
+			  AND t.email_account_id = $3
+			  AND t.task_type = 'email'
+			  AND t.message_id IN ($7, btrim($7, '<> '), '<' || btrim($7, '<> ') || '>')
+			  AND COALESCE(et.forward_thread_id, '') <> ''
+			ORDER BY t.created_at DESC
+			LIMIT 1`
 
 // textArray coalesces a nil slice to an empty one so it binds as '{}' rather
 // than NULL.
@@ -381,14 +460,35 @@ func (r *uniboxRepository) GetIncoming(ctx context.Context, userID uuid.UUID, li
 var ErrEmailNotFound = errors.New("email not found")
 
 func (r *uniboxRepository) GetByID(ctx context.Context, userID, id uuid.UUID) (*models.EmailMessageStoreData, error) {
+	e, err := r.getMessage(ctx, userID, uuid.Nil, id)
+	if err != nil {
+		return nil, err
+	}
+	if !e.Seen {
+		_ = r.MarkSeen(ctx, userID, id, true)
+		e.Seen = true
+	}
+	return e, nil
+}
+
+// GetForSync reads provider state without treating background work as a user view.
+func (r *uniboxRepository) GetForSync(ctx context.Context, userID, emailID, id uuid.UUID) (*models.EmailMessageStoreData, error) {
+	if emailID == uuid.Nil {
+		return nil, ErrEmailNotFound
+	}
+	return r.getMessage(ctx, userID, emailID, id)
+}
+
+func (r *uniboxRepository) getMessage(ctx context.Context, userID, emailID, id uuid.UUID) (*models.EmailMessageStoreData, error) {
 	query := fmt.Sprintf(`
 		SELECT %s
 		FROM unibox_emails
 		WHERE user_id = $1 AND id = $2
+		  AND ($3::uuid = '00000000-0000-0000-0000-000000000000' OR email_id = $3)
 	`, strings.Join(mailFieldsFull, ", "))
 
 	var e models.EmailMessageStoreData
-	err := r.db.QueryRow(ctx, query, userID, id).Scan(
+	err := r.db.QueryRow(ctx, query, userID, id, emailID).Scan(
 		&e.ID, &e.EmailID, &e.Mailbox, &e.FolderPath, &e.ThreadID, &e.MessageID,
 		&e.GmailID, &e.ParentID, &e.UID, &e.ModSeq,
 		&e.Flags, &e.BCC, &e.CC, &e.FromAddr, &e.InReplyTo, &e.ReplyTo,
@@ -400,12 +500,6 @@ func (r *uniboxRepository) GetByID(ctx context.Context, userID, id uuid.UUID) (*
 			return nil, ErrEmailNotFound
 		}
 		return nil, err
-	}
-
-	// Auto-mark as seen
-	if !e.Seen {
-		_ = r.MarkSeen(ctx, userID, id, true)
-		e.Seen = true
 	}
 
 	return &e, nil
@@ -456,6 +550,10 @@ func (r *uniboxRepository) GetByIDForOrg(ctx context.Context, orgID, id uuid.UUI
 // not user_id, so any member with unibox access sees the whole conversation,
 // matching the org-scoped inbox list.
 func (r *uniboxRepository) GetByThread(ctx context.Context, orgID, emailID uuid.UUID, threadID string, limit int, cursor string) (*models.MailSearchResult, error) {
+	return r.GetByThreadWithin(ctx, orgID, emailID, threadID, limit, cursor, nil)
+}
+
+func (r *uniboxRepository) GetByThreadWithin(ctx context.Context, orgID, emailID uuid.UUID, threadID string, limit int, cursor string, allowed []uuid.UUID) (*models.MailSearchResult, error) {
 	query := fmt.Sprintf(`
 		SELECT %s
 		FROM unibox_emails
@@ -469,6 +567,11 @@ func (r *uniboxRepository) GetByThread(ctx context.Context, orgID, emailID uuid.
 	if emailID != uuid.Nil {
 		query += fmt.Sprintf(` AND email_id = $%d`, argPos)
 		args = append(args, emailID)
+		argPos++
+	}
+	if allowed != nil {
+		query += fmt.Sprintf(` AND email_id = ANY($%d::uuid[])`, argPos)
+		args = append(args, allowed)
 		argPos++
 	}
 
@@ -1459,6 +1562,8 @@ func (r *uniboxRepository) LatestMessageIDInThread(ctx context.Context, orgID uu
 		FROM unibox_emails
 		WHERE thread_id = $2
 		  AND message_id <> ''
+		  -- A filed forward never reached the people in the conversation.
+		  AND NOT filed_forward
 		  AND email_id IN (SELECT id FROM email_accounts WHERE organization_id = $1)
 		ORDER BY internal_date DESC
 		LIMIT 1
@@ -1555,7 +1660,7 @@ func (r *uniboxRepository) Overview(ctx context.Context, orgID uuid.UUID) (*mode
 // credential limited to them.
 func (r *uniboxRepository) OverviewForMailboxes(ctx context.Context, orgID uuid.UUID, accountIDs []uuid.UUID) (*models.UniboxOverview, error) {
 	if len(accountIDs) == 0 {
-		return nil, errors.New("accountIDs required")
+		accountIDs = models.NoneMatch()
 	}
 	return r.overview(ctx, orgID, accountIDs)
 }
@@ -1642,7 +1747,7 @@ func (r *uniboxRepository) overview(ctx context.Context, orgID uuid.UUID, accoun
 			COUNT(*) FILTER (WHERE NOT t.is_snoozed AND t.working AND t.is_automated AND t.has_unread)          AS automated_unread,
 			(SELECT COUNT(*) FROM latest_per_thread l WHERE `+ownAddressSQL("l.from_addr", "$1")+`) AS awaiting,
 			(SELECT COUNT(*) FROM ai_thread_drafts d
-				WHERE d.organization_id = $1 AND d.status = 'pending')                        AS awaiting_agent_draft
+				WHERE d.organization_id = $1 AND d.status = 'pending'`+onlyMailboxes("d.email_account_id")+`) AS awaiting_agent_draft
 		FROM threads t
 	`, orgID, todayStart, weekStart).Scan(
 		&overview.Total,
@@ -1739,6 +1844,11 @@ func (r *uniboxRepository) overview(ctx context.Context, orgID uuid.UUID, accoun
 		overview.Mailboxes = append(overview.Mailboxes, m)
 	}
 
+	// A mailbox-limited view lists only the tags on its own mailboxes.
+	tagsOnMailboxes := ""
+	if len(accountIDs) > 0 {
+		tagsOnMailboxes = " AND EXISTS (SELECT 1 FROM email_tags et2 WHERE et2.tag_id = t.id" + onlyMailboxes("et2.email_id") + ")"
+	}
 	// Per-tag counters. Mailbox tags live in `tags` + `email_tags`.
 	// Per THREAD (distinct thread key) so threads aren't over-counted by
 	// message multiplicity or the email_tags fan-out. Every join is on the
@@ -1765,7 +1875,7 @@ func (r *uniboxRepository) overview(ctx context.Context, orgID uuid.UUID, accoun
 		LEFT JOIN unibox_emails ue ON ue.email_id = ea.id
 			AND ue.folder NOT IN `+foldersOutsideWorkingViews+`
 			AND NOT `+automatedThreadSQL("ue.thread_id", "ue.automated", "$1")+onlyMailboxes("ue.email_id")+`
-		WHERE t.organization_id = $1
+		WHERE t.organization_id = $1`+tagsOnMailboxes+`
 		GROUP BY t.id, t.title, t.color, t.position
 		ORDER BY t.position ASC, t.title ASC
 	`, orgID)
@@ -1792,6 +1902,15 @@ func (r *uniboxRepository) overview(ctx context.Context, orgID uuid.UUID, accoun
 	// has any unseen message. Like tags, labels are optional — never let
 	// the join fail the whole overview.
 	overview.Categories = make([]models.UniboxCategoryOverview, 0)
+	categoriesOnMailboxes := ""
+	if accountIDs != nil {
+		categoriesOnMailboxes = ` AND EXISTS (
+			SELECT 1 FROM unibox_thread_labels visible_label
+			JOIN unibox_emails visible_message ON visible_message.thread_id = visible_label.thread_id
+			WHERE visible_label.organization_id = c.organization_id AND visible_label.category_id = c.id
+			  AND visible_message.email_id IN ` + mailboxes + `
+		)`
+	}
 	catRows, err := r.db.Query(ctx, `
 		WITH thread_state AS (
 			SELECT e.thread_id, bool_or(NOT e.seen) AS has_unread
@@ -1811,7 +1930,7 @@ func (r *uniboxRepository) overview(ctx context.Context, orgID uuid.UUID, accoun
 		FROM categories c
 		LEFT JOIN unibox_thread_labels utl ON utl.category_id = c.id AND utl.organization_id = c.organization_id
 		LEFT JOIN thread_state ts ON ts.thread_id = utl.thread_id
-		WHERE c.organization_id = $1
+		WHERE c.organization_id = $1`+categoriesOnMailboxes+`
 		GROUP BY c.id, c.title, c.color, c.position
 		ORDER BY c.position ASC, c.title ASC
 	`, orgID)

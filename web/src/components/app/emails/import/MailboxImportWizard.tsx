@@ -9,7 +9,7 @@
 import React from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { AlertCircleIcon, ChevronLeftIcon, ChevronRightIcon, Loader2Icon, UploadIcon } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { usePreviewMailboxImport, useCreateMailboxImport } from "@/lib/api/hooks/app/emails/useMailboxImportActions";
 import type {
     ImportMapping,
@@ -350,6 +350,7 @@ export default function MailboxImportWizard({
                 )}
                 {step === "run" && importId && (
                     <RunStep
+                        key={importId}
                         importId={importId}
                         onDone={onDone}
                         onAllowance={onAllowance}

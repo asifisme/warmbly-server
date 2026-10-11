@@ -2,6 +2,7 @@ package handler
 
 import (
 	"github.com/warmbly/warmbly/internal/app/admin"
+	"github.com/warmbly/warmbly/internal/app/admindevice"
 	"github.com/warmbly/warmbly/internal/app/adminoutreach"
 	"github.com/warmbly/warmbly/internal/app/advanced"
 	"github.com/warmbly/warmbly/internal/app/advisor"
@@ -41,6 +42,8 @@ import (
 	"github.com/warmbly/warmbly/internal/app/leadsync"
 	"github.com/warmbly/warmbly/internal/app/mailboximport"
 	"github.com/warmbly/warmbly/internal/app/mcp"
+	"github.com/warmbly/warmbly/internal/app/monitoring"
+	"github.com/warmbly/warmbly/internal/app/nodelogs"
 	"github.com/warmbly/warmbly/internal/app/notification"
 	"github.com/warmbly/warmbly/internal/app/oauth"
 	"github.com/warmbly/warmbly/internal/app/opsnotify"
@@ -81,6 +84,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/webhook"
 	"github.com/warmbly/warmbly/internal/app/websitetracking"
 	"github.com/warmbly/warmbly/internal/app/worker"
+	"github.com/warmbly/warmbly/internal/infrastructure/eventbus"
 	"github.com/warmbly/warmbly/internal/pkg/generation"
 	"github.com/warmbly/warmbly/internal/pkg/typesafe"
 
@@ -186,8 +190,10 @@ type Handler struct {
 
 	// Fleet. Nodes enrol with the join token and pull everything else; the
 	// control plane never reaches into a machine.
-	FleetNodes *fleetnode.Service
-	WorkerRepo repository.WorkerRepository
+	FleetNodes        *fleetnode.Service
+	NodeLogs          nodelogs.Store
+	BrokerDiagnostics eventbus.EventBus
+	WorkerRepo        repository.WorkerRepository
 	// UpdatesService backs the admin panel's update indicator and button.
 	UpdatesService *updates.Service
 
@@ -341,6 +347,7 @@ type Handler struct {
 	// Mailbox sync state, read by the dashboard (GET /emails/:id/sync) and by
 	// the worker's priority lane over /api/v1/internal/sync/own-conversation.
 	EmailSyncState repository.EmailSyncStateRepository
+	WarmupDispatch repository.WarmupDispatchRepository
 
 	// Click-link store, served to the tracking service over HTTPS at
 	// /api/v1/internal/tracked-links/:id (same no-direct-Postgres rule).
@@ -380,10 +387,12 @@ type Handler struct {
 
 	// Device-code sign-in for the `warmbly` CLI. Nil-safe: routes answer 501.
 	CLIAuthService cliauth.Service
+	AdminDevice    *admindevice.Service
 
 	// Infrastructure liveness probes for the admin System Status page.
 	// Wired in cmd/backend/main.go where the concrete clients live.
 	SystemChecker *sysstatus.Checker
+	Monitoring    *monitoring.Service
 
 	// Admin operations pages: cross-workspace reads of mailbox sync, the send
 	// outcome loop, fleet placement and abuse signals, plus the scheduled job

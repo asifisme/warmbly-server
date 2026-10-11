@@ -223,11 +223,16 @@ const websiteJsonLd = {
             var isNoise = function (v) {
               return typeof v === 'string' && (noise.indexOf(v.trim()) !== -1 || v.indexOf(scanner) !== -1);
             };
+            var isSdkTimeout = function (type, value) {
+              return type === 'AbortError' && typeof value === 'string' && value.indexOf('PostHog request timed out') === 0;
+            };
             var exceptions = event.properties && event.properties.$exception_list;
             if (Array.isArray(exceptions)) {
               for (var i = 0; i < exceptions.length; i++) {
                 var value = exceptions[i] && (exceptions[i].value || exceptions[i].$exception_value);
                 if (isNoise(value)) return null;
+                var type = exceptions[i] && (exceptions[i].type || exceptions[i].$exception_type);
+                if (isSdkTimeout(type, value)) return null;
               }
             }
             var message = event.properties && event.properties.$exception_message;
@@ -235,9 +240,11 @@ const websiteJsonLd = {
             // Keep accepting flattened payloads while cached SDK chunks are
             // still in browsers during a rolling release.
             var values = event.properties && event.properties.$exception_values;
+            var types = event.properties && event.properties.$exception_types;
             if (!Array.isArray(values)) return event;
             for (var i = 0; i < values.length; i++) {
               if (isNoise(values[i])) return null;
+              if (Array.isArray(types) && isSdkTimeout(types[i], values[i])) return null;
             }
             return event;
           },
@@ -256,7 +263,7 @@ const websiteJsonLd = {
       First touch wins: once a page carries these, links to other pages on
       this site carry them on, so a visitor who lands on a post from a
       campaign and signs up from the pricing page is still attributed to it.
-      A direct visit carries nothing between pages, so its URLs stay clean.
+      The landing path also survives internal navigation without a referrer.
 
       Done here rather than in each CTA because there are dozens of these
       links across the site and a new one should not have to remember.
@@ -273,59 +280,88 @@ const websiteJsonLd = {
         } else {
           decorate();
         }
+        // Hydrated components may add or replace links after DOMContentLoaded.
+        ['click', 'auxclick', 'contextmenu'].forEach(function (name) {
+          document.addEventListener(name, function (event) {
+            var link = event.target && event.target.closest && event.target.closest('a[href]');
+            if (link) decorateLink(link);
+          }, true);
+        });
 
-        function decorate() {
+        function acquisition() {
           var params = new URLSearchParams(location.search);
           var carried = new URLSearchParams();
 
           UTM.forEach(function (name) {
             var value = params.get(name);
-            if (value) carried.set(name, value.slice(0, 255));
+            if (value && value.trim()) carried.set(name, value.trim().slice(0, 255));
           });
 
           // A wb_ value already on this URL came from an earlier page and wins.
           var landing = params.get('wb_lp');
-          carried.set('wb_lp', (landing && landing.charAt(0) === '/' ? landing : location.pathname).slice(0, 255));
+          var path = location.pathname;
+          if (landing && landing.charAt(0) === '/' && landing.charAt(1) !== '/') {
+            try {
+              var landingUrl = new URL(landing, location.origin);
+              if (landingUrl.origin === location.origin) path = landingUrl.pathname;
+            } catch (e) { /* Keep the current path if the carried path is invalid. */ }
+          }
+          carried.set('wb_lp', path.slice(0, 255));
 
           var ref = params.get('wb_ref');
-          if (!ref && document.referrer) {
-            try {
-              var host = new URL(document.referrer).hostname;
-              if (host && host !== location.hostname) ref = host;
-            } catch (e) { /* an unparseable referrer is simply not recorded */ }
-          }
+          ref = externalHost(ref);
+          if (!ref && document.referrer) ref = externalHost(document.referrer);
           if (ref) carried.set('wb_ref', ref.slice(0, 255));
+          return carried;
+        }
 
-          // Only real attribution is worth carrying between our own pages.
-          var attributed = carried.has('wb_ref') || UTM.some(function (n) { return carried.has(n); });
+        function externalHost(value) {
+          if (!value) return '';
+          try {
+            var host = new URL(value.indexOf('://') !== -1 ? value : 'https://' + value).hostname.toLowerCase();
+            return host === location.hostname || host === 'warmbly.com' || host.endsWith('.warmbly.com') ? '' : host;
+          } catch (e) { return ''; }
+        }
 
-          document.querySelectorAll('a[href]').forEach(function (link) {
-            var url;
-            try {
-              url = new URL(link.href, location.href);
-            } catch (e) {
-              return; // leave a link we cannot parse exactly as it was
-            }
-            var toDashboard = url.hostname === DASHBOARD_HOST;
-            var toPage = url.origin === location.origin && !/\.[a-z0-9]+$/i.test(url.pathname) && url.pathname !== location.pathname;
-            if (!toDashboard && !(attributed && toPage)) return;
-            carried.forEach(function (value, name) {
-              if (!url.searchParams.has(name)) url.searchParams.set(name, value);
-            });
-            link.href = url.toString();
+        function decorateLink(link) {
+          var url;
+          try {
+            url = new URL(link.href, location.href);
+          } catch (e) {
+            return;
+          }
+          if (url.protocol !== 'https:' && url.protocol !== 'http:') return;
+          var toDashboard = url.hostname === DASHBOARD_HOST;
+          var toPage = url.origin === location.origin && !/\.[a-z0-9]+$/i.test(url.pathname) &&
+            (url.pathname !== location.pathname || url.search !== location.search);
+          if (!toDashboard && !toPage) return;
+          acquisition().forEach(function (value, name) {
+            url.searchParams.set(name, value);
           });
+          link.href = url.toString();
+        }
+
+        function decorate() {
+          document.querySelectorAll('a[href]').forEach(decorateLink);
         }
       })();
     </script>
-    <!-- Phone diagnostics: ?noshell / ?noanim / ?nogl switch heavy subsystems off (global.css, GrainBackdrop). -->
+    <!-- Phone diagnostics: ?noshell / ?noanim switch heavy subsystems off (global.css). -->
     <script is:inline>
       var diagParams = new URLSearchParams(location.search);
-      document.documentElement.dataset.diag = ['noshell', 'noanim', 'nogl'].filter(function (f) { return diagParams.has(f); }).join(' ');
+      document.documentElement.dataset.diag = ['noshell', 'noanim'].filter(function (f) { return diagParams.has(f); }).join(' ');
     </script>
   </head>
   <body class="min-h-screen flex flex-col antialiased">
     {!bare && <Header />}
-    <main class="flex-1">
+    <main class="relative flex-1">
+      <!-- Faint guide lines down both sides of the content tie every section
+           of a page into one column. -->
+      {!bare && (
+        <div aria-hidden="true" class="pointer-events-none absolute inset-0 z-[5] hidden md:block">
+          <div class="container-page h-full"><div class="h-full border-x border-slate-900/[0.06] md:-mx-6"></div></div>
+        </div>
+      )}
       <slot />
     </main>
     {!bare && <Footer />}

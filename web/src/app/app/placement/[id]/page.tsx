@@ -5,7 +5,7 @@
 import React from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { ArrowLeftIcon, ArrowUpRightIcon, Loader2Icon, SquareIcon } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { EmptyBlock, SectionBar } from "@/components/layout/Page";
 import PermissionButton from "@/components/ui/PermissionButton";
 import EmailBody from "@/components/app/unibox/EmailBody";
@@ -258,7 +258,7 @@ function Breakdown({ counts, running }: { counts: PlacementCounts; running: bool
         },
         { label: "Spam", n: counts.spam, rate: counts.spam_rate, tone: FOLDER.spam.text, dot: FOLDER.spam.dot },
         {
-            label: "Never arrived",
+            label: "Not observed",
             n: counts.missing,
             rate: counts.missing_rate,
             tone: FOLDER.missing.text,
@@ -383,6 +383,7 @@ function SeedResults({ results, masked }: { results: PlacementResult[]; masked: 
                             {r.error && <div className="text-[11px] text-amber-600 truncate" title={r.error}>{r.error}</div>}
                         </div>
                         <FolderChip folder={r.folder} />
+                        {r.late_observation && <span className="text-xs text-slate-500">Observed after timeout ({r.first_folder || "unknown folder"})</span>}
                     </li>
                 ))}
             </ul>

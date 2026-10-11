@@ -1,12 +1,18 @@
 import { RiFireLine, RiMoreLine } from "@remixicon/react";
 import React, { useEffect, useMemo, useRef } from "react";
+import useBrowseState from "@/hooks/useBrowseState";
+import { browseString, mailboxSort, mailboxTab, type MailboxTab } from "@/lib/browse-accounts-analytics";
 import { useSearchParams } from "@/hooks/useSearchParams";
-import toast from "react-hot-toast";
+import useMailboxTagFilter from "@/hooks/useMailboxTagFilter";
+import groupMailboxes from "@/lib/groupMailboxes";
+import { useAppStore } from "@/stores/useAppStore";
+import toast from "react-hot-toast/headless";
 import { useQueryClient } from "@tanstack/react-query";
 import useEmails from "@/lib/api/hooks/app/emails/useEmails";
 import { NoAccess } from "@/components/layout/NoAccess";
 import { usePermission } from "@/hooks/usePermission";
 import useWarmupLifecycle from "@/lib/api/hooks/app/emails/useWarmupLifecycle";
+import { diagnosticSendingAllowed, diagnosticWarmupActive } from "@/lib/diagnosticParticipation";
 import useAccountStatuses from "@/lib/api/hooks/app/analytics/useAccountStatuses";
 import useFeatureStatus from "@/lib/api/hooks/app/subscription/useFeatureStatus";
 import warmupLifecycle from "@/lib/api/client/app/emails/warmupLifecycle";
@@ -44,7 +50,6 @@ import { useSigninMigration } from "@/lib/api/hooks/app/emails/useMailboxGrants"
 import { mailboxBrand, mailboxSource } from "@/lib/mailboxSource";
 import type Tag from "@/lib/api/models/app/Tag";
 import type Inbox from "@/lib/api/models/app/emails/Inbox";
-import mailboxDisplayStatus from "@/lib/mailboxStatus";
 import type AccountStatus from "@/lib/api/models/app/analytics/AccountStatus";
 import {
     ActivityIcon,
@@ -105,6 +110,7 @@ const DefaultFolder = {
 // Rank used to detect when a mailbox's health worsens between refreshes, so we
 // can proactively toast the user (continuous health reporting).
 const HEALTH_RANK: Record<string, number> = { healthy: 0, warning: 1, error: 2 };
+const LAST_REPORTED_ISSUE_MS = 5 * 60_000;
 
 function healthTone(status?: AccountStatus): { dot: string; text: string; label: string; pulse: boolean } {
     const h = status?.health;
@@ -126,12 +132,15 @@ export default function AddressesPage() {
     const confirm = useConfirm();
     const canView = usePermission("MANAGE_EMAILS");
 
-    const [query, setQuery] = React.useState<string>("");
-    const [tag, setTag] = React.useState<string>("");
+    const [query, setQuery] = useBrowseState("emails.search", "", browseString);
+    const organizationID = useAppStore((state) => state.currentOrganization?.id ?? "personal");
+    const [tag, setTag] = useMailboxTagFilter(`${p.user.id}:${organizationID}`, p.user.tags);
     const emailsData = useEmails({ query, tag });
     const [selected, setSelected] = React.useState<string[]>([]);
     const [view, setView] = React.useState<string>("");
-    const [viewTab, setViewTab] = React.useState<string>("overview");
+    const [viewTab, setViewTab] = React.useState<MailboxTab | undefined>();
+    const [tabIntentKey, setTabIntentKey] = React.useState(0);
+    const consumeTabIntent = React.useCallback(() => setViewTab(undefined), []);
     const [removing, setRemoving] = React.useState(false);
     const [bulkStart, setBulkStart] = React.useState(false);
     const [searchParams, setSearchParams] = useSearchParams();
@@ -161,6 +170,7 @@ export default function AddressesPage() {
     // Self-hosted instances can hand warmup to the Warmbly pool; the banner,
     // row badges and menu items below key off this.
     const cloud = useCloudPool();
+    const { connected: cloudConnected, rowFor: cloudRowFor, unavailable: cloudUnavailable } = cloud;
     const [cloudDialog, setCloudDialog] = React.useState(false);
     const authConfigLoading = useAuthConfig().isLoading;
 
@@ -175,19 +185,58 @@ export default function AddressesPage() {
         () => (emailsData.emails ?? []).map((e) => e.id),
         [emailsData.emails],
     );
-    const statuses = useAccountStatuses(visibleEmailIds);
+    const cloudChecking = authConfigLoading || cloud.loading || cloud.refreshing;
+    const statuses = useAccountStatuses(visibleEmailIds, {
+        enabled: !cloudChecking,
+        sourceRevision: cloud.observedAt,
+    });
     // Coerce to an array defensively: a wrong-shape (non-array) response must
     // never reach a `for…of`, which would throw "{} is not iterable".
     const accountStatuses = useMemo(
-        () => (Array.isArray(statuses.data) ? statuses.data : []),
-        [statuses.data],
+        () => (!cloudChecking && !statuses.isError && !statuses.isFetching && Array.isArray(statuses.data) ? statuses.data : []),
+        [cloudChecking, statuses.data, statuses.isError, statuses.isFetching],
     );
     const statusById = useMemo(() => {
         const m = new Map<string, AccountStatus>();
         for (const s of accountStatuses) m.set(s.id, s);
         return m;
     }, [accountStatuses]);
-
+    const statusChecking = emailsData.isLoading || cloudChecking || statuses.isLoading || statuses.isFetching;
+    const cloudStandingUnavailable = cloud.connected && (emailsData.emails ?? []).some((box) => {
+        const row = cloud.rowFor(box.id);
+        return row?.enrolled && !row.cloud?.health;
+    });
+    const inventoryUnavailable = !emailsData.isLoading && (emailsData.isError || emailsData.isIncomplete);
+    const statusUnavailable = inventoryUnavailable || cloud.unavailable || cloudStandingUnavailable || statuses.isError || (!statusChecking && visibleEmailIds.some((id) => !statusById.has(id)));
+    const [lastReportedIssues, setLastReportedIssues] = React.useState<Map<string, { status: AccountStatus; observedAt: number }>>(new Map());
+    useEffect(() => {
+        setLastReportedIssues((previous) => {
+            const next = new Map(previous);
+            const now = Date.now();
+            for (const [id, issue] of next) if (now - issue.observedAt > LAST_REPORTED_ISSUE_MS) next.delete(id);
+            for (const { status, observedAt, current } of statuses.observations ?? []) {
+                if (!observedAt || now - observedAt > LAST_REPORTED_ISSUE_MS || observedAt < (next.get(status.id)?.observedAt ?? 0)) continue;
+                if (status.errors?.length || (status.health && status.health.status !== "healthy")) {
+                    next.set(status.id, { status, observedAt });
+                } else if (current && !cloudChecking && !cloudUnavailable) {
+                    const linked = cloudConnected ? cloudRowFor(status.id) : undefined;
+                    if (!linked?.enrolled || linked.cloud?.health) next.delete(status.id);
+                }
+            }
+            return next.size === previous.size && [...next].every(([id, value]) => previous.get(id)?.status === value.status && previous.get(id)?.observedAt === value.observedAt) ? previous : next;
+        });
+    }, [statuses.observations, cloudChecking, cloudUnavailable, cloudConnected, cloudRowFor]);
+    useEffect(() => {
+        let expiresAt = Infinity;
+        for (const issue of lastReportedIssues.values()) expiresAt = Math.min(expiresAt, issue.observedAt + LAST_REPORTED_ISSUE_MS);
+        if (!Number.isFinite(expiresAt)) return;
+        const timeout = setTimeout(() => setLastReportedIssues((previous) => {
+            const now = Date.now();
+            const next = new Map([...previous].filter(([, issue]) => now - issue.observedAt <= LAST_REPORTED_ISSUE_MS));
+            return next.size === previous.size ? previous : next;
+        }), Math.max(0, expiresAt - Date.now()) + 1);
+        return () => clearTimeout(timeout);
+    }, [lastReportedIssues]);
     // Proactively notify the user when a mailbox's health drops.
     const prevHealth = useRef<Map<string, string>>(new Map());
     useEffect(() => {
@@ -297,8 +346,10 @@ export default function AddressesPage() {
         return out;
     }, [selected, boxStatusById]);
 
-    const openDetail = (id: string, tab: string = "overview") => {
-        setViewTab(tab);
+    const openDetail = (id: string, tab?: string) => {
+        const parsed = mailboxTab.safeParse(tab);
+        setViewTab(tab === undefined ? undefined : parsed.success ? parsed.data : "overview");
+        setTabIntentKey((key) => key + 1);
         setView(id);
     };
 
@@ -333,18 +384,26 @@ export default function AddressesPage() {
         const s = { total: 0, healthy: 0, warming: 0, issues: 0 };
         for (const e of emailsData.emails ?? []) {
             s.total++;
-            const st = mailboxDisplayStatus(e);
-            if (st === "healthy") s.healthy++;
-            else if (st === "warming") s.warming++;
-            else s.issues++;
+            const current = statusById.get(e.id);
+            if (!current) continue;
+            if (e.status !== "active" || e.auth_state === "failing" || current.health?.status !== "healthy" || current.errors?.length) {
+                s.issues++;
+                continue;
+            }
+            const linked = cloudConnected ? cloudRowFor(e.id) : undefined;
+            if (linked?.enrolled ? linked.cloud?.warmup?.enabled && !cloudWarmupPaused(linked.cloud) : diagnosticWarmupActive(e)) {
+                s.warming++;
+            } else {
+                s.healthy++;
+            }
         }
         return s;
-    }, [emailsData.emails]);
+    }, [emailsData.emails, statusById, cloudConnected, cloudRowFor]);
 
     // Mailboxes actively warming (enabled and not paused). Warmup pairs mailboxes
     // with each other, so too few starves it; the notice below warns on that.
     const warmupActive = useMemo(
-        () => (emailsData.emails ?? []).filter((e) => !!e.warmup && !e.warmup_paused_at).length,
+        () => (emailsData.emails ?? []).filter(diagnosticWarmupActive).length,
         [emailsData.emails],
     );
 
@@ -355,7 +414,7 @@ export default function AddressesPage() {
     }
 
     // Every mailbox page is loaded, so the headers sort in the browser.
-    const [sort, setSort] = React.useState<MailboxSort | null>(null);
+    const [sort, setSort] = useBrowseState<MailboxSort | null>("emails.sort", null, mailboxSort);
     const sortBy = (col: MailboxColumn) =>
         setSort((cur) =>
             cur?.by === col.id ? { by: col.id, reverse: !cur.reverse } : { by: col.id, reverse: !!col.sortAsc },
@@ -363,7 +422,7 @@ export default function AddressesPage() {
     const sortedEmails = useMemo(() => {
         const list = emailsData.emails ?? [];
         const col = sort && MAILBOX_COLUMNS.find((c) => c.id === sort.by);
-        if (!sort || !col?.sortValue) return list;
+        if (!sort || !col?.sortValue) return groupMailboxes(list, p.user.tags);
         const value = col.sortValue;
         const dir = sort.reverse ? 1 : -1;
         return [...list].sort((a, b) => {
@@ -372,7 +431,7 @@ export default function AddressesPage() {
             if (x === y) return 0;
             return (x > y ? 1 : -1) * dir;
         });
-    }, [emailsData.emails, sort, statusById]);
+    }, [emailsData.emails, sort, statusById, p.user.tags]);
 
     if (!canView) {
         return <NoAccess feature="email accounts" permissionLabel="Manage mailboxes" />;
@@ -385,12 +444,14 @@ export default function AddressesPage() {
                 subtitle={
                     emailsData.isPending
                         ? "Loading…"
-                        : `${stats.total.toLocaleString()}${emailsData.isLoadingRest || emailsData.isIncomplete ? "+" : ""} mailbox${stats.total === 1 ? "" : "es"}`
+                        : emailsData.isError && emailsData.emails.length === 0
+                          ? "Mailboxes unavailable"
+                          : `${stats.total.toLocaleString()}${emailsData.isLoadingRest || emailsData.isIncomplete ? "+" : ""} mailbox${stats.total === 1 ? "" : "es"}`
                 }
             >
                 <MailboxImportsMenu />
                 <TopbarAction variant="ghost" href="/app/emails/domains" icon={<GlobeIcon className="w-3 h-3" />}>
-                    Sending domains
+                    <span className="sr-only sm:not-sr-only">Sending domains</span>
                 </TopbarAction>
                 <TopbarAction
                     onClick={() => p?.setAddEmail(true)}
@@ -401,10 +462,10 @@ export default function AddressesPage() {
             </PageTopbar>
 
             <StatStrip cols={4}>
-                <Stat label="Total" value={<AnimatedNumber value={stats.total} />} sub="connected" />
-                <Stat label="Healthy" value={<AnimatedNumber value={stats.healthy} />} sub="sending now" accent={stats.healthy > 0} />
-                <Stat label="Warming" value={<AnimatedNumber value={stats.warming} />} sub="ramping up" />
-                <Stat label="Needs attention" value={<AnimatedNumber value={stats.issues} />} sub="paused or failing" last />
+                <Stat label="Total" value={emailsData.isLoading ? "Checking…" : inventoryUnavailable ? "Unavailable" : <AnimatedNumber value={stats.total} />} sub="connected" />
+                <Stat label="Healthy" value={statusChecking ? "Checking…" : statusUnavailable ? "Unavailable" : <AnimatedNumber value={stats.healthy} />} sub="no reported health issues" accent={!statusChecking && !statusUnavailable && stats.healthy > 0} />
+                <Stat label="Warming" value={statusChecking ? "Checking…" : statusUnavailable ? "Unavailable" : <AnimatedNumber value={stats.warming} />} sub="ramping up" />
+                <Stat label="Needs attention" value={statusChecking ? "Checking…" : statusUnavailable ? "Unavailable" : <AnimatedNumber value={stats.issues} />} sub="paused or failing" last />
             </StatStrip>
 
             <SectionBar label="Mailboxes" count={emailsData.emails?.length ?? 0}>
@@ -412,7 +473,7 @@ export default function AddressesPage() {
                     value={query}
                     onChange={setQuery}
                     placeholder="Search by email…"
-                    className="w-full sm:w-56"
+                    className="flex-1 sm:flex-none sm:w-56"
                 />
                 <PopoverMenu align="end">
                     <PopoverMenuTrigger asChild>
@@ -466,7 +527,7 @@ export default function AddressesPage() {
                             canWarmup={canWarmup}
                             onAdd={() => p?.setAddEmail(true)}
                             onConnectCloud={cloud.manageable && !cloud.connected ? () => setCloudDialog(true) : undefined}
-                            cloudConnected={cloud.connected}
+                            cloudConnected={cloud.workspaceConnected}
                         />
                     )}
                 </div>
@@ -482,6 +543,16 @@ export default function AddressesPage() {
                             </div>
                         ))}
                     </div>
+                ) : emailsData.isError && emailsData.emails.length === 0 ? (
+                    <EmptyBlock
+                        title="Mailboxes unavailable"
+                        body="The mailbox list could not be loaded, so no counts are shown."
+                        cta={
+                            <TopbarAction onClick={() => void emailsData.refetch()}>
+                                Try again
+                            </TopbarAction>
+                        }
+                    />
                 ) : !emailsData.emails || emailsData.emails.length === 0 ? (
                     cloud.selfHosted || authConfigLoading ? (
                     <EmptyBlock
@@ -500,58 +571,64 @@ export default function AddressesPage() {
                 ) : (
                     // table-fixed like the Leads list: every column but Mailbox
                     // carries a width, so one long address never widens the table.
-                    <table className="w-full table-fixed text-left">
-                        <thead className="sticky top-0 bg-white z-[1]">
-                            <tr className="border-b border-slate-200">
-                                <th className="pl-5 pr-2 py-2 w-11">
-                                    <Checkbox
-                                        checked={isSelectedAll()}
-                                        onChange={() => {
-                                            if (isSelectedAll()) {
-                                                setSelected((bef) =>
-                                                    bef.filter((e) => !emailsData.emails.map((em) => em.id).includes(e)),
-                                                );
-                                            } else {
-                                                setSelected((bef) => [
-                                                    ...bef,
-                                                    ...emailsData.emails
-                                                        .filter((em) => !selected.includes(em.id))
-                                                        .map((em) => em.id),
-                                                ]);
-                                            }
-                                        }}
+                    // Columns key off the list's own width, not the viewport, since the sidebar takes a share of it.
+                    <div className="@container">
+                        <table className="w-full table-fixed text-left">
+                            <thead className="sticky top-0 bg-white z-[1]">
+                                <tr className="border-b border-slate-200">
+                                    <th className="pl-5 pr-2 py-2 w-11">
+                                        <Checkbox
+                                            checked={isSelectedAll()}
+                                            onChange={() => {
+                                                if (isSelectedAll()) {
+                                                    setSelected((bef) =>
+                                                        bef.filter((e) => !emailsData.emails.map((em) => em.id).includes(e)),
+                                                    );
+                                                } else {
+                                                    setSelected((bef) => [
+                                                        ...bef,
+                                                        ...emailsData.emails
+                                                            .filter((em) => !selected.includes(em.id))
+                                                            .map((em) => em.id),
+                                                    ]);
+                                                }
+                                            }}
+                                        />
+                                    </th>
+                                    {MAILBOX_COLUMNS.map((col) => (
+                                        <MailboxTh key={col.id} col={col} sort={sort} onSort={sortBy} />
+                                    ))}
+                                    <th className="px-3 py-2 w-[84px] @2xl:w-[76px]"></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {sortedEmails.map((box) => (
+                                    <MailboxRow
+                                        key={box.id}
+                                        box={box}
+                                        tags={p?.user.tags ?? []}
+                                        status={(cloud.unavailable || cloudStandingUnavailable) && statusById.get(box.id)?.health?.status === "healthy" && !statusById.get(box.id)?.errors?.length ? undefined : statusById.get(box.id)}
+                                        lastReportedIssue={lastReportedIssues.get(box.id)}
+                                        statusPending={statusChecking && !statusUnavailable}
+                                        cloudStatusPending={cloudChecking || cloud.unavailable || cloudStandingUnavailable}
+                                        findings={advisor.get(box.id)}
+                                        canWarmup={canWarmup}
+                                        cloud={cloud.connected ? cloud.rowFor(box.id) : undefined}
+                                        cloudConnected={cloud.workspaceConnected}
+                                        retiring={retiringDomain.has(box.id)}
+                                        onRetiring={() => openMigration(retiringDomain.get(box.id) ?? null)}
+                                        checked={selected.includes(box.id)}
+                                        onToggleSelect={() =>
+                                            selected.includes(box.id)
+                                                ? setSelected((bef) => bef.filter((i) => i !== box.id))
+                                                : setSelected((bef) => [...bef, box.id])
+                                        }
+                                        onOpen={openDetail}
                                     />
-                                </th>
-                                {MAILBOX_COLUMNS.map((col) => (
-                                    <MailboxTh key={col.id} col={col} sort={sort} onSort={sortBy} />
                                 ))}
-                                <th className="px-3 py-2 w-[76px]"></th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {sortedEmails.map((box) => (
-                                <MailboxRow
-                                    key={box.id}
-                                    box={box}
-                                    tags={p?.user.tags ?? []}
-                                    status={statusById.get(box.id)}
-                                    findings={advisor.get(box.id)}
-                                    canWarmup={canWarmup}
-                                    cloud={cloud.connected ? cloud.rowFor(box.id) : undefined}
-                                    cloudConnected={cloud.connected}
-                                    retiring={retiringDomain.has(box.id)}
-                                    onRetiring={() => openMigration(retiringDomain.get(box.id) ?? null)}
-                                    checked={selected.includes(box.id)}
-                                    onToggleSelect={() =>
-                                        selected.includes(box.id)
-                                            ? setSelected((bef) => bef.filter((i) => i !== box.id))
-                                            : setSelected((bef) => [...bef, box.id])
-                                    }
-                                    onOpen={openDetail}
-                                />
-                            ))}
-                        </tbody>
-                    </table>
+                            </tbody>
+                        </table>
+                    </div>
                 )}
                 {emailsData.isLoadingRest && !emailsData.isPending && (
                     <div className="h-11 px-5 flex items-center gap-2 text-[12px] text-slate-400 border-b border-slate-200/60">
@@ -642,7 +719,7 @@ export default function AddressesPage() {
                 )}
             </PageBody>
 
-            <InboxDetails emails={emailsData.emails} view={view} setView={setView} initialTab={viewTab} canWarmup={canWarmup} />
+            <InboxDetails emails={emailsData.emails} view={view} setView={setView} initialTab={viewTab} tabIntentKey={tabIntentKey} onTabIntentConsumed={consumeTabIntent} canWarmup={canWarmup} />
 
             <SigninMigrationDialog
                 open={migrationOpen}
@@ -709,6 +786,9 @@ function MailboxRow({
     box,
     tags,
     status,
+    lastReportedIssue,
+    statusPending,
+    cloudStatusPending,
     findings,
     canWarmup,
     cloud,
@@ -722,6 +802,9 @@ function MailboxRow({
     box: Inbox;
     tags: Tag[];
     status?: AccountStatus;
+    lastReportedIssue?: { status: AccountStatus; observedAt: number };
+    statusPending: boolean;
+    cloudStatusPending: boolean;
     findings: AdvisorFinding[];
     canWarmup: boolean;
     cloud?: CloudLinkMailboxRow;
@@ -771,13 +854,14 @@ function MailboxRow({
     const source = mailboxSource(box);
     const brand = mailboxBrand(box);
 
-    const off = !box.warmup;
-    const paused = !!box.warmup && !!box.warmup_paused_at;
-    const active = !!box.warmup && !box.warmup_paused_at;
+    const off = !box.warmup || box.test_mode === "off";
+    const paused = !off && !!box.warmup && (!!box.warmup_paused_at || !diagnosticSendingAllowed(box));
+    const active = diagnosticWarmupActive(box);
     // Warmup only runs on a mailbox that is on, whatever its warmup setting says.
     const warming = active && box.status === "active";
 
-    const tone = healthTone(status);
+    const historicalIssue = !status && lastReportedIssue && Date.now() - lastReportedIssue.observedAt <= LAST_REPORTED_ISSUE_MS ? lastReportedIssue : undefined;
+    const tone = healthTone(status ?? historicalIssue?.status);
     const ws = status?.warmup_status;
     const inCampaign = status?.in_campaign;
 
@@ -808,7 +892,7 @@ function MailboxRow({
             ? "Stopped"
         : paused
             ? "Paused"
-            : inCampaign
+            : inCampaign && diagnosticSendingAllowed(box)
                 ? "Health-check"
                 : "Off";
     const warmupTone = sendFailure
@@ -825,20 +909,23 @@ function MailboxRow({
             ? "text-slate-400"
         : paused
             ? "text-amber-600"
-            : inCampaign
+            : inCampaign && diagnosticSendingAllowed(box)
                 ? "text-sky-600"
                 : "text-slate-400";
 
     const run = (action: "start" | "pause" | "resume", verb: string) => {
-        life.mutate(action, {
+        const execute = () => life.mutate(action, {
             onSuccess: () => toast.success(`Warmup ${verb} for ${box.email}`),
             onError: (e) => toast.error(warmupErrorMessage(e as unknown as AppError)),
         });
+        if (action === "start" || action === "resume") {
+            confirm.show("Authorize disclosed automated diagnostic sending? Starting from Off also enables receiving tests. This is not organic engagement or a proven reputation benefit; provider policies apply.", execute);
+        } else execute();
     };
 
     const stopReset = () => {
         confirm.show(
-            `Stop warmup for ${box.email}? This resets ramp progress — restarting begins from the base volume. Use Pause to keep progress.`,
+            `Stop all diagnostic sending and receiving for ${box.email}? Ramp history and safety holds are retained. Updated workers recheck pending work, but accepted provider sends cannot be recalled.`,
             async () => {
                 try {
                     await life.mutateAsync("stop");
@@ -852,6 +939,68 @@ function MailboxRow({
 
     const upsell = () => toast("Warmup is available on paid plans", { icon: "✨" });
 
+    const warmupCell =
+        inCloud && cloud?.cloud ? (
+            <span
+                className="inline-flex items-center gap-1.5"
+                title={
+                    sendFailure
+                        ? `Warmbly Cloud could not send from this mailbox: ${sendFailure.message}`
+                        : `${cloudPaused ? "Paused in Warmbly Cloud. " : ""}${cloud.cloud.sent_today} of ${cloud.cloud.warmup?.target_volume ?? cloud.cloud.settings.base} warmup emails sent today by Warmbly Cloud`
+                }
+            >
+                {sendFailure ? (
+                    <AlertTriangleIcon className="w-3 h-3 shrink-0" />
+                ) : cloudPaused ? (
+                    <PauseIcon className="w-3 h-3 shrink-0" />
+                ) : (
+                    <span className="campaign-grid shrink-0" aria-hidden />
+                )}
+                <span>
+                    <AnimatedNumber value={cloud.cloud.sent_today} />
+                    <span className="opacity-60">/{cloud.cloud.warmup?.target_volume ?? cloud.cloud.settings.base}</span>
+                </span>
+            </span>
+        ) : inCloud ? (
+            <span className="inline-flex items-center gap-1.5" title="Waiting for Warmbly Cloud to report">
+                <CloudIcon className="w-3 h-3 shrink-0" />
+                <span>{warmupLabel}</span>
+            </span>
+        ) : warming ? (
+            <span
+                className="inline-flex items-center gap-1.5"
+                title={sendFailure ? `The last warmup email was not sent: ${sendFailure.message}` : `${ws?.current_volume ?? 0} of ${ws?.target_volume ?? box.warmup_base} warmup emails sent today`}
+            >
+                {sendFailure ? <AlertTriangleIcon className="w-3 h-3 shrink-0" /> : <span className="campaign-grid shrink-0" aria-hidden />}
+                <span>
+                    <AnimatedNumber value={ws?.current_volume ?? 0} />
+                    <span className="opacity-60">/{ws?.target_volume ?? box.warmup_base}</span>
+                </span>
+            </span>
+        ) : (
+            <span
+                className="inline-flex items-center gap-1.5 font-sans text-[11.5px] font-medium"
+                title={
+                    active
+                        ? box.status === "revoked"
+                            ? "Warmup is on, but the mailbox's access was revoked, so nothing is sent. Reconnect it to resume."
+                            : "Warmup is on, but the mailbox is not, so nothing is sent. Switch the mailbox back on to resume."
+                        : undefined
+                }
+            >
+                {active ? (
+                    <PowerOffIcon className="w-3 h-3 shrink-0" />
+                ) : paused ? (
+                    <PauseIcon className="w-3 h-3 shrink-0" />
+                ) : inCampaign ? (
+                    <ActivityIcon className="w-3 h-3 shrink-0" />
+                ) : (
+                    <RiFireLine className="w-3 h-3 shrink-0" />
+                )}
+                {warmupLabel}
+            </span>
+        );
+
     return (
         <tr
             onClick={() => onOpen(box.id)}
@@ -860,7 +1009,7 @@ function MailboxRow({
             <td className="pl-5 pr-2" onClick={(e) => e.stopPropagation()}>
                 <Checkbox checked={checked} onChange={onToggleSelect} />
             </td>
-            <td className="px-3 overflow-hidden">
+            <td className="px-3 py-2 @2xl:py-0 overflow-hidden">
                 {/* The flag is a sibling of the open-row button, not a child:
                     it has its own trigger and nesting buttons is invalid. */}
                 <div className="flex w-full min-w-0 items-center gap-2">
@@ -882,7 +1031,7 @@ function MailboxRow({
                             {inCloud && (
                                 <span
                                     title={cloud?.managed ? "Signed in through Warmbly Cloud, which warms it" : cloudPaused ? "Paused in Warmbly Cloud" : "Warmed by Warmbly Cloud"}
-                                    className={`inline-flex items-center gap-1 h-4 px-1.5 rounded-full text-[9.5px] font-medium uppercase tracking-[0.08em] shrink-0 ${cloudPaused ? "bg-amber-50 text-amber-600" : "bg-sky-600 text-white"}`}
+                                    className={`hidden @2xl:inline-flex items-center gap-1 h-4 px-1.5 rounded-full text-[9.5px] font-medium uppercase tracking-[0.08em] shrink-0 ${cloudPaused ? "bg-amber-50 text-amber-600" : "bg-sky-600 text-white"}`}
                                 >
                                     <CloudIcon className="w-2.5 h-2.5" /> Cloud
                                 </span>
@@ -890,7 +1039,7 @@ function MailboxRow({
                             {shownTags.map((t) => (
                                 <span
                                     key={t.id}
-                                    className="hidden lg:inline-flex items-center gap-1 h-4 px-1.5 rounded-full text-[9.5px] font-medium shrink-0"
+                                    className="hidden @4xl:inline-flex items-center gap-1 h-4 px-1.5 rounded-full text-[9.5px] font-medium shrink-0"
                                     style={{ backgroundColor: `${t.color}1a`, color: labelInk(t.color) }}
                                 >
                                     <span className="size-1.5 rounded-full" style={{ backgroundColor: t.color }} />
@@ -898,14 +1047,14 @@ function MailboxRow({
                                 </span>
                             ))}
                             {rowTags.length > shownTags.length && (
-                                <span className="hidden lg:inline-flex items-center h-4 px-1 rounded-full bg-slate-100 text-slate-500 text-[9.5px] font-medium shrink-0">
+                                <span className="hidden @4xl:inline-flex items-center h-4 px-1 rounded-full bg-slate-100 text-slate-500 text-[9.5px] font-medium shrink-0">
                                     +{rowTags.length - shownTags.length}
                                 </span>
                             )}
                         </div>
                         {/* Who it sends as, and how it connects: the vendor or grant chip, else the host. */}
-                        <div className="mt-0.5 flex items-center gap-1.5 min-w-0 text-[11px] text-slate-400 leading-tight">
-                            {box.name && <span className="truncate text-slate-500">{box.name}</span>}
+                        <div className="mt-0.5 flex items-center gap-1.5 min-w-0 overflow-hidden text-[11px] text-slate-400 leading-tight">
+                            {box.name && <span className="truncate shrink-0 max-w-[60%] text-slate-500">{box.name}</span>}
                             {box.name && <span className="text-slate-300">·</span>}
                             {source.kind !== "host" ? (
                                 <MailboxSourceChip box={box} labelClassName="inline" />
@@ -915,15 +1064,37 @@ function MailboxRow({
                             {inCloud && (
                                 <span className={`inline-flex items-center gap-1 shrink-0 ${cloudPaused ? "text-amber-600" : "text-sky-600"}`}>
                                     <span className="text-slate-300">·</span>
-                                    <CloudIcon className="w-2.5 h-2.5" /> {cloudPaused ? "Cloud warmup paused" : "Warmed by Warmbly Cloud"}
+                                    <CloudIcon className="w-2.5 h-2.5" />
+                                    <span className="@4xl:hidden">{cloudPaused ? "Cloud paused" : "Cloud"}</span>
+                                    <span className="hidden @4xl:inline">{cloudPaused ? "Cloud warmup paused" : "Warmed by Warmbly Cloud"}</span>
                                 </span>
                             )}
                             {inCampaign && (
-                                <span className="hidden sm:inline-flex items-center gap-1 shrink-0 text-sky-600">
+                                <span className="hidden @4xl:inline-flex items-center gap-1 shrink-0 text-sky-600">
                                     <span className="text-slate-300">·</span>
                                     <ActivityIcon className="w-2.5 h-2.5" /> In campaign
                                 </span>
                             )}
+                        </div>
+                        {/* Too narrow for the metric columns: the same readings, labelled, under the address. */}
+                        <div className="@2xl:hidden mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0 leading-tight">
+                            <MailboxStatusPill box={box} status={status} historicalIssue={historicalIssue} warming={inCloud ? !cloudPaused : warming} compact pending={statusPending} />
+                            <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+                                <span className="text-[10.5px] text-slate-400">Warmup</span>
+                                <span className={`font-mono text-[11.5px] tabular-nums ${warmupTone}`}>{cloudStatusPending ? statusPending ? "Checking…" : "Unavailable" : warmupCell}</span>
+                            </span>
+                            <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+                                <span className="text-[10.5px] text-slate-400">Inbox</span>
+                                <PlacementRateBadge rate={status?.warmup_placement} />
+                            </span>
+                            <span className="inline-flex items-center gap-1.5 whitespace-nowrap" title={status?.health ? tone.label : undefined}>
+                                <span className="text-[10.5px] text-slate-400">Health</span>
+                                <span className={`inline-flex items-center gap-1 font-mono text-[11.5px] font-medium tabular-nums ${tone.text}`}>
+                                    <span className={`inline-flex w-1.5 h-1.5 rounded-full ${tone.dot}`} />
+                                    {historicalIssue && <span className="text-slate-500">Last observed</span>}
+                                    {status?.health?.score ?? historicalIssue?.status.health?.score ?? "—"}
+                                </span>
+                            </span>
                         </div>
                     </div>
                 </button>
@@ -931,10 +1102,10 @@ function MailboxRow({
                 <AdvisorRowFlag findings={findings} subject={box.email} />
                 </div>
             </td>
-            <td className="px-3 overflow-hidden">
-                <MailboxStatusPill box={box} status={status} warming={inCloud ? !cloudPaused : warming} />
+            <td className={`px-3 overflow-hidden ${colShow("status")}`}>
+                <MailboxStatusPill box={box} status={status} historicalIssue={historicalIssue} warming={inCloud ? !cloudPaused : warming} pending={statusPending} />
             </td>
-            <td className="px-3 overflow-hidden hidden md:table-cell">
+            <td className={`px-3 overflow-hidden ${colShow("sent")}`}>
                 {status?.daily_usage ? (
                     <span
                         className={`inline-flex items-center gap-1.5 font-mono text-[12px] tabular-nums ${status.daily_usage.campaign_sent > 0 ? "text-sky-700" : "text-slate-500"}`}
@@ -950,88 +1121,29 @@ function MailboxRow({
                     <Dash />
                 )}
             </td>
-            <td className={`px-3 overflow-hidden font-mono text-[12px] tabular-nums ${warmupTone}`}>
-                {inCloud && cloud?.cloud ? (
-                    <span
-                        className="inline-flex items-center gap-1.5"
-                        title={
-                            sendFailure
-                                ? `Warmbly Cloud could not send from this mailbox: ${sendFailure.message}`
-                                : `${cloudPaused ? "Paused in Warmbly Cloud. " : ""}${cloud.cloud.sent_today} of ${cloud.cloud.warmup?.target_volume ?? cloud.cloud.settings.base} warmup emails sent today by Warmbly Cloud`
-                        }
-                    >
-                        {sendFailure ? (
-                            <AlertTriangleIcon className="w-3 h-3 shrink-0" />
-                        ) : cloudPaused ? (
-                            <PauseIcon className="w-3 h-3 shrink-0" />
-                        ) : (
-                            <span className="campaign-grid shrink-0" aria-hidden />
-                        )}
-                        <span>
-                            <AnimatedNumber value={cloud.cloud.sent_today} />
-                            <span className="opacity-60">/{cloud.cloud.warmup?.target_volume ?? cloud.cloud.settings.base}</span>
-                        </span>
-                    </span>
-                ) : inCloud ? (
-                    <span className="inline-flex items-center gap-1.5" title="Waiting for Warmbly Cloud to report">
-                        <CloudIcon className="w-3 h-3 shrink-0" />
-                        <span>{warmupLabel}</span>
-                    </span>
-                ) : warming ? (
-                    <span
-                        className="inline-flex items-center gap-1.5"
-                        title={sendFailure ? `The last warmup email was not sent: ${sendFailure.message}` : `${ws?.current_volume ?? 0} of ${ws?.target_volume ?? box.warmup_base} warmup emails sent today`}
-                    >
-                        {sendFailure ? <AlertTriangleIcon className="w-3 h-3 shrink-0" /> : <span className="campaign-grid shrink-0" aria-hidden />}
-                        <span>
-                            <AnimatedNumber value={ws?.current_volume ?? 0} />
-                            <span className="opacity-60">/{ws?.target_volume ?? box.warmup_base}</span>
-                        </span>
-                    </span>
-                ) : (
-                    <span
-                        className="inline-flex items-center gap-1.5 font-sans text-[11.5px] font-medium"
-                        title={
-                            active
-                                ? box.status === "revoked"
-                                    ? "Warmup is on, but the mailbox's access was revoked, so nothing is sent. Reconnect it to resume."
-                                    : "Warmup is on, but the mailbox is not, so nothing is sent. Switch the mailbox back on to resume."
-                                : undefined
-                        }
-                    >
-                        {active ? (
-                            <PowerOffIcon className="w-3 h-3 shrink-0" />
-                        ) : paused ? (
-                            <PauseIcon className="w-3 h-3 shrink-0" />
-                        ) : inCampaign ? (
-                            <ActivityIcon className="w-3 h-3 shrink-0" />
-                        ) : (
-                            <RiFireLine className="w-3 h-3 shrink-0" />
-                        )}
-                        {warmupLabel}
-                    </span>
-                )}
+            <td className={`px-3 overflow-hidden font-mono text-[12px] tabular-nums ${warmupTone} ${colShow("warmup")}`}>
+                {cloudStatusPending ? <span className="text-slate-500">{statusPending ? "Checking…" : "Unavailable"}</span> : warmupCell}
             </td>
-            <td className="px-3">
+            <td className={`px-3 ${colShow("inbox")}`}>
                 <button
                     type="button"
                     onClick={(e) => { e.stopPropagation(); onOpen(box.id, "deliverability"); }}
                     aria-label="View warmup deliverability"
                     className="inline-flex items-center gap-1.5"
                 >
-                    <MailCheckIcon className="w-3 h-3 shrink-0 text-slate-400 hidden sm:block" />
+                    <MailCheckIcon className="w-3 h-3 shrink-0 text-slate-400" />
                     <PlacementRateBadge rate={status?.warmup_placement} />
                 </button>
             </td>
-            <td className="px-3 overflow-hidden">
+            <td className={`px-3 overflow-hidden ${colShow("health")}`}>
                 <button
                     type="button"
                     onClick={(e) => { e.stopPropagation(); onOpen(box.id, "overview"); }}
                     className={`inline-flex items-center gap-1.5 text-[11px] font-medium max-w-full ${tone.text}`}
-                    title={status?.health?.issues?.join("\n") || "View mailbox health"}
+                    title={historicalIssue ? `Last observed ${new Date(historicalIssue.observedAt).toLocaleString()}. Current health unavailable.` : status?.health?.issues?.join("\n") || "View mailbox health"}
                 >
                     <span className={`inline-flex w-1.5 h-1.5 rounded-full shrink-0 ${tone.dot}`} />
-                    <span className={`uppercase tracking-[0.08em] hidden md:inline truncate ${tone.pulse ? "text-shimmer" : ""}`}>{tone.label}</span>
+                    <span className={`uppercase tracking-[0.08em] hidden @4xl:inline truncate ${tone.pulse && !historicalIssue ? "text-shimmer" : ""}`}>{historicalIssue && "Last observed: "}{tone.label}</span>
                 </button>
             </td>
             <td className="px-3" onClick={(e) => e.stopPropagation()}>
@@ -1042,7 +1154,7 @@ function MailboxRow({
                                 type="button"
                                 aria-label="Warmup actions"
                                 disabled={life.isPending}
-                                className="w-6 h-6 flex items-center justify-center rounded hover:bg-slate-100 text-slate-400 hover:text-orange-600 transition-colors cursor-pointer disabled:opacity-50"
+                                className="size-7 @2xl:size-6 flex items-center justify-center rounded hover:bg-slate-100 text-slate-400 hover:text-orange-600 transition-colors cursor-pointer disabled:opacity-50"
                             >
                                 {inCloud ? <CloudIcon className={`w-3.5 h-3.5 ${cloudPaused ? "text-amber-500" : "text-sky-600"}`} /> : <RiFireLine className={`w-3.5 h-3.5 ${warming ? "text-orange-500" : paused ? "text-amber-500" : ""}`} />}
                             </button>
@@ -1128,7 +1240,7 @@ function MailboxRow({
                         <PopoverMenuTrigger asChild>
                             <button
                                 type="button"
-                                className="w-6 h-6 flex items-center justify-center rounded hover:bg-slate-100 text-slate-400 hover:text-slate-700 transition-colors cursor-pointer"
+                                className="size-7 @2xl:size-6 flex items-center justify-center rounded hover:bg-slate-100 text-slate-400 hover:text-slate-700 transition-colors cursor-pointer"
                                 aria-label="Mailbox actions"
                             >
                                 <RiMoreLine className="w-3.5 h-3.5" />
@@ -1184,8 +1296,10 @@ interface MailboxColumn {
     id: MailboxColumnId;
     label: string;
     header?: React.ReactNode;
-    // Width and breakpoint, shared by the header and the row's cell.
+    // Width of the header cell, which sets the column in a fixed table.
     className: string;
+    // Container breakpoint the column appears at, shared by the header and the row's cell.
+    show?: string;
     align?: "right";
     // Whether the first click sorts ascending (text) rather than descending.
     sortAsc?: boolean;
@@ -1205,21 +1319,23 @@ const MAILBOX_COLUMNS: MailboxColumn[] = [
         header: (
             <>
                 <span className="sr-only">Status</span>
-                <span aria-hidden className="hidden sm:inline">Status</span>
+                <span aria-hidden className="hidden @4xl:inline">Status</span>
             </>
         ),
-        className: "w-16 sm:w-32",
+        className: "w-12 @4xl:w-32",
+        show: "hidden @2xl:table-cell",
         // Problems first, then idle, warming, sending, sending and warming.
         sortValue: (b, s) =>
             b.status !== "active" || s?.errors?.length
                 ? -1
-                : (s?.in_campaign ? 2 : 0) + (b.warmup && !b.warmup_paused_at ? 1 : 0),
+                : (s?.in_campaign ? 2 : 0) + (diagnosticWarmupActive(b) ? 1 : 0),
     },
     {
         id: "sent",
         label: "Sent today",
         header: <InfoHeader label="Sent today" title="Campaign emails sent from this mailbox today, against its daily cap." aria="How sends are counted" />,
-        className: "w-28 hidden md:table-cell",
+        className: "w-32",
+        show: "hidden @5xl:table-cell",
         sortValue: (_, s) => s?.daily_usage?.campaign_sent ?? -1,
     },
     {
@@ -1227,7 +1343,8 @@ const MAILBOX_COLUMNS: MailboxColumn[] = [
         label: "Warmup",
         header: <InfoHeader label="Warmup" title="Warmup emails sent today, against today's ramp target." aria="How warmup is counted" />,
         className: "w-28",
-        sortValue: (b, s) => (b.warmup && !b.warmup_paused_at ? (s?.warmup_status?.current_volume ?? 0) : -1),
+        show: "hidden @2xl:table-cell",
+        sortValue: (b, s) => (diagnosticWarmupActive(b) ? (s?.warmup_status?.current_volume ?? 0) : -1),
     },
     {
         id: "inbox",
@@ -1239,7 +1356,8 @@ const MAILBOX_COLUMNS: MailboxColumn[] = [
                 aria="How the inbox rate is measured"
             />
         ),
-        className: "w-20 sm:w-24",
+        className: "w-24",
+        show: "hidden @2xl:table-cell",
         sortValue: (_, s) => s?.warmup_placement?.inbox_rate ?? -1,
     },
     {
@@ -1248,19 +1366,24 @@ const MAILBOX_COLUMNS: MailboxColumn[] = [
         header: (
             <>
                 <span className="sr-only">Health</span>
-                <span aria-hidden className="hidden md:inline">
+                <span aria-hidden className="hidden @4xl:inline">
                     <InfoHeader label="Health" title="The mailbox's overall health score out of 100: connection, errors, bounces and warmup standing. Click it for the details." aria="How health is scored" />
                 </span>
             </>
         ),
-        className: "w-10 md:w-32",
+        className: "w-10 @4xl:w-32",
+        show: "hidden @2xl:table-cell",
         sortValue: (_, s) => s?.health?.score ?? -1,
     },
 ];
 
+function colShow(id: MailboxColumnId): string {
+    return MAILBOX_COLUMNS.find((c) => c.id === id)?.show ?? "";
+}
+
 // A header cell; a sortable one is the sort control, like the Leads list.
 function MailboxTh({ col, sort, onSort }: { col: MailboxColumn; sort: MailboxSort | null; onSort: (col: MailboxColumn) => void }) {
-    const base = `px-3 py-2 text-[10px] font-medium text-slate-400 uppercase tracking-[0.14em] truncate ${col.className} ${col.align === "right" ? "text-right" : ""}`;
+    const base = `px-3 py-2 text-[10px] font-medium text-slate-400 uppercase tracking-[0.14em] truncate ${col.className} ${col.show ?? ""} ${col.align === "right" ? "text-right" : ""}`;
     const content = col.header ?? col.label;
     if (!col.sortValue) return <th className={base}>{content}</th>;
     const active = sort?.by === col.id;
@@ -1284,7 +1407,9 @@ function MailboxTh({ col, sort, onSort }: { col: MailboxColumn; sort: MailboxSor
 
 // What the mailbox is doing right now. Cold sending and warmup run side by
 // side, so both show when both are on; a problem that stops it wins.
-function MailboxStatusPill({ box, status, warming }: { box: Inbox; status?: AccountStatus; warming: boolean }) {
+// compact spells a problem out, since it is the one reading a phone must not miss.
+function MailboxStatusPill({ box, status, historicalIssue, warming, compact = false, pending = false }: { box: Inbox; status?: AccountStatus; historicalIssue?: { status: AccountStatus; observedAt: number }; warming: boolean; compact?: boolean; pending?: boolean }) {
+    if (!status && historicalIssue && box.status === "active") return <span className="text-[10.5px] text-amber-700" title={`Last observed ${new Date(historicalIssue.observedAt).toLocaleString()}. Current status unavailable.`}>Last reported issue</span>;
     const error = status?.errors?.[0];
     const lifecycle = status?.send_lifecycle;
     const inCampaign = !!status?.in_campaign;
@@ -1301,10 +1426,12 @@ function MailboxStatusPill({ box, status, warming }: { box: Inbox; status?: Acco
             <span className={`inline-flex items-center gap-1.5 max-w-full text-[10.5px] font-medium uppercase tracking-[0.08em] ${problem.text}`} title={problem.title}>
                 <Icon className="w-3 h-3 shrink-0" />
                 <span className="sr-only">{problem.label}</span>
-                <span aria-hidden className="hidden sm:inline truncate">{problem.label}</span>
+                <span aria-hidden className={`${compact ? "inline" : "hidden @4xl:inline"} truncate`}>{problem.label}</span>
             </span>
         );
     }
+
+    if (!status) return <span className="text-[10.5px] text-slate-500">{pending ? "Checking…" : "Unavailable"}</span>;
 
     // One word; the icons beside it say which activities are on.
     const label = sending && warming ? "Active" : sending ? "Sending" : resting ? (lifecycle?.state === "reserve" ? "Reserve" : "Resting") : warming ? "Warming" : "Idle";
@@ -1312,8 +1439,8 @@ function MailboxStatusPill({ box, status, warming }: { box: Inbox; status?: Acco
         sending ? "Sending campaign emails" : resting ? `Held out of campaign sending${lifecycle?.reason ? `: ${lifecycle.reason}` : ""}` : "Not in a live campaign",
         warming
             ? "warming up"
-            : inCampaign
-              ? "a low-volume health-check warmup keeps running"
+            : inCampaign && diagnosticSendingAllowed(box)
+              ? "low-volume diagnostic health checks are enabled"
               : box.warmup && box.warmup_paused_at
                 ? "warmup paused"
                 : "warmup off",
@@ -1328,7 +1455,7 @@ function MailboxStatusPill({ box, status, warming }: { box: Inbox; status?: Acco
                 {!sending && !resting && !warming && <CircleSlashIcon className="w-3 h-3" />}
             </span>
             <span className="sr-only">{label}</span>
-            <span aria-hidden className={`hidden sm:inline truncate ${sending || warming ? "text-shimmer" : ""}`}>{label}</span>
+            <span aria-hidden className={`hidden @4xl:inline truncate ${sending || warming ? "text-shimmer" : ""}`}>{label}</span>
         </span>
     );
 }

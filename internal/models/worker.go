@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/warmbly/warmbly/internal/errx"
 	"golang.org/x/oauth2"
 )
 
@@ -103,14 +104,15 @@ type TrackingInfo struct {
 
 // EmailSendError contains detailed error information for failed email sends
 type EmailSendError struct {
-	Code           string `json:"code" avro:"code"`
-	Type           string `json:"type" avro:"type"`
-	Message        string `json:"message" avro:"message"`
-	ResolveMethod  string `json:"resolve_method" avro:"resolve_method"`
-	UserVisible    bool   `json:"user_visible" avro:"user_visible"`
-	UserTitle      string `json:"user_title,omitempty" avro:"user_title"`
-	UserMessage    string `json:"user_message,omitempty" avro:"user_message"`
-	ActionRequired string `json:"action_required,omitempty" avro:"action_required"`
+	Failure        *errx.SendFailure `json:"failure,omitempty" avro:"failure"`
+	Code           string            `json:"code" avro:"code"`
+	Type           string            `json:"type" avro:"type"`
+	Message        string            `json:"message" avro:"message"`
+	ResolveMethod  string            `json:"resolve_method" avro:"resolve_method"`
+	UserVisible    bool              `json:"user_visible" avro:"user_visible"`
+	UserTitle      string            `json:"user_title,omitempty" avro:"user_title"`
+	UserMessage    string            `json:"user_message,omitempty" avro:"user_message"`
+	ActionRequired string            `json:"action_required,omitempty" avro:"action_required"`
 	// Recipient is the address a refusal named, when the server refused one
 	// recipient rather than the message.
 	Recipient string `json:"recipient,omitempty" avro:"recipient"`
@@ -118,10 +120,11 @@ type EmailSendError struct {
 
 // SendEmailResult is the result from worker after sending email
 type SendEmailResult struct {
-	TaskID        uuid.UUID `json:"task_id" avro:"task_id"`
-	Success       bool      `json:"success" avro:"success"`
-	MessageID     string    `json:"message_id,omitempty" avro:"message_id"`
-	ProviderMsgID string    `json:"provider_msg_id,omitempty" avro:"provider_msg_id"`
+	TransportGeneration uuid.UUID `json:"transport_generation,omitempty" avro:"transport_generation"`
+	TaskID              uuid.UUID `json:"task_id" avro:"task_id"`
+	Success             bool      `json:"success" avro:"success"`
+	MessageID           string    `json:"message_id,omitempty" avro:"message_id"`
+	ProviderMsgID       string    `json:"provider_msg_id,omitempty" avro:"provider_msg_id"`
 	// ThreadID is the provider-side conversation the message landed in, for
 	// the providers that have one (Gmail). The control plane records it
 	// against the task so the next step of the sequence can be appended to
@@ -155,8 +158,9 @@ type AddWorkerEmailGraphData struct {
 }
 
 type AddWorkerEmail struct {
-	ID     uuid.UUID `json:"id" avro:"id"`
-	UserID uuid.UUID `json:"user_id" avro:"user_id"`
+	TransportGeneration uuid.UUID `json:"transport_generation,omitempty" avro:"transport_generation"`
+	ID                  uuid.UUID `json:"id" avro:"id"`
+	UserID              uuid.UUID `json:"user_id" avro:"user_id"`
 	// OrganizationID scopes the organization-wide sync budget. Nil for a
 	// legacy personal mailbox, which then only has per-mailbox budgets.
 	OrganizationID *uuid.UUID `json:"organization_id" avro:"organization_id"`
@@ -191,6 +195,9 @@ func (a *AddWorkerEmail) SavesSentCopy() bool {
 }
 
 type RemoveWorkerEmail struct {
-	UserID  string `json:"user_id" avro:"user_id"`
-	EmailID string `json:"email_id" avro:"email_id"`
+	UserID           string   `json:"user_id" avro:"user_id"`
+	EmailID          string   `json:"email_id" avro:"email_id"`
+	WarmupMessageIDs []string `json:"warmup_message_ids,omitempty" avro:"warmup_message_ids"`
+	WarmupPlacement  string   `json:"warmup_placement,omitempty" avro:"warmup_placement"`
+	WarmupFolder     string   `json:"warmup_folder,omitempty" avro:"warmup_folder"`
 }

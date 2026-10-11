@@ -67,7 +67,7 @@ type WarmupDailyStats struct {
 	TargetVolume   int    `json:"target_volume"`
 	// Active is whether the mailbox had a warmup plan that day. A day with
 	// arrivals but no plan still lists, but does not count as a day active.
-	Active bool `json:"-"`
+	Active bool `json:"active"`
 }
 
 // Campaign Analytics
@@ -130,13 +130,36 @@ type CampaignSummary struct {
 	// part of UniqueClicks, which only ever counts a person's click.
 	MachineClicks int `json:"machine_clicks"`
 	Replies       int `json:"replies"`
-	Bounces       int `json:"bounces"`
-	Unsubscribes  int `json:"unsubscribes"`
+	// PositiveReplies is the subset of Replies the reply classifier judged
+	// positive, one per answered step like Replies.
+	PositiveReplies int `json:"positive_replies"`
+	// InterestedLeads counts distinct contacts with a positive reply, so a
+	// lead who answered two steps positively counts once.
+	InterestedLeads int `json:"interested_leads"`
+	Bounces         int `json:"bounces"`
+	Unsubscribes    int `json:"unsubscribes"`
+	// ReplyBreakdown splits Replies by classification, plus the automated
+	// replies that never count as one.
+	ReplyBreakdown ReplyBreakdown `json:"reply_breakdown"`
 
-	OpenRate   float64 `json:"open_rate"`   // percentage
-	ClickRate  float64 `json:"click_rate"`  // percentage
-	ReplyRate  float64 `json:"reply_rate"`  // percentage
-	BounceRate float64 `json:"bounce_rate"` // percentage
+	OpenRate          float64 `json:"open_rate"`           // percentage
+	ClickRate         float64 `json:"click_rate"`          // percentage
+	ReplyRate         float64 `json:"reply_rate"`          // percentage
+	PositiveReplyRate float64 `json:"positive_reply_rate"` // percentage of EmailsSent
+	BounceRate        float64 `json:"bounce_rate"`         // percentage
+}
+
+// ReplyBreakdown is a cohort's replies by reply_class. The human classes plus
+// Unclassified add up to Replies; OutOfOffice and AutoReply are the automated
+// answers, which are not part of Replies.
+type ReplyBreakdown struct {
+	Positive     int `json:"positive"`
+	Neutral      int `json:"neutral"`
+	Negative     int `json:"negative"`
+	Unsubscribe  int `json:"unsubscribe"`
+	Unclassified int `json:"unclassified"`
+	OutOfOffice  int `json:"out_of_office"`
+	AutoReply    int `json:"auto_reply"`
 }
 
 type SequenceStats struct {
@@ -152,24 +175,27 @@ type SequenceStats struct {
 	Clicks       int `json:"clicks"`
 	// MachineClicks counts this step's contacts whose only clicks were
 	// automated; they are not part of Clicks.
-	MachineClicks int `json:"machine_clicks"`
-	Replies       int `json:"replies"`
-	Bounces       int `json:"bounces"`
+	MachineClicks   int `json:"machine_clicks"`
+	Replies         int `json:"replies"`
+	PositiveReplies int `json:"positive_replies"`
+	Bounces         int `json:"bounces"`
 
 	// Rates are percentages of this step's own EmailsSent, so steps that
 	// reached different numbers of contacts still compare.
-	OpenRate   float64 `json:"open_rate"`
-	ClickRate  float64 `json:"click_rate"`
-	ReplyRate  float64 `json:"reply_rate"`
-	BounceRate float64 `json:"bounce_rate"`
+	OpenRate          float64 `json:"open_rate"`
+	ClickRate         float64 `json:"click_rate"`
+	ReplyRate         float64 `json:"reply_rate"`
+	PositiveReplyRate float64 `json:"positive_reply_rate"`
+	BounceRate        float64 `json:"bounce_rate"`
 }
 
 type CampaignDailyStats struct {
-	Date    string `json:"date"`
-	Sent    int    `json:"sent"`
-	Opens   int    `json:"opens"`
-	Clicks  int    `json:"clicks"`
-	Replies int    `json:"replies"`
+	Date            string `json:"date"`
+	Sent            int    `json:"sent"`
+	Opens           int    `json:"opens"`
+	Clicks          int    `json:"clicks"`
+	Replies         int    `json:"replies"`
+	PositiveReplies int    `json:"positive_replies"`
 }
 
 // Email Account Status
@@ -300,8 +326,10 @@ type WarmupStatusInfo struct {
 
 // WarmupSendFailure is why a warmup send failed: the server's answer when it gave one.
 type WarmupSendFailure struct {
-	Message string    `json:"message"`
-	At      time.Time `json:"at"`
+	Message        string     `json:"message"`
+	At             time.Time  `json:"at"`
+	Kind           string     `json:"kind,omitempty"`
+	FirstFailureAt *time.Time `json:"first_failure_at,omitempty"`
 }
 
 // WarmupPartnerLimit explains a target held below the ramp because a mailbox
@@ -385,6 +413,42 @@ type DashboardAnalytics struct {
 	// the scheduler's clamps; the sidebar meter's denominator. Absent when
 	// it could not be computed.
 	CapacityToday *WorkspaceSendCapacity `json:"capacity_today,omitempty"`
+	// Scope is the campaign filter the campaign-derived sections were
+	// computed for; absent when they cover the whole workspace.
+	Scope *DashboardScope `json:"scope,omitempty"`
+}
+
+// DashboardFilter is the campaign filter a dashboard request asked for.
+type DashboardFilter struct {
+	CampaignIDs []uuid.UUID
+	FolderIDs   []uuid.UUID
+	// AllowedCampaigns and AllowedMailboxes hold a restricted caller to their grants; set by the server, nil allows all.
+	AllowedCampaigns []uuid.UUID
+	AllowedMailboxes []uuid.UUID
+}
+
+// Empty reports a filter that leaves the dashboard workspace-wide.
+func (f DashboardFilter) Empty() bool {
+	return len(f.CampaignIDs) == 0 && len(f.FolderIDs) == 0
+}
+
+// CampaignScope narrows campaign analytics to a resolved set of campaigns.
+// A nil scope is the whole workspace; an empty set matches nothing.
+type CampaignScope struct {
+	CampaignIDs []uuid.UUID
+}
+
+// DashboardScope echoes a resolved filter: the workspace's requested campaigns and folders, and the distinct campaigns they cover.
+type DashboardScope struct {
+	Campaigns     []DashboardScopeItem `json:"campaigns"`
+	Folders       []DashboardScopeItem `json:"folders"`
+	CampaignCount int                  `json:"campaign_count"`
+}
+
+// DashboardScopeItem names one campaign or folder in a DashboardScope.
+type DashboardScopeItem struct {
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
 }
 
 // DashboardOverallStats contains aggregate statistics for the dashboard
@@ -404,7 +468,8 @@ type DashboardOverallStats struct {
 	ReplyRate       float64 `json:"reply_rate"`
 	BounceRate      float64 `json:"bounce_rate"`
 	ActiveCampaigns int     `json:"active_campaigns"`
-	ActiveAccounts  int     `json:"active_accounts"`
+	// ActiveAccounts is workspace-wide; a campaign filter does not narrow it.
+	ActiveAccounts int `json:"active_accounts"`
 }
 
 // RecentActivityItem represents a single activity event

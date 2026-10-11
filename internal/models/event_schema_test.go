@@ -1,12 +1,14 @@
 package models
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/hamba/avro/v2"
+	"github.com/iskorotkov/avro/v2"
 )
 
 // Every event the bus carries has to survive the codec. This is what makes the
@@ -21,7 +23,7 @@ func TestEveryWorkerCommandRoundTrips(t *testing.T) {
 			in := WorkerEvent{Type: eventType, Body: want}
 			payload := encode(t, schema, in)
 			var out WorkerEvent
-			if err := avro.Unmarshal(schema, payload, &out); err != nil {
+			if err := EventAvro.Unmarshal(schema, payload, &out); err != nil {
 				t.Fatalf("decode: %v", err)
 			}
 			if out.Type != eventType {
@@ -40,7 +42,7 @@ func TestEveryWorkerResultRoundTrips(t *testing.T) {
 			in := JobEvent{Type: eventType, Body: want}
 			payload := encode(t, schema, in)
 			var out JobEvent
-			if err := avro.Unmarshal(schema, payload, &out); err != nil {
+			if err := EventAvro.Unmarshal(schema, payload, &out); err != nil {
 				t.Fatalf("decode: %v", err)
 			}
 			if out.Type != eventType {
@@ -53,11 +55,98 @@ func TestEveryWorkerResultRoundTrips(t *testing.T) {
 
 func encode(t *testing.T, schema avro.Schema, in any) []byte {
 	t.Helper()
-	payload, err := avro.Marshal(schema, in)
+	payload, err := EventAvro.Marshal(schema, in)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
 	return payload
+}
+
+// Fixtures were emitted by hamba v2.31.0 on main at 7345dd7ff.
+func TestEventAvroReadsPreUpgradeEnvelopes(t *testing.T) {
+	t.Run("worker", func(t *testing.T) {
+		payload, err := base64.StdEncoding.DecodeString("EkFERF9FTUFJTABIODE4MTgxODEtODE4MS04MTgxLTgxODEtODE4MTgxODE4MTgxSDgxODE4MTgxLTgxODEtODE4MS04MTgxLTgxODE4MTgxODE4MQJIODE4MTgxODEtODE4MS04MTgxLTgxODEtODE4MTgxODE4MTgxAQIBAngCeAJ4AngCgAAAAAAAAAECAngCeAJ4gPCGwu5lDgIBTAJ4AQQCeACCgICAEIAAAAAAAAABgoCAgBACeIKAgIAQgPCGwu5lAAICeAJ4AniA8IbC7mUOAgICeAJ4AngOAngCAngCeAJ4DgJ4AgICeAJ4AniA8IbC7mUOAQgCeAJ4AAJ4Ag4ODg4BBAJ4AAICeAJ4ARQCeAJ4goCAgBABAAKAAAAAAAAAAYDwhsLuZQJ4AQJ4DgKA8IbC7mUCgPCGwu5lAoDwhsLuZQKA8IbC7mUCeA4ODgKA8IbC7mUB")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got WorkerEvent
+		if err := EventAvro.Unmarshal(preTransportSchema(t, WorkerEvent{}.Schema()), payload, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Type != WorkerEventTypeAddEmail {
+			t.Fatalf("worker type changed: %s", got.Type)
+		}
+		want := sample(WorkerEventBodies[WorkerEventTypeAddEmail]).(*AddWorkerEmail)
+		want.TransportGeneration = [16]byte{}
+		want.Sync.State.TransportGeneration = [16]byte{}
+		assertBody(t, got.Body, want)
+	})
+	t.Run("job", func(t *testing.T) {
+		payload, err := base64.StdEncoding.DecodeString("FEVNQUlMX1NFTlQiSDgxODE4MTgxLTgxODEtODE4MS04MTgxLTgxODE4MTgxODE4MQECeAJ4AniA8IbC7mUCAgJ4AngOAngCeAJ4AngCeIDwhsLuZQKA8IbC7mUCeAJ4AngCeAECeAJ4AngCeAJ4")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got JobEvent
+		if err := EventAvro.Unmarshal(preTransportSchema(t, JobEvent{}.Schema()), payload, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Type != JobEventTypeEmailSent {
+			t.Fatalf("job type changed: %s", got.Type)
+		}
+		want := sample(JobEventBodies[JobEventTypeEmailSent]).(SendEmailResult)
+		want.TransportGeneration = [16]byte{}
+		assertBody(t, got.Body, want)
+	})
+}
+
+// Unframed fixtures need their writer schema, just as registry decoding does.
+func preTransportSchema(t *testing.T, schema avro.Schema) avro.Schema {
+	t.Helper()
+	doc, err := SchemaDocument(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root any
+	if err := json.Unmarshal([]byte(doc), &root); err != nil {
+		t.Fatal(err)
+	}
+	var strip func(any)
+	strip = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			if fields, ok := x["fields"].([]any); ok {
+				kept := fields[:0]
+				for _, f := range fields {
+					field := f.(map[string]any)
+					if field["name"] == "transport_generation" || x["name"] == "EmailErrorEvent" && field["name"] == "operation" {
+						continue
+					}
+					strip(f)
+					kept = append(kept, f)
+				}
+				x["fields"] = kept
+			}
+			for k, value := range x {
+				if k != "fields" {
+					strip(value)
+				}
+			}
+		case []any:
+			for _, value := range x {
+				strip(value)
+			}
+		}
+	}
+	strip(root)
+	old, err := json.Marshal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := avro.Parse(string(old))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }
 
 // The decoded body has to arrive as the type the handler asserts on, carrying

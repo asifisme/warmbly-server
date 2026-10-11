@@ -211,6 +211,10 @@ func (s *service) notifyMembers(ctx context.Context, orgID uuid.UUID, perm model
 		if m.AcceptedAt == nil || m.UserID == uuid.Nil || m.UserID == exclude {
 			continue
 		}
+		// Workspace notifications name resources a restricted member may not reach.
+		if m.IsRestricted() {
+			continue
+		}
 		if perm != 0 && !m.Permissions.HasPermission(perm) {
 			continue
 		}
@@ -225,16 +229,33 @@ func (s *service) notifyMembers(ctx context.Context, orgID uuid.UUID, perm model
 // the flush loop bundles them later (see email.go). Returns whether the Slack
 // channel fired, so org fan-outs post to the shared workspace only once.
 func (s *service) notifyOne(ctx context.Context, userID uuid.UUID, orgID *uuid.UUID, uniboxEmailID *uuid.UUID, category models.NotificationCategory, title, body, link string, meta map[string]any, groupKey string, suppressSlack bool) bool {
+	fired, _ := s.notifyOneWithError(ctx, userID, orgID, uniboxEmailID, category, title, body, link, meta, groupKey, suppressSlack)
+	return fired
+}
+
+func (s *service) NotifyDurable(ctx context.Context, userID uuid.UUID, orgID *uuid.UUID, category models.NotificationCategory, title, body, link string, meta map[string]any, groupKey string) error {
+	_, err := s.notifyOneWithError(ctx, userID, orgID, nil, category, title, body, link, meta, groupKey, false)
+	return err
+}
+
+func (s *service) notifyOneWithError(ctx context.Context, userID uuid.UUID, orgID *uuid.UUID, uniboxEmailID *uuid.UUID, category models.NotificationCategory, title, body, link string, meta map[string]any, groupKey string, suppressSlack bool) (bool, error) {
 	if userID == uuid.Nil {
-		return false
+		return false, nil
+	}
+	allowed, err := s.recipientEligibility(ctx, userID, orgID, category)
+	if err != nil || !allowed {
+		return false, err
 	}
 	prefs, err := s.repo.GetPreferences(ctx, userID)
 	if err != nil || prefs == nil {
-		return false
+		return false, err
 	}
 	cat := prefs.CategoryPref(category)
 	if !cat.Enabled {
-		return false // category off — no channel fires
+		return false, nil
+	}
+	if !s.canNotifyMessage(ctx, category, uniboxEmailID) {
+		return false, nil
 	}
 
 	emailOn := cat.Channels.Email && s.email != nil && s.users != nil
@@ -259,14 +280,17 @@ func (s *service) notifyOne(ctx context.Context, userID uuid.UUID, orgID *uuid.U
 			n.EmailDueAt = &due
 		}
 		created, cerr := s.repo.Create(ctx, n)
-		if errors.Is(cerr, repository.ErrNotificationMessageGone) {
-			return false // the message left the unibox first; nothing to announce
+		if errors.Is(cerr, repository.ErrNotificationMessageGone) || errors.Is(cerr, repository.ErrNotificationMessageAutomated) {
+			return false, nil
+		}
+		if cerr != nil {
+			return false, cerr
 		}
 		if cerr == nil && created != nil && created.MessageSeen {
-			return false // already read where it arrived; the row is the record
+			return false, nil
 		}
 		if cerr == nil && created != nil && cat.Channels.InApp && s.publisher != nil {
-			s.publisher.PublishNotificationCreated(ctx, userID.String(), created.ID.String(), string(category), title, link)
+			s.publisher.PublishNotificationCreated(ctx, userID.String(), created.ID.String(), string(category), title, link, orgID)
 		}
 	}
 
@@ -280,6 +304,10 @@ func (s *service) notifyOne(ctx context.Context, userID uuid.UUID, orgID *uuid.U
 		go func(parent context.Context) {
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 8*time.Second)
 			defer cancel()
+			allowed, err := s.recipientEligibility(ctx, userID, &org, category)
+			if err != nil || !allowed || !s.canNotifyMessage(ctx, category, uniboxEmailID) {
+				return
+			}
 			if postOrg {
 				if err := s.slack.NotifyOrg(ctx, org, notice); err != nil {
 					log.Printf("notification: slack channel post failed (org=%s category=%s): %v", org, category, err)
@@ -293,9 +321,43 @@ func (s *service) notifyOne(ctx context.Context, userID uuid.UUID, orgID *uuid.U
 
 	// Push: immediate on a quiet window, digest-batched inside one (detached).
 	if cat.Channels.Push && s.push != nil && s.deviceTokens != nil && s.pushRedis != nil {
-		go s.deliverPush(userID, category, title, body, link)
+		go s.deliverPush(userID, category, pendingPush{Title: title, Body: body, Link: link, MessageID: uniboxEmailID, OrganizationID: orgID})
 	}
-	return slackFired
+	return slackFired, nil
+}
+
+func (s *service) recipientEligibility(ctx context.Context, userID uuid.UUID, orgID *uuid.UUID, category models.NotificationCategory) (bool, error) {
+	if orgID == nil {
+		return category == models.NotifSecuritySignIn, nil
+	}
+	if *orgID == uuid.Nil {
+		return false, nil
+	}
+	if s.members == nil {
+		return false, errors.New("notification: member resolver unavailable")
+	}
+	members, err := s.members.GetMembers(ctx, *orgID)
+	if err != nil {
+		return false, err
+	}
+	for _, m := range members {
+		if m.UserID == userID {
+			return m.AcceptedAt != nil && !m.IsRestricted(), nil
+		}
+	}
+	return false, nil
+}
+
+func (s *service) canNotifyMessage(ctx context.Context, category models.NotificationCategory, messageID *uuid.UUID) bool {
+	allowed, err := s.messageEligibility(ctx, category, messageID)
+	return err == nil && allowed
+}
+
+func (s *service) messageEligibility(ctx context.Context, category models.NotificationCategory, messageID *uuid.UUID) (bool, error) {
+	if messageID == nil || (category != models.NotifInboundReply && category != models.NotifInboundOOO) {
+		return true, nil
+	}
+	return s.repo.CanNotifyAboutMessage(ctx, *messageID, category)
 }
 
 // slackNotice copies meta so the detached delivery never shares the caller's map.

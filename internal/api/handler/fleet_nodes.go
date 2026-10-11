@@ -111,6 +111,16 @@ func (h *Handler) FleetJoin(c *gin.Context) {
 	}
 
 	address := heartbeatAddress(req.Address)
+	joinVersion := h.FleetNodes.JoinVersion(ctx, nodeID)
+	if joinVersion == "" {
+		errx.JSON(c, errx.New(errx.Internal, "cannot resolve a backend-compatible node image; configure WARMBLY_VERSION for unstamped builds"))
+		return
+	}
+
+	if h.NodeLogs == nil {
+		errx.JSON(c, errx.ErrServiceDown)
+		return
+	}
 
 	// Registering here rather than waiting for the first beat means the node
 	// shows up in the dashboard the moment it joins, even if it then fails to
@@ -134,13 +144,19 @@ func (h *Handler) FleetJoin(c *gin.Context) {
 		return
 	}
 
+	logToken, logErr := h.NodeLogs.Enroll(ctx, nodeID)
+	if logErr != nil {
+		errx.JSON(c, errx.ErrServiceDown)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, fleetJoinResponse{
 		NodeID: nodeID,
 		Role:   string(role),
-		EnvB64: base64.StdEncoding.EncodeToString([]byte(renderNodeEnv(nodeID, role, req.Region))),
+		EnvB64: base64.StdEncoding.EncodeToString([]byte(renderNodeEnv(nodeID, role, req.Region) + "\nNODE_LOG_TOKEN=" + logToken + "\n")),
 		// Not reply.DesiredVersion: an empty answer is "no opinion" to a node
 		// that is already running something, but this one has nothing to run.
-		DesiredVersion:   h.FleetNodes.JoinVersion(ctx, nodeID),
+		DesiredVersion:   joinVersion,
 		HeartbeatSeconds: nodeHeartbeatSeconds(reply.LivenessSeconds),
 	})
 }
@@ -576,6 +592,14 @@ func (h *Handler) AdminFleetDeleteNode(c *gin.Context) {
 		errx.JSON(c, errx.New(errx.NotImplemented, "fleet enrolment is not available on this instance"))
 		return
 	}
+	if h.NodeLogs == nil {
+		errx.JSON(c, errx.ErrServiceDown)
+		return
+	}
+	if err := h.NodeLogs.Revoke(c.Request.Context(), id); err != nil {
+		errx.JSON(c, errx.ErrServiceDown)
+		return
+	}
 	if err := h.FleetNodeRepo.Delete(c.Request.Context(), id); err != nil {
 		errx.JSON(c, errx.New(errx.Internal, err.Error()))
 		return
@@ -615,6 +639,12 @@ func (h *Handler) AdminFleetPatchNode(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	changed := map[string]string{}
+	if body.PinnedVersion != nil && *body.PinnedVersion != "" && h.FleetNodes != nil {
+		if err := h.FleetNodes.CheckTarget(*body.PinnedVersion); err != nil {
+			errx.JSON(c, errx.New(errx.BadRequest, err.Error()))
+			return
+		}
+	}
 	if body.Name != nil {
 		if err := h.FleetNodeRepo.SetName(ctx, id, *body.Name); err != nil {
 			errx.JSON(c, errx.New(errx.Internal, err.Error()))
@@ -698,6 +728,12 @@ func (h *Handler) AdminFleetSetRelease(c *gin.Context) {
 	}
 
 	if body.Tag != "" {
+		if h.FleetNodes != nil {
+			if err := h.FleetNodes.CheckTarget(strings.TrimSpace(body.Tag)); err != nil {
+				errx.JSON(c, errx.New(errx.BadRequest, err.Error()))
+				return
+			}
+		}
 		state.Tag = strings.TrimSpace(body.Tag)
 		state.Channel = models.FleetChannelPinned
 		state.ResolvedAt = time.Now()

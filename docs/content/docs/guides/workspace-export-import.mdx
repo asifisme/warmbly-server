@@ -3,7 +3,62 @@ title: "Export and import"
 description: "Move a whole workspace between Warmbly instances, including mailboxes, campaigns, contacts, and inbox history."
 ---
 
+A workspace archive is one file holding everything a workspace owns. Use it to move a workspace between Warmbly instances, for example from a self-hosted install to the cloud or back.
+
+## Move a workspace
+
+<Steps>
+
+<Step>
+
+On the source instance, open **Settings > Data**, pick the groups to export, and select **Start export**.
+
+</Step>
+
+<Step>
+
+To keep mailboxes connected, turn on **Include mailbox credentials** and choose a passphrase.
+
+</Step>
+
+<Step>
+
+When the archive lands in the **Archives** list, select **Download**.
+
+</Step>
+
+<Step>
+
+On the destination, choose the archive file, enter its passphrase, and select **Check this archive**.
+
+</Step>
+
+<Step>
+
+Read the report, pick the groups to apply, and confirm.
+
+</Step>
+
+</Steps>
+
+## Good to know
+
+- Export and import are limited to the workspace owner.
+- Archives are kept for 7 days and then deleted automatically.
+- The passphrase is never stored. If you lose it, the credentials in that archive cannot be recovered.
+- An import runs as one transaction. If anything fails, nothing lands.
+- Mailbox overwrite preserves report history, send audit and restrictive holds. Recovery is checked automatically against the destination's newly loaded mailbox transport; an old or in-flight result cannot clear restored transport warnings. Skipped mailboxes are unaffected.
+- To move a whole self-hosted install, use `warmblyctl backup` and `warmblyctl restore` instead.
+
+<Fold>
+
+## About workspace archives
+
 A workspace archive is a single file holding everything one workspace owns. It exists so you can move between instances: a self-hosted install to the cloud, the cloud back to self-hosted, or one self-host to another.
+
+Diagnostic participation, shared/rolling limits, restrictive send evidence and audited repair-resolution history travel with their registered mailbox/task/organization data. Source-worker executor handles reset; exact provider-message DKIM authorization/nonces are excluded. Portable minimal receipt proof remains historical evidence, never an execution grant. The reconciliation webhook/notification outbox is source-instance-local and excluded to prevent replay on import; drain pending effects before moving. Whole-instance database backups retain it. See [send-safety retention and rollback](/development/send-safety/#upgrade-rollback-and-portability).
+
+Campaign task replay intent resets to unverified on workspace import. The destination cannot replay an imported dead letter as a verified non-sending wakeup. A contact or sequence binding remains restrictive send intent even if that record is later removed. Whole-instance backups retain the durable intent; migration rollback refuses to discard retained send intent or unverified pending campaign dead letters.
 
 <Callout title="Moving a whole self-hosted instance is a different tool">
 This page moves **one workspace** between two running instances, re-sealing its secrets for the destination's keys. To move an entire self-hosted install (every workspace, its users, its platform admins) use `warmblyctl backup` and `warmblyctl restore`, which carry the database, the blob root and the encryption keys as one bundle. See [data control](/development/data-control/#backups). The two are not interchangeable: a bundle cannot be applied to a single workspace, and this archive cannot restore an instance.
@@ -11,19 +66,23 @@ This page moves **one workspace** between two running instances, re-sealing its 
 
 Everything here lives under **Settings > Data**, and is limited to the workspace owner. An export with credentials contains every mailbox password in the workspace, so it sits at the same level as deleting the workspace.
 
+</Fold>
+
+<Fold>
+
 ## What an archive contains
 
 The data is split into groups. Every export includes **Workspace**; the rest are yours to choose.
 
 | Group | Contents |
 |-------|----------|
-| Workspace | The organization, members, roles, teams, mailboxes and their profile photos, mailbox tags, the column mappings saved by [mailbox imports](/guides/mailbox-import/), inbox vendor connections, [root redirects](/guides/sending-domains/#root-redirects), API keys, webhooks, and settings, including the website tracking site key. Always included |
+| Workspace | The organization, members with their [access scope](/guides/team-roles/#access-scope) and mailbox grants, roles, teams, mailboxes and their profile photos, mailbox tags, the column mappings saved by [mailbox imports](/guides/mailbox-import/), inbox vendor connections, [root redirects](/guides/sending-domains/#root-redirects), API keys, webhooks, and settings, including the website tracking site key. Always included |
 | Contacts | Contacts, labels, the column mappings saved by [contact imports](/guides/contacts-crm/#importing), segments with their manual overrides, forms with their images, submissions, personalized link tickets and funnel events, notes, activities, the suppression list, and each contact's [HubSpot](/guides/hubspot/) record id, owner, lifecycle stage, lead status and company |
-| Campaigns | Campaigns, folders, sequences, senders, linked segments, attachments, the email image library, per-campaign settings, each lead's step progress with its per-link clicks and per-event opens, the colleagues [copied on each lead](/guides/campaigns/#copying-colleagues-on-one-lead), [placement monitors](/guides/placement-tests/#campaign-placement-monitors), and the [unsubscribe links](/guides/unsubscribe/) already in recipients' inboxes |
+| Campaigns | Campaigns, folders, restricted members' campaign and folder grants, sequences, senders, linked segments, attachments, the email image library, per-campaign settings, each lead's step progress with its per-link clicks and per-event opens, the colleagues [copied on each lead](/guides/campaigns/#copying-colleagues-on-one-lead), [placement monitors](/guides/placement-tests/#campaign-placement-monitors), and the [unsubscribe links](/guides/unsubscribe/) already in recipients' inboxes |
 | CRM | Pipelines, deals, tasks, and meeting bookings |
 | Automations | Automations, connected integrations, lead sync sources, and the workspace's CRM mode: whether it runs on [HubSpot](/guides/hubspot/), its setup choices, the owner matches, and which Warmbly record is which HubSpot record |
 | Assistant | Remie sessions and messages (including conversations held in [Slack](/guides/slack/)), skills, MCP servers, and AI settings |
-| Warmup | Warmup participation, routing rules, statistics and inbox placement history, appeals, and the standing of every penalised address, current or removed, so a move is not a way past a block |
+| Warmup | Warmup participation, routing rules, statistics and inbox placement history, appeals, expiring reconnect-recognition fingerprints, and the standing of every penalised address, current or removed, so a move is not a way past a block |
 | Inbox | Unified inbox threads, message bodies, conversation labels, mailbox sync state, and completed automatic-tagging verdicts with their raw probabilities |
 | Send history | Queued and completed send tasks with their payloads |
 | Delivery events | Bounces, complaints, opens, clicks, [placement tests](/guides/placement-tests/) and batches with where each copy landed, and website page views with the browser records that tie them to contacts |
@@ -33,9 +92,29 @@ The data is split into groups. Every export includes **Workspace**; the rest are
 
 Inbox, send history, delivery events, and logs are the ones that grow without limit. Turn them off and you get a small archive that still rebuilds a working workspace; leave them on for a faithful copy.
 
+The pending warmup-filing queue stays on its source instance. The destination resyncs mail and files recognized warmup messages using its own workers and the mailbox's placement setting.
+
+Warmup statistics travel as history. Per-task charge and refund markers reset on import so settling an old task cannot refund another send's destination statistics. Whole-instance database backups retain these markers.
+
+Mailbox transport-error reports travel as history, retaining every report ID, observation timestamp, task reference and recorded resolution. Their operation and observation provenance reset to unknown, including overwrite imports and older archives without those fields. Imported and legacy historical reports do not share the uniqueness rule for new, locally observed reports and are not automatically cleared by a successful sync or send. Unknown history means recovery is unverified, not that a provider is still failing.
+
+Instance-local transport-success clocks do not travel with an archive. The mailbox transport generation is omitted from exported rows, manifest columns and stored-result/confirmation JSON envelopes; other result and audit evidence remains intact. Importing a new mailbox or overwriting an existing one creates its own destination generation and invalidates only that mailbox's derived transport clocks in the same transaction. Skipped mailboxes and mailboxes not in the archive keep their generation and clocks. This does not clear restrictive send holds, confirmed-task evidence or accounting history.
+
+Send-recovery audit rows also travel as history, including operator confirmations and payload-free contradictory outcome metadata. Their local provenance resets on import. A source-instance confirmation cannot become an executable result or release a conflict hold on the destination. Unknown outcomes stay restrictive until independent authoritative worker results or a fresh local administrator/provider confirmation resolves them; importing an archive never authorizes a resend. Recovery uses available authoritative results automatically, without a new customer sending or connection step. Only unresolved evidence needs administrator verification, not customer log investigation.
+
+Move recovery history only to a destination with compatible recovery code and schema. An older destination can reject the new conflict evidence type or misinterpret historical confirmations even when it can read the archive. Do not discard audit rows to force an import or downgrade. See [conflict-audit upgrade ordering](/development/send-safety/#conflict-audit-upgrade-ordering).
+
+[Test workspace samples](/development/accounts-and-access/#adding-sample-data) move as ordinary contacts, campaigns and CRM records in their corresponding groups; reply templates are in **Assistant**. Their instance-wide admin audit marker does not travel, and import does not grant managed Test access.
+
+A restricted member stays restricted on the destination. Their campaign and folder grants travel with **Campaigns**, so an import without that group brings them in with no campaign access rather than more.
+
 <Callout type="info" title="Suppression always travels with contacts">
 The suppression list is part of the Contacts group and is never optional within it. An import that dropped it would start mailing people who already opted out.
 </Callout>
+
+</Fold>
+
+<Fold>
 
 ## Exporting
 
@@ -56,6 +135,10 @@ Warmbly does not keep it on either instance. If you lose it, the credentials ins
 Leave the option off and the credential fields travel empty. Everything else imports normally, and each mailbox arrives marked for reconnection: open it on the destination and sign in again, exactly like connecting it the first time.
 
 Webhook signing secrets follow the same rule, including the one an [OAuth app](/api/oauth/#receiving-events-as-an-app-webhooks) signs its deliveries with. Without the option, rotate the app's webhook secret on the destination before relying on its deliveries.
+
+</Fold>
+
+<Fold>
 
 ## Importing
 
@@ -87,6 +170,8 @@ Anyone in the archive without an account on the destination has their rows reass
 
 ### What deliberately does not import
 
+Cloud connections and mailbox enrollments never travel, including workspace-scoped connections and retained legacy links. Connect the destination workspace separately to its own Cloud workspace. Cloud-served redirects arrive served locally with their source connection association cleared.
+
 Some things belong to an instance rather than to a workspace, so they are not applied even when the archive contains them:
 
 | Not imported | Why |
@@ -97,6 +182,9 @@ Some things belong to an instance rather than to a workspace, so they are not ap
 | Mailbox sync checkpoints | Replaying a checkpoint would make the destination skip everything that arrived between export and import, so it re-syncs from scratch |
 | Reply processing checkpoints | Claims that prevent a synchronized inbox message from being handled twice belong to the source process. They reset so the destination can safely classify its imported inbox state |
 | Pending warmup verification | Mail waiting for this instance's local or cloud warmup check is not exported. The destination re-syncs it from the provider and applies its own verification |
+| Raw warmup receipt provenance | `warmup_received` observations, first-folder/auth header provenance and provider thread handles are source-instance evidence and are explicitly excluded. Aggregated warmup placement history travels, but raw receipt provenance does not |
+| Warmup dispatch and continuation authority | Parent task/receipt/message handles, lineage authority, queue revisions, worker IDs, dispatch nonces and native result state reset. Imported historical diagnostic metadata and tokens do not authorize automatic continuation on the destination |
+| Provider-attempt history | Immutable attempted timestamps and recipient counts travel in the sending group, retaining restrictive daily/rolling evidence after a capacity refund. Historical attempt nonces never authorize a new executor command |
 | Warmup pool membership | Pools are shared across every workspace on an instance, so membership is re-earned rather than asserted by a file |
 | Domain authentication timings | The verdict travels (public DNS reads the same anywhere), but the destination re-checks before it can stop any sending, so a mailbox is never blocked on an observation the new instance never made |
 | Risk and review status | A workspace's abuse posture is one platform's verdict about a tenant on its own infrastructure, reached from evidence the destination never saw. An archive can neither carry a restriction nor clear one |
@@ -116,6 +204,10 @@ Some things belong to an instance rather than to a workspace, so they are not ap
 | HubSpot sync queue and pull checkpoints | Writes queued for [HubSpot](/guides/hubspot/) and the record of how far each pull had read belong to the instance doing the work. The destination logs its own activity from the move onward and starts its own pull, which reads HubSpot afresh |
 
 An import runs as one transaction. If anything fails, nothing lands and the workspace is untouched.
+
+</Fold>
+
+<Fold>
 
 ## After a move
 
@@ -137,7 +229,13 @@ An import runs as one transaction. If anything fails, nothing lands and the work
 If you have shell access to the source, `warmblyctl org export` writes the same archive straight to a file without going through a browser, which is the easier route for a large workspace. See the [warmblyctl reference](/development/warmblyctl/).
 </Callout>
 
+</Fold>
+
+<Fold>
+
 ## What does not travel
+
+Pending mailbox arrivals and their delivery queue are instance-local. Provider mappings whose arrivals are still pending are excluded too. Let the source consumer finish its pending arrivals before exporting; importing the archive does not replay that source queue. A [full-instance backup](/development/data-control/#mailbox-sync-recovery-data) instead preserves the queue together with its keys and message-body storage.
 
 The Test workspace classification is instance-local. Importing an archive does not classify the destination as Test or grant a managed Test plan or testing credits.
 
@@ -153,9 +251,15 @@ A [community directory](/guides/integrations/#community-apps) listing does not t
 
 Reply and forward drafts kept in your browser are also excluded. Finish or copy them before moving to another instance. See [reply drafts](/guides/unibox/#reply-drafts).
 
+</Fold>
+
+<Fold>
+
 ## Limits
 
 - One export and one import can run per workspace at a time.
 - An uploaded archive can be up to 8 GB.
 - Archives expire 7 days after they finish.
 - An archive can be imported into any instance running the same or a newer release. A newer archive on an older instance is refused, with the version in the message.
+
+</Fold>

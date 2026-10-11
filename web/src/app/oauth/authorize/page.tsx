@@ -5,6 +5,7 @@
 
 "use client";
 
+import { DashboardImage } from "@/components/ui/dashboard-image";
 import React from "react";
 import { useSearchParams } from "@/hooks/useSearchParams";
 import { CheckIcon, ExternalLinkIcon, MinusIcon, ShieldAlertIcon, ShieldCheckIcon } from "lucide-react";
@@ -36,6 +37,21 @@ function isSafeRedirect(rawUrl: string): boolean {
         return !UNSAFE_REDIRECT_SCHEMES.has(new URL(rawUrl).protocol.toLowerCase());
     } catch {
         return false;
+    }
+}
+
+// Where approving sends the code, phrased for a person: a loopback address is a
+// program on this device, a private-use scheme names the app that claims it.
+function redirectDestination(rawUrl: string): string {
+    try {
+        const u = new URL(rawUrl);
+        if (u.protocol === "http:" || u.protocol === "https:") {
+            const loopback = u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]";
+            return loopback ? "an app on this device" : u.host;
+        }
+        return `the ${u.protocol.replace(/:$/, "")} app on this device`;
+    } catch {
+        return "the app";
     }
 }
 
@@ -131,7 +147,7 @@ export default function OAuthConsentPage() {
         <div className={card}>
             <div className="flex flex-col items-center gap-2 border-b border-slate-100 px-6 pt-7 pb-5">
                 {info.logo_url ? (
-                    <img src={info.logo_url} alt={info.name} className="h-12 w-12 rounded-xl object-cover ring-1 ring-slate-200" />
+                    <DashboardImage src={info.logo_url} alt={info.name} className="h-12 w-12 rounded-xl object-cover ring-1 ring-slate-200" />
                 ) : (
                     <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-sky-50 text-[18px] font-semibold uppercase text-sky-700 ring-1 ring-sky-100">
                         {info.name.charAt(0)}
@@ -141,7 +157,6 @@ export default function OAuthConsentPage() {
                     <h1 className="text-[15px] font-semibold text-slate-900">{info.name}</h1>
                     {!info.verified && (
                         <span
-                            title="Warmbly has not reviewed this app. Only continue if you trust who made it."
                             className="inline-flex items-center gap-1 rounded-md bg-amber-50 px-1.5 py-0.5 text-[10.5px] font-medium text-amber-700 ring-1 ring-amber-200"
                         >
                             <ShieldAlertIcon className="h-3 w-3" />
@@ -164,6 +179,21 @@ export default function OAuthConsentPage() {
                     </a>
                 )}
             </div>
+
+            {!info.verified && (
+                <div className="mx-6 mt-5 flex gap-2.5 rounded-lg bg-amber-50 px-3 py-2.5 ring-1 ring-amber-200">
+                    <ShieldAlertIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                    <div className="text-[12px] leading-relaxed text-amber-800">
+                        <p className="font-medium text-amber-900">Not affiliated with Warmbly</p>
+                        <p>
+                            {info.self_registered
+                                ? "This app registered itself and chose its own name, so Warmbly cannot say who made it."
+                                : "Someone outside Warmbly made this app, and Warmbly has not reviewed it."}{" "}
+                            Approve only if you started this connection yourself.
+                        </p>
+                    </div>
+                </div>
+            )}
 
             <div className="px-6 py-5">
                 <div className="text-[10px] uppercase tracking-[0.14em] text-slate-400 mb-2">It will be able to</div>
@@ -210,13 +240,8 @@ export default function OAuthConsentPage() {
                 </button>
             </div>
             <p className="px-6 pb-5 text-center text-[11px] text-slate-400 leading-relaxed">
-                You'll be redirected to {(() => {
-                    try {
-                        return new URL(info.redirect_uri).host;
-                    } catch {
-                        return "the app";
-                    }
-                })()}. Only authorize apps you trust.
+                Authorizing sends access to <span className="font-medium text-slate-600">{redirectDestination(info.redirect_uri)}</span>. Only
+                authorize apps you trust.
             </p>
         </div>
     );

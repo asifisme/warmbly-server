@@ -29,6 +29,8 @@ type UniboxService interface {
 		ctx context.Context,
 		orgID, id uuid.UUID,
 	) (*models.EmailMessage, *errx.Error)
+	// Peek is GetByID without marking the message read.
+	Peek(ctx context.Context, orgID, id uuid.UUID) (*models.EmailMessage, *errx.Error)
 	// ForwardSource is the message a forward carries, read without marking it
 	// seen. NotFound when the id names no message in the organization.
 	ForwardSource(ctx context.Context, orgID, id uuid.UUID) (*models.ForwardedMessage, *errx.Error)
@@ -37,6 +39,8 @@ type UniboxService interface {
 		orgID, emailID uuid.UUID,
 		threadID, limit, cursor string,
 	) (*models.MailSearchResult, *errx.Error)
+	// GetByThreadWithin is GetByThread limited to the allowed mailboxes; nil allows every mailbox.
+	GetByThreadWithin(ctx context.Context, orgID, emailID uuid.UUID, threadID, limit, cursor string, allowed []uuid.UUID) (*models.MailSearchResult, *errx.Error)
 	// LatestMessageIDInThread is the RFC Message-ID a reply into this thread
 	// should name in its In-Reply-To header. Returns "" when the thread is
 	// unknown or holds no message id, which callers treat as "no backfill".
@@ -67,11 +71,14 @@ type UniboxService interface {
 	// MessageMailboxes lists the mailboxes the named messages and
 	// conversations sit in, within the organization.
 	MessageMailboxes(ctx context.Context, orgID uuid.UUID, ids []uuid.UUID, threadIDs []string) ([]uuid.UUID, *errx.Error)
+	// CategoriesForMailboxes lists categories attached to messages in the named mailboxes; empty grants see none.
+	CategoriesForMailboxes(ctx context.Context, orgID uuid.UUID, accountIDs []uuid.UUID) ([]models.Group, *errx.Error)
 
 	// Conversation labels. SetThreadLabels replaces a thread's full
 	// label set (idempotent); ListThreadLabels reads the current set.
 	SetThreadLabels(ctx context.Context, orgID, userID uuid.UUID, threadID string, categoryIDs []uuid.UUID) ([]models.MiniCategory, *errx.Error)
 	ListThreadLabels(ctx context.Context, orgID uuid.UUID, threadID string) ([]models.MiniCategory, *errx.Error)
+	ListThreadLabelsWithin(ctx context.Context, orgID uuid.UUID, threadID string, accountIDs []uuid.UUID) ([]models.MiniCategory, *errx.Error)
 
 	// Scheduled-sends review + cancel. CancelScheduled is DB-only: we
 	// flip status to 'cancelled' and let the queued Cloud Task fire as

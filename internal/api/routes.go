@@ -146,7 +146,7 @@ func Run(
 
 	// Public invitation preview for the /invite landing page. Unauthenticated:
 	// the secret token in the query is the capability.
-	r.GET("/invitations/lookup", m.PublicIPRateLimitMiddleware(), h.PreviewInvitation)
+	r.GET("/invitations/lookup", middleware.QueryValidation(), m.PublicIPRateLimitMiddleware(), h.PreviewInvitation)
 
 	// On-demand TLS gate for the reverse proxy in front of this instance
 	// (Caddy's `ask`). Unauthenticated because the proxy has no credential to
@@ -191,6 +191,7 @@ func Run(
 		// Worker mailbox-sync messageId -> internal email map.
 		node.GET("/email-message-map", h.InternalGetEmailMessageMap)
 		node.PUT("/email-message-map", h.InternalPutEmailMessageMap)
+		node.POST("/email-message-map/arrival", h.InternalAdmitEmailArrival)
 		node.DELETE("/email-message-map", h.InternalDeleteEmailMessageMap)
 
 		// Sync governor priority lane: "is this new message a reply to
@@ -204,9 +205,14 @@ func Run(
 		// Gmail folder reconciliation: the rows the platform believes Gmail
 		// has in a folder, so the worker can report the ones that moved.
 		node.GET("/sync/provider-folder-messages", h.InternalSyncProviderFolderMessages)
+		node.GET("/sync/provider-messages", h.InternalSyncProviderMessages)
 
 		// Worker runtime config.
 		node.GET("/worker/config", h.InternalWorkerConfig)
+		node.POST("/worker/warmup-dispatch", h.InternalWarmupDispatch)
+		node.POST("/worker/warmup-actions", h.InternalWarmupActions)
+		node.POST("/worker/warmup-actions/defer", h.InternalWarmupFilingDeferral)
+		node.POST("/worker/diagnostic-auth", h.InternalDiagnosticAuth)
 	}
 
 	// The role-agnostic node heartbeat. A node still sending INTERNAL_API_TOKEN
@@ -214,6 +220,8 @@ func Run(
 	heartbeat := r.Group("/api/v1/internal")
 	heartbeat.Use(m.NodeHeartbeatAuthMiddleware())
 	heartbeat.POST("/fleet/heartbeat", h.FleetHeartbeat)
+	// This route authenticates an enrollment-issued, node-bound log credential, never a shared broker token.
+	r.POST("/api/v1/internal/fleet/nodes/:id/logs", h.InternalNodeLogs)
 
 	// The edge group is what the tracking and forms services call, on
 	// INTERNAL_API_TOKEN.
@@ -299,6 +307,7 @@ func Run(
 
 	r.Use(cors.New(corsConfig))
 	r.Use(middleware.DashboardOriginMiddleware())
+	r.Use(middleware.QueryValidation())
 
 	// Limit request body size to 10MB to prevent OOM. The contact file uploads
 	// apply their own, larger cap in the handler before reading.
@@ -315,6 +324,9 @@ func Run(
 	// (health, signed webhooks, OAuth bouncers, worker enroll, the internal API,
 	// and /admin) are NOT versioned and stay at their bare paths.
 	v1 := r.Group("/v1")
+	v1.GET("/realtime/socket/websocket", m.PublicIPRateLimitMiddleware(), h.ProxyWebsocket)
+	v1.POST("/dashboard-image/public", m.PublicIPRateLimitMiddleware(), h.PublicDashboardImage)
+	v1.POST("/dashboard-image", m.AuthMiddleware(), m.RateLimitMiddleware(models.RateLimitRead), h.DashboardImage)
 
 	// Public invitation preview for the /invite landing page. Unauthenticated:
 	// the invite token in the query is the capability. Registered on /v1 (the
@@ -340,6 +352,8 @@ func Run(
 	cliAuthPublic.Use(m.CLIAuthIPRateLimitMiddleware())
 	{
 		cliAuthPublic.POST("/code", h.CLIAuthStart)
+		cliAuthPublic.POST("/admin/code", h.AdminDeviceStart)
+		cliAuthPublic.POST("/admin/poll", h.AdminDevicePoll)
 		cliAuthPublic.POST("/poll", h.CLIAuthPoll)
 	}
 
@@ -441,6 +455,7 @@ func Run(
 		protectedAuth.GET("/me", h.GetUser)
 		protectedAuth.PATCH("/me", h.UpdateUserProfile)
 		protectedAuth.PATCH("/me/onboarding", h.CompleteOnboarding)
+		protectedAuth.PUT("/me/product-tour", h.CompleteProductTour)
 		protectedAuth.POST("/me/avatar", h.UploadUserAvatar)
 		protectedAuth.DELETE("/me/avatar", h.DeleteUserAvatar)
 		protectedAuth.POST("/me/password", m.RateLimitMiddleware(models.RateLimitWrite), h.ChangePassword)
@@ -502,7 +517,7 @@ func Run(
 		// long-lived API key (billing, org governance, websocket bootstrap, and
 		// the email onboarding flow that writes user-encrypted secrets).
 		jwtOnly := base.Group("")
-		jwtOnly.Use(m.AuthMiddleware())
+		jwtOnly.Use(m.AuthMiddleware(), m.ResourceScopeGate())
 
 		// Warmbly MCP server: exposes the shared tool registry over the MCP
 		// streamable-HTTP transport. Accepts an API key (static header) or an OAuth
@@ -512,61 +527,63 @@ func Run(
 		// RequiredAPIPerm, send-class tools are never exposed, and per-key rate
 		// limits apply.
 		mcpServer := base.Group("/mcp")
-		mcpServer.Use(m.MCPAuthMiddleware(), m.APIKeyUsageMiddleware(), m.RateLimitMiddleware(models.RateLimitWrite))
+		mcpServer.Use(m.MCPAuthMiddleware(), m.ResourceScopeGate(), m.APIKeyUsageMiddleware(), m.RateLimitMiddleware(models.RateLimitWrite))
 		mcpServer.POST("", h.MCPEndpoint)
 
 		// API-accessible group: routes that accept either a JWT or an API key.
 		// CombinedAuthMiddleware sets the same context keys for both; the usage
 		// middleware records one log row per API-key request (JWT skipped).
 		protected := base.Group("")
-		protected.Use(m.CombinedAuthMiddleware(), m.APIKeyUsageMiddleware(), m.IdempotencyMiddleware(), h.ForgetUniboxOverviewOnWrite)
+		// ResourceScopeGate holds a restricted member, and every key or app acting
+		// for one, to the routes that filter to their grants.
+		protected.Use(m.CombinedAuthMiddleware(), m.ResourceScopeGate(), m.APIKeyUsageMiddleware(), m.IdempotencyMiddleware(), h.ForgetUniboxOverviewOnWrite)
 		{
 			emails := protected.Group("/emails")
-			emails.Use(m.RateLimitMiddleware(models.RateLimitWrite))
+			emails.Use(m.RateLimitMiddleware(models.RateLimitWrite), middleware.UUIDParams("id"))
 			{
 				emails.GET("", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), h.EmailsSearch)
-				emails.GET("/:id", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.GetEmail)
-				emails.PATCH("/:id", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.UpdateEmail)
+				emails.GET("/:id", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireEmailAccountParam("id"), h.GetEmail)
+				emails.PATCH("/:id", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.UpdateEmail)
 				// Bulk tag add/remove across many mailboxes (set semantics,
 				// naturally idempotent). Static path beside /:id like /verify.
 				emails.PATCH("/tags", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), h.BulkTagEmails)
 				// How many mailboxes the workspace holds and may hold, and why.
 				emails.GET("/allowance", m.RequireOrganization(), m.RequireAccess(models.PermManageEmails, models.APIPermReadEmails), h.GetMailboxAllowance)
-				emails.GET("/:id/track", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.GetEmailTrackingDomain)
-				emails.PATCH("/:id/track", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.UpdateEmailTrackingDomain)
-				emails.PATCH("/:id/direct-tracking", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.UpdateEmailDirectTracking)
+				emails.GET("/:id/track", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireEmailAccountParam("id"), h.GetEmailTrackingDomain)
+				emails.PATCH("/:id/track", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.UpdateEmailTrackingDomain)
+				emails.PATCH("/:id/direct-tracking", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.UpdateEmailDirectTracking)
 				// Write-scoped like the auth-check refresh: persisting the
 				// verdict is what routes real links through the custom host.
-				emails.POST("/:id/track/verify", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.VerifyEmailTrackingDomain)
-				emails.POST("/:id/warmup/start", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.StartWarmup)
-				emails.POST("/:id/warmup/pause", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.PauseWarmup)
-				emails.POST("/:id/warmup/resume", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.ResumeWarmup)
-				emails.POST("/:id/warmup/stop", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.StopWarmup)
+				emails.POST("/:id/track/verify", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.VerifyEmailTrackingDomain)
+				emails.POST("/:id/warmup/start", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.StartWarmup)
+				emails.POST("/:id/warmup/pause", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.PauseWarmup)
+				emails.POST("/:id/warmup/resume", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.ResumeWarmup)
+				emails.POST("/:id/warmup/stop", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.StopWarmup)
 				// The owner's hold on campaign sending. Bodyless and idempotent, so no Idempotency-Key.
-				emails.POST("/:id/hold", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.HoldEmail)
-				emails.POST("/:id/release", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.ReleaseEmail)
-				emails.GET("/:id/auth-check", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.GetEmailAuthCheck)
+				emails.POST("/:id/hold", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.HoldEmail)
+				emails.POST("/:id/release", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.ReleaseEmail)
+				emails.GET("/:id/auth-check", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireEmailAccountParam("id"), h.GetEmailAuthCheck)
 				// Write-scoped: recording the verdict is what lifts the cold-send
 				// and warmup gate, so a read-only key must not reach it.
-				emails.POST("/:id/auth-check", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.RefreshEmailAuthCheck)
-				emails.GET("/:id/sync", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.GetEmailSync)
-				emails.PUT("/:id/sync", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.UpdateEmailSync)
+				emails.POST("/:id/auth-check", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.RefreshEmailAuthCheck)
+				emails.GET("/:id/sync", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireEmailAccountParam("id"), h.GetEmailSync)
+				emails.PUT("/:id/sync", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.UpdateEmailSync)
 				// Which addresses the provider will let this mailbox send as,
 				// and where its signature came from. The refresh is the only
 				// half that calls the provider, and storing its answer is what
 				// a send-as choice is validated against, so it is write-scoped.
-				emails.GET("/:id/identity", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.GetEmailSendIdentity)
-				emails.POST("/:id/identity/refresh", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.RefreshEmailSendIdentity)
+				emails.GET("/:id/identity", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireEmailAccountParam("id"), h.GetEmailSendIdentity)
+				emails.POST("/:id/identity/refresh", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.RefreshEmailSendIdentity)
 				// Human sending behaviour: the ranges the mailbox rolls its
 				// workday from, and the workday it rolled for today.
-				emails.GET("/:id/behavior", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.GetEmailBehavior)
-				emails.PUT("/:id/behavior", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.UpdateEmailBehavior)
-				emails.GET("/:id/behavior/plan", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.GetEmailBehaviorPlan)
+				emails.GET("/:id/behavior", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireEmailAccountParam("id"), h.GetEmailBehavior)
+				emails.PUT("/:id/behavior", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.UpdateEmailBehavior)
+				emails.GET("/:id/behavior/plan", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireEmailAccountParam("id"), h.GetEmailBehaviorPlan)
 				emails.POST("/verify", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), h.VerifyEmail)
-				emails.GET("/:id/warmup/ban-status", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.GetWarmupBanStatus)
-				emails.POST("/:id/warmup/appeal", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.SubmitWarmupAppeal)
-				emails.DELETE("/:id", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.DeleteEmail)
-				emails.POST("/:id/send", m.RequireOrganization(), m.RequireAccess(models.PermSendCampaigns, models.APIPermSendCampaigns), middleware.RequireAPIKeyEmailAccountParam("id"), h.SendEmailFromAccount)
+				emails.GET("/:id/warmup/ban-status", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), middleware.RequireEmailAccountParam("id"), h.GetWarmupBanStatus)
+				emails.POST("/:id/warmup/appeal", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.SubmitWarmupAppeal)
+				emails.DELETE("/:id", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.DeleteEmail)
+				emails.POST("/:id/send", m.RequireOrganization(), m.RequireAccess(models.PermSendCampaigns, models.APIPermSendCampaigns), middleware.RequireEmailAccountParam("id"), h.SendEmailFromAccount)
 			}
 
 			// Email onboarding is JWT-only — it writes user-encrypted refresh
@@ -701,7 +718,7 @@ func Run(
 			protected.POST("/campaigns-estimate", m.RateLimitMiddleware(models.RateLimitRead), m.RequireOrganization(), m.RequireAccess(models.PermViewCampaigns, models.APIPermReadCampaigns), h.EstimateCampaign)
 
 			campaigns := protected.Group("/campaigns")
-			campaigns.Use(m.RateLimitMiddleware(models.RateLimitWrite))
+			campaigns.Use(m.RateLimitMiddleware(models.RateLimitWrite), middleware.UUIDParams("id"), middleware.RequireCampaignParam("id"))
 			{
 				campaigns.GET("", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadCampaigns), h.SearchCampaigns)
 				campaigns.POST("", m.RequireAccess(models.PermManageCampaigns, models.APIPermWriteCampaigns), h.CreateCampaign)
@@ -843,7 +860,7 @@ func Run(
 			}
 
 			contacts := protected.Group("/contacts")
-			contacts.Use(m.RateLimitMiddleware(models.RateLimitWrite))
+			contacts.Use(m.RateLimitMiddleware(models.RateLimitWrite), middleware.UUIDParams("id"))
 			{
 				contacts.POST("/search", m.RequireAccess(models.PermViewContacts, models.APIPermReadContacts), h.SearchContacts)
 				contacts.POST("", m.RequireAccess(models.PermManageContacts, models.APIPermWriteContacts), h.AddContacts)
@@ -1062,11 +1079,11 @@ func Run(
 				analytics.GET("/warmup", h.GetWarmupAnalytics)
 				analytics.GET("/warmup/placement", m.RequireOrganization(), h.GetWarmupPlacement)
 				analytics.GET("/campaigns/compare", h.CompareCampaigns)
-				analytics.GET("/campaigns/:id", h.GetCampaignAnalytics)
-				analytics.GET("/campaigns/:id/daily", h.GetCampaignDailyStats)
-				analytics.GET("/campaigns/:id/hourly", h.GetCampaignHourlyStats)
+				analytics.GET("/campaigns/:id", middleware.RequireCampaignParam("id"), h.GetCampaignAnalytics)
+				analytics.GET("/campaigns/:id/daily", middleware.RequireCampaignParam("id"), h.GetCampaignDailyStats)
+				analytics.GET("/campaigns/:id/hourly", middleware.RequireCampaignParam("id"), h.GetCampaignHourlyStats)
 				analytics.GET("/accounts", h.GetAllAccountStatuses)
-				analytics.GET("/accounts/:id", middleware.RequireAPIKeyEmailAccountParam("id"), h.GetAccountStatus)
+				analytics.GET("/accounts/:id", middleware.RequireEmailAccountParam("id"), h.GetAccountStatus)
 				analytics.GET("/usage", h.GetUsageOverview)
 			}
 
@@ -1090,7 +1107,7 @@ func Run(
 				placementTests.POST("/batches/:id/cancel", m.RequireAccess(models.PermSendCampaigns, models.APIPermSendCampaigns), h.CancelPlacementBatch)
 				placementTests.GET("/coverage", m.RateLimitMiddleware(models.RateLimitAnalytics), m.RequireAccess(models.PermViewAnalytics, models.APIPermReadAnalytics), h.GetPlacementCoverage)
 				placementTests.GET("/seeds", m.RequireAccess(models.PermViewCampaigns, models.APIPermReadEmails), h.ListPlacementSeeds)
-				placementTests.PUT("/seeds/:id", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireAPIKeyEmailAccountParam("id"), h.SetPlacementSeed)
+				placementTests.PUT("/seeds/:id", m.RequireAccess(models.PermManageEmails, models.APIPermWriteEmails), middleware.RequireEmailAccountParam("id"), h.SetPlacementSeed)
 			}
 
 			// Audit logs
@@ -1489,6 +1506,10 @@ func Run(
 				org.POST("/members/invite", m.RequireOrganization(), m.RequirePermission(models.PermManageTeam), middleware.RequireFreshAuth(), h.InviteMember)
 				org.PATCH("/members/:id", m.RequireOrganization(), m.RequirePermission(models.PermManageTeam), middleware.RequireFreshAuth(), h.UpdateMemberRole)
 				org.DELETE("/members/:id", m.RequireOrganization(), m.RequirePermission(models.PermManageTeam), h.RemoveMember)
+				// Resource scope: which campaigns, folders and mailboxes a member's role applies to.
+				org.GET("/members/:id/access", m.RequireOrganization(), m.RequirePermission(models.PermManageTeam), h.GetMemberAccess)
+				org.PUT("/members/:id/access", m.RequireOrganization(), m.RequirePermission(models.PermManageTeam), middleware.RequireFreshAuth(), h.SetMemberAccess)
+				org.GET("/access/suggested-senders", m.RequireOrganization(), m.RequirePermission(models.PermManageTeam), h.SuggestAccessSenders)
 
 				// Custom roles: named permission sets assignable to members.
 				org.GET("/roles", m.RequireOrganization(), h.ListOrganizationRoles)
@@ -1648,13 +1669,19 @@ func Run(
 				poolLinkInstance.DELETE("", h.PoolLinkInstanceDisconnect)
 				poolLinkInstance.GET("/mailboxes", h.PoolLinkInstanceMailboxes)
 				poolLinkInstance.GET("/standing", h.PoolLinkInstanceStanding)
+				poolLinkInstance.POST("/analytics/warmup", h.PoolLinkWarmupStats)
+				poolLinkInstance.POST("/analytics/warmup/placement", h.PoolLinkWarmupPlacement)
 				poolLinkInstance.POST("/mailboxes", h.PoolLinkEnroll)
 				poolLinkInstance.GET("/mailboxes/:remoteId", h.PoolLinkGetMailbox)
 				poolLinkInstance.PATCH("/mailboxes/:remoteId", h.PoolLinkPatchMailbox)
+				poolLinkInstance.PATCH("/mailboxes/:remoteId/participation", h.PoolLinkPatchMailbox)
 				poolLinkInstance.DELETE("/mailboxes/:remoteId", h.PoolLinkUnenroll)
 				// Cloud-managed mailboxes: consent on this deployment's OAuth app, brokered tokens.
 				poolLinkInstance.POST("/oauth/start", h.PoolLinkOAuthStart)
 				poolLinkInstance.POST("/oauth/finish", h.PoolLinkOAuthFinish)
+				poolLinkInstance.POST("/oauth/start-correlated", h.PoolLinkOAuthStart)
+				poolLinkInstance.POST("/oauth/finish-correlated", h.PoolLinkOAuthFinish)
+				poolLinkInstance.POST("/mailboxes/adopt-correlated", h.PoolLinkAdopt)
 				poolLinkInstance.GET("/mailboxes/:remoteId/token", h.PoolLinkAccessToken)
 				poolLinkInstance.GET("/mailboxes/:remoteId/warmup-tokens/:token", h.PoolLinkVerifyWarmupToken)
 				poolLinkInstance.POST("/mailboxes/:remoteId/warmup-deliveries", h.PoolLinkVerifyWarmupDelivery)
@@ -1674,10 +1701,7 @@ func Run(
 			}
 
 			// Self-hosted side: Settings > Warmbly Cloud, registered on a self-host only.
-			// The link is one per instance, so linking, unlinking and the linked cloud
-			// workspace's mailboxes take the instance administrator (admin
-			// manage_settings, second factor). A workspace's own mailboxes ride the
-			// link under its manage_emails.
+			// Cloud connections are workspace-scoped; approving their credential sharing still requires an instance administrator.
 			if config.SelfHosted() {
 				cloudLink := jwtOnly.Group("/cloud-link")
 				cloudLink.Use(m.RateLimitMiddleware(models.RateLimitWrite), m.RequireOrganization())
@@ -1688,6 +1712,7 @@ func Run(
 				members.DELETE("/mailboxes/:id/enroll", h.CloudLinkUnenroll)
 				members.POST("/mailboxes/:id/pause", h.CloudLinkPause)
 				members.POST("/mailboxes/:id/resume", h.CloudLinkResume)
+				members.PATCH("/mailboxes/:id/participation", h.CloudLinkParticipation)
 				members.POST("/oauth/start", h.CloudLinkOAuthStart)
 				members.POST("/oauth/finish", h.CloudLinkOAuthFinish)
 				operator := cloudLink.Group("", m.AdminMiddleware(), middleware.RequireAdminPermission(models.AdminPermManageSettings))
@@ -1745,6 +1770,10 @@ func Run(
 	adminRoutes := r.Group("/admin")
 	adminRoutes.Use(m.AuthMiddleware(), m.AdminMiddleware())
 	{
+		adminRoutes.POST("/auth/device/describe", h.AdminDeviceDescribe)
+		adminRoutes.GET("/fleet/nodes/:id/logs", middleware.RequireAdminPermission(models.AdminPermViewWorkers), h.AdminNodeLogs)
+		adminRoutes.GET("/fleet/nodes/:id/broker", middleware.RequireAdminPermission(models.AdminPermViewWorkers), middleware.RequireAdminPermission(models.AdminPermViewAnalytics), h.AdminNodeBroker)
+		adminRoutes.POST("/auth/device/decide", middleware.RequireFreshAuth(), h.AdminDeviceDecide)
 		// Settings → Storage backends (pluggable infrastructure registry)
 		// Platform mail diagnostics. A broken relay locks everyone out, so the
 		// operator needs to see the SMTP dialogue from inside the panel rather
@@ -1772,6 +1801,7 @@ func Run(
 		// other user routes can do.
 		adminRoutes.GET("/testers", middleware.RequireAdminPermission(models.AdminPermViewUsers), h.AdminListTesters)
 		adminRoutes.POST("/testers", middleware.RequireAdminPermission(models.AdminPermManageTesters), h.AdminCreateTester)
+		adminRoutes.POST("/organizations/:id/sample-data", middleware.RequireAdminPermission(models.AdminPermManageTesters), h.AdminSeedTesterWorkspace)
 		adminRoutes.DELETE("/testers/:id", middleware.RequireAdminPermission(models.AdminPermManageTesters), h.AdminRevokeTester)
 		adminRoutes.POST("/users/:id/ban", middleware.RequireAdminPermission(models.AdminPermBanUsers), h.AdminBanUser)
 		adminRoutes.POST("/users/:id/unban", middleware.RequireAdminPermission(models.AdminPermBanUsers), h.AdminUnbanUser)
@@ -1877,6 +1907,7 @@ func Run(
 		// unsafe content or cancel a stuck provider job, but generation volume and
 		// scheduling are not manually controlled.
 		adminRoutes.GET("/warmup-content/overview", middleware.RequireAdminPermission(models.AdminPermViewWarmupPool), h.AdminWarmupContentOverview)
+		adminRoutes.PUT("/warmup-content/settings", middleware.RequireAdminPermission(models.AdminPermManageSettings), h.AdminPutWarmupContentSettings)
 		adminRoutes.GET("/warmup-content/conversations", middleware.RequireAdminPermission(models.AdminPermViewWarmupPool), h.AdminListWarmupConversations)
 		adminRoutes.GET("/warmup-content/conversations/:id", middleware.RequireAdminPermission(models.AdminPermViewWarmupPool), h.AdminGetWarmupConversation)
 		adminRoutes.POST("/warmup-content/conversations/:id/archive", middleware.RequireAdminPermission(models.AdminPermManageSettings), h.AdminArchiveWarmupConversation)
@@ -1915,6 +1946,7 @@ func Run(
 		// only keys no environment variable owns.
 		adminRoutes.GET("/instance/config", middleware.RequireAdminPermission(models.AdminPermManageSettings), h.AdminInstanceConfig)
 		adminRoutes.GET("/instance/health", middleware.RequireAdminPermission(models.AdminPermViewAnalytics), h.AdminInstanceHealth)
+		adminRoutes.GET("/instance/monitoring", middleware.RequireAdminPermission(models.AdminPermViewAnalytics), h.AdminInstanceMonitoring)
 		adminRoutes.DELETE("/instance/invitations/expired", middleware.RequireAdminPermission(models.AdminPermManageOrganizations), h.AdminDeleteExpiredInvitations)
 		adminRoutes.GET("/instance/limits", middleware.RequireAdminPermission(models.AdminPermViewAnalytics), h.AdminInstanceLimits)
 		adminRoutes.GET("/instance/settings", middleware.RequireAdminPermission(models.AdminPermManageSettings), h.AdminGetInstanceSettings)

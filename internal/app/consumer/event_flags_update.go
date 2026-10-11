@@ -33,20 +33,12 @@ func (s *JobsService) HandleFlagsAdd(ctx context.Context, e *models.JobEventFlag
 				}); err != nil {
 					return fmt.Errorf("hold warmup spam move: %w", err)
 				}
-			case containsTrashFlag(e.Flags) && warmupDeletionCounts(rec, time.Now()):
-				// Gmail reports Delete as gaining the TRASH label and only
-				// reports the message gone when Trash is emptied, weeks later.
-				// The label is the owner's act, so it is judged here, on the
-				// same freshness rule as a removal; the later purge is then
-				// outside the window and reads as housekeeping.
-				hHarmer, _ := s.WarmupService.RecordTampering(ctx, e.EmailID, rec.MessageID, "deletion")
-				s.markRiskBandFromWarmupHealth(ctx, e.EmailID, hHarmer)
 			}
 			return nil
 		}
 	}
 
-	email, err := s.emailForSyncUpdate(ctx, e.UserID, e.ID, func(message *models.EmailMessageStoreData) {
+	email, err := s.emailForSyncUpdate(ctx, e.UserID, e.EmailID, e.ID, func(message *models.EmailMessageStoreData) {
 		for _, flag := range e.Flags {
 			if !slices.Contains(message.Flags, flag) {
 				message.Flags = append(message.Flags, flag)
@@ -163,7 +155,7 @@ func warmupTokenFromFlags(flags []string) string {
 }
 
 func (s *JobsService) HandleFlagsRemove(ctx context.Context, e *models.JobEventFlags) error {
-	email, err := s.emailForSyncUpdate(ctx, e.UserID, e.ID, func(message *models.EmailMessageStoreData) {
+	email, err := s.emailForSyncUpdate(ctx, e.UserID, e.EmailID, e.ID, func(message *models.EmailMessageStoreData) {
 		message.Flags = slices.DeleteFunc(message.Flags, func(flag string) bool { return slices.Contains(e.Flags, flag) })
 		if models.SeenFromFlags(e.Flags) {
 			message.Seen = false

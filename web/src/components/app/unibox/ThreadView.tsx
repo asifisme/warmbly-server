@@ -9,7 +9,7 @@ import React from "react";
 import { useParams } from "@tanstack/react-router";
 import { AnimatePresence, motion } from "framer-motion";
 import { useQueryClient, useMutation } from "@tanstack/react-query";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import {
   AlertCircleIcon,
   ArchiveIcon,
@@ -38,6 +38,7 @@ import { DateTimePicker } from "@/components/ui/DateTimePicker";
 import { usePresenceResource } from "@/hooks/PresenceProvider";
 import { useMediaQuery, LG_QUERY } from "@/hooks/useMediaQuery";
 import { useShortcutActions } from "@/hooks/useShortcutActions";
+import { useAccessRestricted } from "@/hooks/usePermission";
 import { ThreadLabelMenu } from "./ThreadLabelMenu";
 import ContactContextPanel from "./ContactContextPanel";
 import { CategoryChip } from "@/components/app/contacts/CategoryPicker";
@@ -103,6 +104,8 @@ function defaultCustomSnoozeValue(): string {
 }
 
 export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
+  // A member restricted to selected resources reads the conversation and nothing more.
+  const readOnly = useAccessRestricted();
   const q = useThread(threadId, emailId);
   const scheduledQ = useThreadScheduled(threadId);
   const accounts = useAppStore((s) => s.emails);
@@ -161,7 +164,7 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
   // `c` labels the open conversation. The key itself is declared in the global
   // shortcut registry; registering the action here is what makes the row live
   // (and shown in the `?` modal) only while a thread is actually open.
-  useShortcutActions({ labelThread: () => setLabelMenuOpen(true) });
+  useShortcutActions(readOnly ? {} : { labelThread: () => setLabelMenuOpen(true) });
 
   // Composer is opt-in. Default: no reply UI mounted. The user has
   // to click Reply (per-message or the footer CTA) before any blank
@@ -241,13 +244,13 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
   // effect), and reading back the patch Mark as unread just wrote undoes it.
   const selected = useAppStore((s) => s.selectedThreadId === threadId);
   React.useEffect(() => {
-    if (!selected) return;
+    if (!selected || readOnly) return;
     const unseenIds = (q.data?.data ?? [])
       .filter((m) => !m.seen)
       .map((m) => m.id);
     if (unseenIds.length === 0) return;
     markSeenMutate({ ids: unseenIds, threadIds: [threadId] });
-  }, [selected, threadId, q.data, markSeenMutate]);
+  }, [selected, readOnly, threadId, q.data, markSeenMutate]);
 
   // Header actions. Each one closes the thread: the effect above would
   // otherwise re-mark an "unread" thread as seen on the next refetch, and a
@@ -403,14 +406,14 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
   };
 
   return (
-    <div className="flex h-full min-h-0">
-      <div className="flex-1 flex flex-col min-w-0 bg-white">
-      <div className="min-h-12 px-4 sm:px-5 py-2 border-b border-slate-200 flex items-center gap-3 shrink-0 bg-white">
+    <div className="flex h-full min-h-0 min-w-0 overflow-hidden">
+      <div className="@container/thread flex-1 flex flex-col min-h-0 min-w-0 bg-white">
+      <div className="min-h-12 px-4 sm:px-5 py-2 border-b border-slate-200 flex flex-col items-stretch gap-2 @min-[40rem]/thread:flex-row @min-[40rem]/thread:items-center @min-[40rem]/thread:gap-3 shrink-0 bg-white">
         <div className="min-w-0 flex-1">
-          <h1 className="text-[13.5px] text-slate-900 font-semibold truncate leading-5">
+          <h1 title={subject} className="text-[13.5px] text-slate-900 font-semibold line-clamp-2 break-words leading-5">
             {subject}
           </h1>
-          <div className="flex items-center gap-1.5 min-w-0 text-[11px] text-slate-400 leading-4">
+          <div className="flex flex-wrap items-center gap-1.5 min-w-0 text-[11px] text-slate-400 leading-4">
             <span className="shrink-0">
               {messages.length} {messages.length === 1 ? "message" : "messages"}
             </span>
@@ -421,7 +424,7 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
               </>
             )}
             {(threadLabels.data ?? []).length > 0 && (
-              <span className="hidden md:inline-flex items-center gap-1 shrink-0 ml-1">
+              <span className="inline-flex max-w-full flex-wrap items-center gap-1 ml-1">
                 {(threadLabels.data ?? []).slice(0, 3).map((c) => (
                   <CategoryChip key={c.id} category={c} compact />
                 ))}
@@ -430,7 +433,17 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
             <ResourceViewers resource={`thread:${threadId}`} className="shrink-0 ml-1" />
           </div>
         </div>
-        <div className="flex items-center gap-0.5 shrink-0">
+        {readOnly ? (
+          onClose && (
+            <IconAction
+              label="Close conversation"
+              className="hidden md:inline-flex"
+              icon={<XIcon className="w-[15px] h-[15px]" />}
+              onClick={onClose}
+            />
+          )
+        ) : (
+        <div className="flex flex-wrap items-center gap-0.5 shrink-0">
           <ThreadLabelMenu
             threadId={threadId}
             open={labelMenuOpen}
@@ -529,7 +542,7 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
             </PopoverMenuContent>
           </PopoverMenu>
 
-          <div className="hidden sm:flex items-center gap-0.5">
+          <div className="hidden @min-[28rem]/thread:flex items-center gap-0.5">
             <IconAction
               label="Mark as unread"
               icon={<MailCheckIcon className="w-[15px] h-[15px]" />}
@@ -560,7 +573,7 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
               />
             )}
           </div>
-          <span aria-hidden className="hidden sm:block h-4 w-px bg-slate-200 mx-1" />
+          <span aria-hidden className="hidden @min-[28rem]/thread:block h-4 w-px bg-slate-200 mx-1" />
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -584,7 +597,7 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
               <button
                 type="button"
                 aria-label="More thread actions"
-                className="sm:hidden size-7 rounded-md inline-flex items-center justify-center text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition-colors"
+                className="@min-[28rem]/thread:hidden size-7 rounded-md inline-flex items-center justify-center text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition-colors"
               >
                 <MoreVerticalIcon className="w-3.5 h-3.5" />
               </button>
@@ -637,6 +650,7 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
             </>
           )}
         </div>
+        )}
       </div>
 
       <motion.div
@@ -646,7 +660,10 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
-        className="flex-1 overflow-y-auto divide-y divide-slate-100"
+        role="region"
+        aria-label="Conversation messages"
+        tabIndex={0}
+        className="flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden divide-y divide-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-sky-500"
       >
         {messages.map((email, i) => (
           <MessageBubble
@@ -664,8 +681,8 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
                 ? accounts.find((a) => a.id === email.answers_mailbox_id)?.email
                 : undefined
             }
-            onReply={() => openReply(email.id, "reply")}
-            onForward={() => openReply(email.id, "forward")}
+            onReply={readOnly ? undefined : () => openReply(email.id, "reply")}
+            onForward={readOnly ? undefined : () => openReply(email.id, "forward")}
           />
         ))}
         {(scheduledQ.data?.data ?? []).map((item) => (
@@ -673,13 +690,14 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
             key={item.task_id}
             item={item}
             cancelling={cancel.isPending && cancel.variables === item.task_id}
-            onCancel={() => cancel.mutate(item.task_id)}
+            onCancel={readOnly ? undefined : () => cancel.mutate(item.task_id)}
           />
         ))}
       </motion.div>
 
-      <AgentDraftCard threadId={threadId} />
+      {!readOnly && <AgentDraftCard threadId={threadId} />}
 
+      {!readOnly && (
       <AnimatePresence mode="wait" initial={false}>
         {replyState && replyTarget ? (
           <ReplyComposer
@@ -729,9 +747,10 @@ export function ThreadView({ threadId, emailId, onClose }: ThreadViewProps) {
           </motion.div>
         )}
       </AnimatePresence>
+      )}
       </div>
 
-      {crmOpen && (
+      {crmOpen && !readOnly && (
         <ContactContextPanel
           email={contactEmail}
           name={contactName}
@@ -883,7 +902,7 @@ function ScheduledMessageBubble({
 }: {
   item: UniboxScheduledItem;
   cancelling: boolean;
-  onCancel: () => void;
+  onCancel?: () => void;
 }) {
   const when = formatScheduled(item.scheduled_at);
   const recipients = [...item.to, ...(item.cc ?? []), ...(item.bcc ?? [])];
@@ -917,6 +936,7 @@ function ScheduledMessageBubble({
               </span>
             </div>
           </div>
+          {onCancel && (
           <button
             type="button"
             onClick={onCancel}
@@ -931,6 +951,7 @@ function ScheduledMessageBubble({
             )}
             {cancelling ? "Cancelling" : "Cancel"}
           </button>
+          )}
         </header>
         <div className="mt-2.5 ml-10">
           {item.subject && (

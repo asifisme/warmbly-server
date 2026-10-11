@@ -37,6 +37,20 @@ func reportable(err error) bool {
 }
 
 func (w *WMail) CaptureError(err error) {
+	w.captureOperationError(err, models.MailTransportUnknown)
+}
+
+func (w *WMail) captureSyncError(err error) {
+	w.captureOperationError(err, models.MailTransportSync)
+}
+
+func (w *WMail) captureOperationError(err error, operation models.MailTransportOperation) {
+	w.lifecycleMu.Lock()
+	stopped := w.stopped
+	w.lifecycleMu.Unlock()
+	if stopped {
+		return
+	}
 	if reportable(err) {
 		errs.CaptureException(err,
 			errs.Tag("user_id", w.UserID.String()),
@@ -58,32 +72,42 @@ func (w *WMail) CaptureError(err error) {
 
 	userInfo := mailErr.GetUserErrorInfo()
 	errorEvent := models.EmailErrorEvent{
-		EmailAccountID: w.ID.String(),
-		UserID:         w.UserID.String(),
-		ErrorCode:      string(mailErr.Code),
-		ErrorType:      string(mailErr.Type),
-		ResolveMethod:  string(mailErr.ResolveMethod),
-		Message:        mailErr.Message,
-		UserVisible:    mailErr.IsUserVisible(),
-		UserTitle:      userInfo.Title,
-		UserMessage:    userInfo.Message,
-		ActionRequired: userInfo.ActionRequired,
-		Timestamp:      time.Now().Unix(),
+		TransportGeneration: w.TransportGeneration,
+		Operation:           operation,
+		EmailAccountID:      w.ID.String(),
+		UserID:              w.UserID.String(),
+		ErrorCode:           string(mailErr.Code),
+		ErrorType:           string(mailErr.Type),
+		ResolveMethod:       string(mailErr.ResolveMethod),
+		Message:             mailErr.Message,
+		UserVisible:         mailErr.IsUserVisible(),
+		UserTitle:           userInfo.Title,
+		UserMessage:         userInfo.Message,
+		ActionRequired:      userInfo.ActionRequired,
+		Timestamp:           ErrorObservedTimestamp(mailErr),
 	}
 
+	w.lifecycleMu.Lock()
+	if w.stopped {
+		w.lifecycleMu.Unlock()
+		return
+	}
 	_ = w.onEvent(eventType, errorEvent)
+	w.lifecycleMu.Unlock()
 
 	// Critical errors should stop the sync loop and remove the account from the
 	// worker's local state until the user re-authenticates.
 	if eventType == models.JobEventTypeEmailAuthError ||
 		eventType == models.JobEventTypeEmailDisabled {
-		if w.Cancel != nil {
-			w.Cancel()
-		}
-		if w.TerminateFunc != nil {
-			w.TerminateFunc()
-		}
+		w.Terminate()
 	}
+}
+
+func ErrorObservedTimestamp(mailErr *errx.MailError) int64 {
+	if mailErr.Failure != nil && !mailErr.Failure.ObservedAt.IsZero() {
+		return mailErr.Failure.ObservedAt.Unix()
+	}
+	return time.Now().Unix()
 }
 
 // mailErrorToJobEventType maps a mail error code to the matching job event type

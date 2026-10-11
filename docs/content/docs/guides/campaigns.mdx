@@ -3,6 +3,60 @@ title: Campaigns
 description: "Create and send cold outreach campaigns safely."
 ---
 
+A campaign sends a sequence of emails to a list of contacts, spread across your connected mailboxes. Warmbly handles the timing, volume limits and mailbox rotation, so sending looks natural and stays safe.
+
+![The campaigns list, grouped by state, with each campaign tagged and filed in a folder](/guides/campaigns.webp)
+
+## Set up a campaign
+
+<Steps>
+
+<Step>
+
+Open **Campaigns** and choose **New campaign**.
+
+</Step>
+
+<Step>
+
+On **Leads**, name the campaign and pick one or more lead lists.
+
+</Step>
+
+<Step>
+
+On **Emails**, write the first email and any follow-ups.
+
+</Step>
+
+<Step>
+
+On **Schedule**, choose when it starts, the sending days and hours, the mailboxes to send from and the daily limit per mailbox.
+
+</Step>
+
+<Step>
+
+On **Review**, check the finish date, then choose **Launch** or **Save as draft**.
+
+</Step>
+
+</Steps>
+
+## Good to know
+
+- Each mailbox sends at most `50` cold emails a day by default, with at least `600` seconds between two sends.
+- A campaign sends only inside its weekly sending windows, in the campaign's timezone.
+- A lead's follow-ups normally go out from the mailbox that sent their first email, and move to another one only when that mailbox is held, cooling or gone.
+- Launch checks your list first and refuses one that is known to be largely undeliverable.
+- Nothing sends until the campaign launches. Closing the flow with anything filled in saves a draft.
+
+<Fold>
+
+## Sender fields and what you need first
+
+Browsing filters, searches and view choices are [remembered in your browser tab](/guides/browsing/) across refreshes and navigation, separately for each user and workspace.
+
 A campaign sends a sequence of emails to a list of contacts, spread across your connected mailboxes. Warmbly handles timing, volume limits, and mailbox rotation so sending looks natural and stays safe.
 
 Personalize from the mailbox sending each message with `{{.Sender.Name}}` and `{{.Sender.Email}}`. Sender values follow mailbox rotation, and the email field uses the active send-as alias when one is selected. The editor's **Sender fields** picker exposes the mailbox's safe details; choose a mailbox in Preview to see its values. See [Sender fields](/guides/expressions/#sender-fields-emails).
@@ -11,18 +65,34 @@ Personalize from the mailbox sending each message with `{{.Sender.Name}}` and `{
 You need at least one active mailbox and a contact list. Warm new mailboxes before running cold campaigns from them. See [Deliverability](/guides/deliverability/).
 </Callout>
 
+</Fold>
+
+<Fold>
+
 ## Shared workspace access
 
-Campaigns belong to the workspace. Members with **View campaigns** can read campaign details, steps and activity logs regardless of who created them. **Manage campaigns** allows members to edit settings, create or edit steps, arrange the step canvas and delete steps. Campaign overview metrics require **View analytics**. See [Team and roles](/guides/team-roles/) for permission details.
+Campaigns belong to the workspace. Members with **View campaigns** can read campaign details, steps and activity logs regardless of who created them. **Manage campaigns** allows members to edit settings, create or edit steps and delete steps. Campaign overview metrics require **View analytics**. See [Team and roles](/guides/team-roles/) for permission details.
 
 Select the workspace that owns the campaign before opening it. Creating a campaign does not grant access to it from a different workspace.
+
+</Fold>
+
+<Fold>
+
+## Campaigns list
+
+Campaign names take priority over descriptions in the list. Descriptions use the remaining space and are hidden on small screens. A name that is still too long for the available space is shortened with an ellipsis so the status and actions stay accessible. On devices that support hover, hover over the name to read it in full. The top campaigns list in Analytics also uses the available space for names before shortening them.
+
+</Fold>
+
+<Fold>
 
 ## Create a campaign
 
 **Campaigns** > **New campaign** opens a four-step flow. A campaign is a first email and, optionally, follow-ups that stop for anyone who replies.
 
 1. **Leads**: name the campaign at the top (left blank, it is named after its first list, or "Campaign" and the date; rename it any time), then pick one or more lead lists. Lists are your [segments](/guides/segments/), shown with how many leads each holds; someone on several lists is emailed once, and the total below counts each lead once. **Import new leads** takes you to Contacts to bring in a CSV and keeps the draft for when you return. Picking no list is fine: **Continue without leads** creates the campaign so you can add leads afterwards.
-2. **Emails**: the same editor as the Steps tab, with templates, **Write with AI**, variables, a preview rendered through the send engine and the content score. Add follow-ups here, each sent a number of days after the previous email (and stopping for anyone who replies, when **Stop on reply** is on). **Add the usual two follow-ups** adds two at 3 and 7 days. A follow-up with no subject replies in the same thread. The emails can also be left for the Steps tab, where you can branch them and add A/B variants.
+2. **Emails**: the same editor as the Steps tab, with templates, **Write with AI**, variables, a preview rendered through the send engine and the content score. Selecting a template applies both its saved subject and its body. A template without a subject keeps the email's existing subject. Add follow-ups here, each sent a number of days after the previous email (and stopping for anyone who replies, when **Stop on reply** is on). **Add the usual two follow-ups** adds two at 3 and 7 days. A follow-up with no subject replies in the same thread. The emails can also be left for the Steps tab, where you can branch them and add A/B variants.
 3. **Schedule**: start at launch or on a date, the timezone, sending days and hours, the mailbox tags to send from, and the daily limit per mailbox. Every mailbox in the pool is listed with what it can send: **Ramping up** while it is still graduating from warmup, **Reduced volume** in a watch or throttled health band, **On hold**, **DNS failing** or **Resting** when it will not send. Tracking, UTM parameters, the unsubscribe header and stop on reply are under **Tracking and replies**.
 4. **Review**: the finish date and a day-by-day chart of first emails and follow-ups against what the pool can send, what is setting the pace, and a summary with a link back to each step.
 
@@ -39,9 +109,10 @@ A draft's Overview tab shows what it still needs (leads, an email, senders), eac
 The estimate simulates the campaign day by day against the mailboxes that would send it. It uses the same rules as the scheduler:
 
 - each mailbox's own cap and the campaign's daily limit
-- the warmup graduation ceiling, which starts a freshly warmed mailbox low and adds 5 a day
+- conservative cold pacing, requiring recent real-recipient replies for bounded increases rather than synthetic age
 - the workspace's risk band and each mailbox's health band
 - mailboxes on hold or failing domain authentication, which send nothing
+- mailboxes with an unresolved send outcome or a provider cooldown, which contribute no available sends until the hold is resolved or the cooldown expires
 - sending behaviour profiles
 - the sending window, with the spacing between sends
 
@@ -49,9 +120,29 @@ Warmup keeps running on every warming mailbox, reduced to 5 emails a day while i
 
 Follow-ups that are due go out before new leads start, and the total assumes nobody replies or unsubscribes, so real sequences usually finish sooner. Replies, bounces, new contacts joining a linked segment and changes to a mailbox's health all move the real finish.
 
+An unresolved send from one mailbox does not stop other healthy mailboxes from sending. A follow-up normally uses the address its lead first heard from, but can move to another eligible mailbox when that address is held or cooling. The launch plan and day plan show the hold or cooldown separately from the normal daily limit. An unknown send needs [provider-confirmed resolution](/development/send-safety/#resolving-an-unknown-send); a timeout or missing Sent copy is not proof that it can be retried.
+
+</Fold>
+
+<Fold>
+
+## Images in the editor
+
+Warmbly loads external images through a display-only preview service while you edit. The image must be publicly reachable over HTTPS and 5 MiB or smaller. Images behind a login, private-network images and unavailable images show an unavailable preview. Uploaded images are read directly from the instance's object store.
+
+Your original image URLs, image links and background-image styles stay in saved templates and sent emails. Recipients load images directly from those original URLs, without a Warmbly login. Existing templates use the same preview behavior without a migration. This does not change recipient open or click tracking, or the remote-image consent in your inbox.
+
+</Fold>
+
+<Fold>
+
 ## Plain text only
 
 **Settings** > **Plain text only** sends the campaign without an HTML part. Recipients get the plain-text body with the mailbox's plain-text signature, and because open pixels and wrapped links need HTML, open and click tracking are off for that campaign whatever their toggles say. Test emails respect it too, so what lands in your own inbox is what recipients get.
+
+</Fold>
+
+<Fold>
 
 ## Senders and rotation
 
@@ -90,6 +181,10 @@ Two things can happen to a lead's mailbox, and Warmbly treats them differently:
 
 Removing a mailbox from **Sending accounts** therefore hands its in-flight leads to the remaining mailboxes as each of them reaches its next step. Adding a mailbox never moves an existing lead; it picks up new ones.
 
+</Fold>
+
+<Fold>
+
 ## Sending limits
 
 Warmbly is mailbox-first: safe volume is the sum of each mailbox's budget, not one global limit. Limits stack, and **the smallest always wins**.
@@ -109,6 +204,8 @@ Each of those lines carries a breakdown per mailbox: the cap this campaign gives
 ### Today's sending plan
 
 The campaign overview opens with a one-line **Today's sending plan**: how many emails the campaign sends today, worked out through the same gates a real send goes through, and the one limit that decides it. **Why** opens the working: a list of every limit that took the number below what your settings add up to, the leads, and each mailbox's day. The card re-reads itself once a minute while the page is open.
+
+![A running campaign's overview: today's sends, performance over time and the live activity feed](/guides/campaign-overview.webp)
 
 For an active campaign the plan is worked out in the background and refreshed about once a minute, so opening it is quick no matter how many leads the campaign has. The card shows when the figures were last worked out. Right after you edit, start or stop a campaign, or just after midnight UTC, it shows the last good figures while a fresh plan is worked out, then updates on its own within moments. A campaign you have only just created is worked out the moment you open it.
 
@@ -243,6 +340,10 @@ Every sent count counts emails only: the contact's **Sent** total, a lead's sent
 
 No contact is emailed the same step twice. Each step is recorded as attempted before the send is handed to a worker, so a crash, a restart, or a database hiccup in the moment between the two cannot make the step look unsent and send it again. The trade-off is a step whose outcome is genuinely unknown, when the worker stops responding mid-send: after 30 minutes with no answer the step is treated as a failed attempt, appears in **Needs attention**, and is retried like any other failure.
 
+</Fold>
+
+<Fold>
+
 ## Link tracking and UTM parameters
 
 With **Link tracking** on, every link in the email body becomes its own tracked link, so Warmbly records which link was clicked, not only that one was. Open a contact's **Activity** tab and a click reads **Clicked Pricing**, with the campaign, step and sending mailbox on the row and, expanded, the link's text, its full URL, every UTM parameter it carried, the browser, and whether a person or a scanner followed it. The campaign's live feed names the link the same way, and the `campaign.email_clicked` webhook carries the URL and the link text.
@@ -258,6 +359,10 @@ With **Link tracking** on, every link in the email body becomes its own tracked 
 
 A link that already carries one of these keeps the hand-written value; only the missing parameters are added. Existing query strings and fragments are left exactly as written, and the tags go on the real destination, so they survive the tracking redirect. Anchors, `mailto:` and `tel:` links, and anything that is not `http(s)` are never touched. UTM tagging works with link tracking off too: the tags are added and the link is otherwise left as written. Bare URLs in the plain-text part are tagged as well, numbered `link_1`, `link_2` since they have no text. Change the source, medium and campaign values under **Settings** > **Deliverability**; leave a field empty to use the default.
 
+</Fold>
+
+<Fold>
+
 ## Scheduling
 
 Campaigns send only inside the **weekly sending windows** you define, in the campaign's timezone. Each day is independent, with different hours or several windows per day, set from presets like `Mon-Fri 9-5` or by dragging on the grid (which is Monday-first).
@@ -268,7 +373,13 @@ A step whose turn comes while the window is shut waits for the next one; it is n
 
 Within a window Warmbly spreads the day's emails evenly, adds random jitter, and rounds to natural send times so nothing arrives in obvious bursts. A mailbox with its own timezone is also kept inside its local business hours (`8am` to `8pm`).
 
-The spread covers every mailbox on the campaign, not one at a time: the day's remaining capacity across the whole sending pool is paced across the hours left in the window. Adding a second healthy mailbox roughly doubles how fast a campaign works through its leads, while each mailbox still stays inside its own daily cap, hourly ceiling and minimum gap.
+The spread covers every mailbox on the campaign, not one at a time: the day's remaining capacity across the whole sending pool is paced across the hours left in the window. Adding a second healthy mailbox roughly doubles how fast a campaign works through its leads, while each mailbox still stays inside its own daily cap, hourly ceiling and minimum gap. This holds for large pools too: a single campaign can use the whole daily capacity of a hundred mailboxes, sending several emails a minute across them when the window calls for it, so there is no need to split one sequence across several campaigns to reach it.
+
+**Daily limit per mailbox** caps this campaign separately for each sender, not across the whole pool. With a limit of `50`, one mailbox sending `50` does not use another mailbox's allowance. Campaign send budgets reset at midnight UTC, independently of the timezone used for sending windows. Sends reserved for dispatch count once; campaign re-checks that send no email do not count. The mailbox's own campaign cap, capacity used by other campaigns, shared daily and rolling recipient limits, and safety clamps still apply. Existing campaigns stored with a non-positive limit keep their uncapped campaign-specific allowance, without bypassing mailbox limits; new API settings remain validated from `3` to `5000`.
+
+The campaign limit is a configurable ceiling, not a daily target. Newly connected mailboxes use a [variable sending plan](/guides/sending-behavior/) with a `28`–`32`/day starting range, about `30`, chosen once per local working day. Existing profiles and stored daily plans remain unchanged. A `30` campaign ceiling clips a higher roll to `30`; the default `50` ceiling leaves the whole recommended range available. Other campaigns share the same mailbox plan and mailbox-wide capacity.
+
+If send admission refuses a mailbox at its campaign limit, the activity log reports `CAMPAIGN_DAILY_LIMIT_REACHED`, not a worker outage. An unavailable mailbox workday, closed window, or exhausted daily/hourly sending plan reports `MAILBOX_SENDING_PLAN_DENIED`. The worker rechecks before dispatch, so a reservation cannot bypass the day's plan. A refusal before dispatch gives the lead's reservation back without spending a failed-send attempt; the campaign retries through its normal scheduler.
 
 The spacing sits between sends, never in front of the first one. A campaign you start (or resume) with a lead due sends that lead as soon as one of its mailboxes can (inside the sending window, under its daily cap and past its minimum gap), and the paced gap only begins once that email has gone.
 
@@ -276,13 +387,17 @@ When nothing is due (every lead is inside a step's wait, for example), the campa
 
 ### Delay before the first email
 
-By default a contact's first email is due the moment they enter the campaign. The campaign's **Settings** > **First email** holds it back instead: choose **After a wait**, then pick a preset (`1 hour`, `4 hours`, `1 day`, `2 days`, `3 days`, `1 week`) or a custom amount in minutes, hours or days, up to `90` days. The same control sits on the **Trigger** card at the top of the Steps canvas, and both write one setting.
+By default a contact's first email is due the moment they enter the campaign. The campaign's **Settings** > **First email** holds it back instead: choose **After a wait**, then pick a preset (`1 hour`, `4 hours`, `1 day`, `2 days`, `3 days`, `1 week`) or a custom amount in minutes, hours or days, up to `90` days. The same control is on the **Start** card at the top of the Steps canvas and on the line under it, and all of them write one setting.
 
 The delay counts from when that contact entered the campaign, not from when the campaign started. A contact who joins a [linked segment](/guides/segments/#linking-a-segment-to-a-campaign) three weeks after launch still gets the full delay from their own arrival, which is what makes it useful for a campaign that keeps enrolling people. Once the delay elapses the email goes out in the first sending window that has mailbox capacity, exactly like any other step, so a `2 days` delay on a Friday afternoon lands on Monday morning if you only send on weekdays.
 
 Follow-up spacing is separate and unaffected: that is each step's own wait, set on the connection into it (see [Sequences](/guides/sequences/#wait-and-spacing)). Every lead carries the moment it was enrolled, so turning a delay on does not re-delay people who joined weeks ago: their wait is already long past. Leads enrolled before this setting existed have no recorded moment and fall back to the campaign's creation date, which has the same effect. Changing the delay on a running campaign takes effect on save.
 
 Optional **campaign dates** bound when it may send. Leave both blank to run open-ended. Picking today as the start date means "start now", and clearing a start date on a running campaign removes the wait entirely. Schedule changes on an active campaign take effect immediately: the next send is recomputed on save, so a campaign waiting on a future start date starts sending as soon as you clear or shorten it. Past the end date nothing goes out at all, including a follow-up that came due before it: the campaign finishes instead, and its activity log says it reached its end date.
+
+</Fold>
+
+<Fold>
 
 ## Start and stop
 
@@ -294,6 +409,10 @@ An auto-pause is never silent. It writes a red entry to the campaign's activity 
 
 A finished campaign starts again on its own when a lead is added to it, whether by a linked segment, the API, a form, an integration or an automation, through the same launch checks as pressing play. If a check refuses the restart (the list is a bounce risk, the plan cannot send, too many campaigns are active), the activity log says so and the new leads wait until you fix the cause and press play. Pressing play also works after extending or clearing the end date. If there is genuinely nothing left to send, pressing play turns on **Keep running for new leads** and the campaign stays active, **waiting for leads**, so it never dead-ends on a campaign that only ran out of people to write to; the activity log notes the switch.
 
+</Fold>
+
+<Fold>
+
 ## Duplicate and delete
 
 Every campaign has a **⋯** menu, on its row in the list and in the header of its detail view, with **Edit**, **Duplicate**, **Start** or **Pause**, and **Delete**. Both actions need the **Manage campaigns** permission; a member without it is told which permission is missing instead of the action failing later.
@@ -301,6 +420,10 @@ Every campaign has a **⋯** menu, on its row in the list and in the header of i
 **Duplicate** creates a new draft from the campaign's configuration and opens its settings so you can rename it (it starts as `name (copy)`), pick a different audience, change the copy, or adjust the schedule before starting it. The copy keeps every setting, the steps with their branching, the sending accounts, folders, tags, A/B variants and attachments. It does not keep leads, progress, statistics, activity, the ramp level, an auto-pause, or a start or end date that has already passed. The original is not touched, and the two campaigns are independent from then on. A duplicate counts as a new campaign for the daily creation limit.
 
 **Delete** asks for confirmation that spells out what goes: the campaign, its steps, lead progress and activity. Contacts and emails already sent stay. A running campaign can be deleted directly; the confirmation says so, and sending stops immediately because every task waiting for the campaign is cancelled together with it. The same action is available at the bottom of the campaign's **Settings**. Deletion cannot be undone.
+
+</Fold>
+
+<Fold>
 
 ## Auto-pause guardrails
 
@@ -323,11 +446,19 @@ Setting a rate to `0` turns that rule off. The check runs every 15 minutes, and 
 
 A paused campaign shows the reason and the numbers behind it on the **Auto-pause** section, and everyone on the team who can see campaigns gets a notification. Starting the campaign again clears the marker, but the next check re-evaluates from scratch, so fix the underlying problem first.
 
+</Fold>
+
+<Fold>
+
 ## Live activity
 
 The detail view streams sends, opens, clicks, replies, bounces, and skips as they happen, for every teammate at once. The **Sending** card appears only while an email is actually being handed to a worker, and always names the contact; between sends the panel shows the campaign's progress and the log, not a send in flight. A **Needs attention** panel above it surfaces failures such as a step that could not be scheduled, a send the worker could not complete, or a mailbox whose sending worker is offline; these retry automatically and stay visible so nothing fails silently.
 
 If scheduling stalls on a transient infrastructure hiccup, Warmbly re-seeds within a few minutes. Pausing and resuming forces a fresh start.
+
+</Fold>
+
+<Fold>
 
 ## Content checks
 
@@ -376,30 +507,36 @@ The AI score is deliberately not sampled, so re-checking copy you did not touch 
 
 When the draft has moved on from the analysis on screen, the panel says so and highlights the button, rather than presenting stale findings as current.
 
+</Fold>
+
+<Fold>
+
 ## Testing placement
 
 A content score reads the copy; a placement test sends it. Test any email step from **Placement tests** by choosing the campaign and the step: the copy is rendered the way this campaign sends it (merge fields for its first lead, its opt-out line, its tracking and attachments) and sent from one of its mailboxes to seed inboxes at the major providers, which report whether it reached the inbox, a Gmail tab or spam, or never arrived. Each copy is a send from that mailbox's daily limit.
 
 A **placement monitor** repeats that on a schedule while the campaign runs, every `7` days by default, rotating through the campaign's mailboxes. When a run lands below its alert threshold (`70%` inbox by default), everyone who can view campaigns is notified, and the monitor can pause the campaign too, as an auto-pause you restart yourself. See [inbox placement tests](/guides/placement-tests/).
 
+</Fold>
+
+<Fold>
+
 ## Easing out of warmup
 
-A mailbox that has been warming does not jump straight to its full cold cap. Going from 40 warmup emails a day to 50 cold emails the next morning is the volume jump mailbox providers penalise, so Warmbly ramps into it.
+A diagnostic-history mailbox starts cold sending at a conservative ceiling of five/day. Synthetic traffic and elapsed age do not show that real recipients welcome outreach.
 
-The mailbox starts at a volume set by how long it warmed, then adds `5` a day until it reaches the cap you configured:
+Confirmed human replies to actual campaign recipients in the last seven days permit bounded increases: at most five per clean day, and never more than the confirmed reply count. Complaints clear positive progression. Without reply evidence, the ceiling stays five/day.
 
-| Warmed for | Starts cold at |
-|------------|----------------|
-| under a week | `5`/day |
-| one to two weeks | `10`/day |
-| two weeks or more | `20`/day |
-
-The ramp only ever **lowers** a cap, never raises one, so your configured limit and the campaign's daily limit still bind. A spam placement at Google, Microsoft or Yahoo pauses the climb for the same three days it pauses the warmup ramp, and the paused days are subtracted rather than made up. The mailbox drawer shows today's allowance and roughly when it reaches your cap.
+Configured campaign/mailbox caps, shared daily/rolling recipient limits and negative-feedback holds still bind. This is product pacing, not a universal provider-approved safe volume or proven reputation benefit. Missing evidence leaves full-cap dates unknown rather than projecting synthetic age into readiness. If the feedback lookup fails or omits a known warmed mailbox, its execution, projection and displayed explanation retain the conservative ceiling. A missing lookup does not mean the mailbox never warmed.
 
 <Callout type="info" title="Only for mailboxes that warmed">
 A mailbox that never used warmup is not gated. This exists to smooth the warmup-to-cold transition, not to cap senders who never opted into warmup.
 
 </Callout>
+
+</Fold>
+
+<Fold>
 
 ## The launch check on your list
 
@@ -415,21 +552,27 @@ A refused launch shows why and offers **Launch anyway**, for a list you verified
 
 Above `4%` projected bounce the launch is refused with the number and what to do about it. Between `2%` and `4%` it launches with a warning. The same projection appears in the launch dialog before you click, so a refusal is never a surprise.
 
+</Fold>
+
+<Fold>
+
 ## Safety posture
 
 Defaults are deliberately conservative, aiming at a low complaint rate rather than maximum throughput:
 
 - **Spacing over bursts**: the minimum gap and even distribution keep a natural cadence.
-- **Spread, don't concentrate**: volume splits across many mailboxes and worker IPs.
+- **Honor provider limits**: adding mailboxes or worker IPs is not a way to bypass provider restrictions.
 - **Ramp gradually**: raise volume only while performance stays healthy.
 - **Health gating**: a mailbox in deliverability trouble has its cold volume cut or paused automatically.
 - **Human timing**: mailboxes with [sending behavior](/guides/sending-behavior/) enabled keep randomized working hours, volume, and spacing in their own timezone.
 
-A practical band is `30` to `50`/day for warmed mailboxes, starting newer ones at `10` to `20`.
+Choose configured caps using provider policy, recipient permission and observed campaign outcomes. A configured cap is a maximum, not evidence that the volume is safe or that the mailbox is ready for it.
 
-<Callout type="warn" title="Keep warmup running">
-Warmbly limits a campaign mailbox to at most five warmup messages per day, so campaign traffic stays primary. Warmup cannot compensate for one repetitive template sent to a poorly targeted list: personalize, test meaningful A/B variants, and honor suppression and unsubscribe signals.
+<Callout type="warn" title="Diagnostics are optional">
+When enabled, Warmbly limits a campaign mailbox to at most five diagnostic warmup messages per day, so campaign traffic stays primary. Diagnostic participation is not a proven reputation benefit and cannot compensate for a repetitive template sent to a poorly targeted list: personalize, test meaningful A/B variants, and honor suppression and unsubscribe signals.
 </Callout>
+
+</Fold>
 
 ## Related guides
 

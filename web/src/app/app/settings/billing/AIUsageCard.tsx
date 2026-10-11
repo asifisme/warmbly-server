@@ -6,7 +6,9 @@
 // until you commit.
 
 import React from "react";
-import toast from "react-hot-toast";
+import useBrowseState from "@/hooks/useBrowseState";
+import { aiUsageRangeSchema } from "@/lib/browse-other-lists";
+import toast from "react-hot-toast/headless";
 import { AnimatePresence, motion } from "framer-motion";
 import { Loader2Icon, RotateCcwIcon } from "lucide-react";
 import useCredits from "@/lib/api/hooks/app/subscription/useCredits";
@@ -86,7 +88,7 @@ function toForm(s: AISpendSettings): SpendForm {
 type RangeDays = 7 | 30 | 90;
 
 export default function AIUsageCard() {
-    const [range, setRange] = React.useState<RangeDays>(30);
+    const [range, setRange] = useBrowseState<RangeDays>("settings.billing.ai-usage.range", 30, aiUsageRangeSchema);
     const usage = useCreditUsage(range);
     const settings = useCreditSettings();
     const credits = useCredits();

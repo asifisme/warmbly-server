@@ -2,6 +2,8 @@
 // read from the import itself, so it is the same view for whoever opens it.
 
 import React from "react";
+import useBrowseState from "@/hooks/useBrowseState";
+import { browseText } from "@/lib/browse-contacts-campaigns";
 import { AnimatePresence, motion } from "framer-motion";
 import {
     AlertTriangleIcon,
@@ -17,7 +19,7 @@ import {
     XCircleIcon,
     XIcon,
 } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { useContactImport, CONTACT_IMPORTS_KEY } from "@/lib/api/hooks/app/contacts/useContactImports";
@@ -142,7 +144,7 @@ function Counts({ imp }: { imp: ContactImport }) {
 }
 
 function Finished({ imp, pinned }: { imp: ContactImport; pinned: string[] }) {
-    const [query, setQuery] = React.useState("");
+    const [query, setQuery] = useBrowseState(`contacts:imports:${imp.id}:failures:query`, "", browseText);
     const [downloading, setDownloading] = React.useState(false);
 
     async function download() {

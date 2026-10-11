@@ -17,7 +17,7 @@ import {
     XIcon,
     type LucideIcon,
 } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { ImportColumnMapping, ImportDedupStrategy } from "@/lib/api/client/app/contacts/importContacts";
@@ -480,6 +480,7 @@ export default function ImportWizard({ open, onClose, lockedCampaign, lockedSegm
                                     )}
                                     {!resuming && step === "map" && draft?.preview && (
                                         <MapStep
+                                            importId={draft.id}
                                             preview={draft.preview}
                                             mapping={mapping}
                                             setMapping={setMapping}

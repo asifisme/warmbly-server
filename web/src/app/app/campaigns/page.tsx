@@ -1,6 +1,8 @@
 import { NoAccess } from "@/components/layout/NoAccess";
 import { usePermission } from "@/hooks/usePermission";
 import { useUserProfile } from "@/hooks/context/user";
+import useBrowseState from "@/hooks/useBrowseState";
+import { browseText, campaignStatusSchema, campaignSortSchema } from "@/lib/browse-contacts-campaigns";
 import useCampaigns from "@/lib/api/hooks/app/campaigns/useCampaigns";
 import useStartCampaign from "@/lib/api/hooks/app/campaigns/useStartCampaign";
 import useStopCampaign from "@/lib/api/hooks/app/campaigns/useStopCampaign";
@@ -12,7 +14,7 @@ import AdvisorSummaryBar from "@/components/app/advisor/AdvisorSummaryBar";
 import { useAdvisorEntityIndex } from "@/lib/api/hooks/app/advisor/useAdvisor";
 import LaunchCampaignDialog from "@/components/app/campaigns/LaunchCampaignDialog";
 import CampaignActionsMenu from "@/components/app/campaigns/CampaignActionsMenu";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
 import type Campaign from "@/lib/api/models/app/campaigns/Campaign";
@@ -245,10 +247,10 @@ export default function CampaignsPage() {
     const canView = usePermission("VIEW_CAMPAIGNS");
     const startCampaign = useStartCampaign();
     const stopCampaign = useStopCampaign();
-    const [folder, setFolder] = useState<string>("");
-    const [query, setQuery] = useState<string>("");
-    const [status, setStatus] = useState<StatusFilter>("all");
-    const [sort, setSort] = useState<SortMode>("newest");
+    const [folder, setFolder] = useBrowseState("campaigns:list:folder", "", browseText);
+    const [query, setQuery] = useBrowseState("campaigns:list:query", "", browseText);
+    const [status, setStatus] = useBrowseState<StatusFilter>("campaigns:list:status", "all", campaignStatusSchema);
+    const [sort, setSort] = useBrowseState<SortMode>("campaigns:list:sort", "newest", campaignSortSchema);
     const [newOpen, setNewOpen] = useState<boolean>(false);
     // A draft clicked in the list reopens in the new-campaign flow, for a
     // member who may edit it; anyone else gets the campaign page.
@@ -395,7 +397,7 @@ export default function CampaignsPage() {
                     <PopoverMenuTrigger asChild>
                         <SelectButton
                             icon={<FolderIcon className="w-3.5 h-3.5" />}
-                            label={activeFolder?.title ?? "All folders"}
+                            label={activeFolder?.title ?? (folder ? "Selected folder" : "All folders")}
                         />
                     </PopoverMenuTrigger>
                     <PopoverMenuContent minWidth={200}>
@@ -531,19 +533,21 @@ export default function CampaignsPage() {
                                     <span className="shrink-0 w-3.5 flex items-center justify-center">
                                         <CampaignStatusMark status={cstatus} idle={isIdleCampaign(c)} />
                                     </span>
-                                    <span className="text-[12.5px] text-slate-900 font-medium truncate max-w-[40%]">
-                                        {c.name}
-                                    </span>
-                                    <span className="font-mono text-[10.5px] text-slate-400 tabular-nums shrink-0 hidden sm:inline">
-                                        {c.id.slice(0, 8)}
-                                    </span>
-                                    <AdvisorRowFlag findings={advisor.get(c.id)} subject={c.name} />
-                                    <CampaignFolderChips campaign={c} folders={folders} />
-                                    {c.description && (
-                                        <span className="text-[11.5px] text-slate-400 truncate hidden md:inline">
-                                            {c.description}
+                                    <div className="flex min-w-0 flex-1 items-center gap-3 overflow-hidden">
+                                        <span className="min-w-0 text-[12.5px] text-slate-900 font-medium truncate" title={c.name}>
+                                            {c.name}
                                         </span>
-                                    )}
+                                        <span className="font-mono text-[10.5px] text-slate-400 tabular-nums shrink-0 hidden sm:inline">
+                                            {c.id.slice(0, 8)}
+                                        </span>
+                                        <AdvisorRowFlag findings={advisor.get(c.id)} subject={c.name} />
+                                        <CampaignFolderChips campaign={c} folders={folders} />
+                                        {c.description && (
+                                            <span className="min-w-0 flex-1 text-[11.5px] text-slate-400 truncate hidden md:inline">
+                                                {c.description}
+                                            </span>
+                                        )}
+                                    </div>
                                     <span className={cn("ml-auto text-[10px] uppercase tracking-[0.1em] font-medium shrink-0", campaignDisplayTone(c))}>
                                         {stateLabel}
                                     </span>

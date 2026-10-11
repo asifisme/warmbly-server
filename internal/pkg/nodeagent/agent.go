@@ -32,11 +32,13 @@ import (
 const DefaultInterval = 90 * time.Second
 
 type Config struct {
-	NodeID  uuid.UUID
-	Role    models.NodeRole
-	Name    string
-	Region  string
-	Address string
+	LogToken           string
+	WarmupSendProtocol int
+	NodeID             uuid.UUID
+	Role               models.NodeRole
+	Name               string
+	Region             string
+	Address            string
 	// CapacityTarget is meaningful for workers only. Zero leaves the control
 	// plane's stored/default target unchanged.
 	CapacityTarget float64
@@ -60,6 +62,7 @@ type Config struct {
 }
 
 type Agent struct {
+	logs           *logCapture
 	cfg            Config
 	http           *http.Client
 	started        time.Time
@@ -69,20 +72,28 @@ type Agent struct {
 
 	// lastErr is reported on the next beat and then cleared, so the dashboard
 	// shows what went wrong without it sticking forever.
-	lastErr atomic.Pointer[string]
+	lastErr        atomic.Pointer[string]
+	reloadRequests atomic.Uint64
 }
 
 func New(cfg Config) *Agent {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
 	}
-	return &Agent{cfg: cfg, http: cfg.HTTPClient, started: time.Now()}
+	a := &Agent{cfg: cfg, http: cfg.HTTPClient, started: time.Now()}
+	a.prepareLogs()
+	return a
 }
 
 // ReportError attaches a message to the next heartbeat. Safe from any
 // goroutine; the newest message wins.
 func (a *Agent) ReportError(msg string) {
 	a.lastErr.Store(&msg)
+}
+
+// RequestReload coalesces missing-mailbox recovery into the next acknowledged heartbeat.
+func (a *Agent) RequestReload() {
+	a.reloadRequests.Add(1)
 }
 
 // Run beats until ctx is cancelled, then sends one farewell beat so the node
@@ -96,9 +107,13 @@ func (a *Agent) Run(ctx context.Context) {
 		log.Println("nodeagent: no backend URL or token; heartbeats disabled")
 		return
 	}
+	go a.runLogs(ctx)
 
 	interval := DefaultInterval
-	if reply := a.beat(ctx, true, false); reply != nil {
+	bootPending := true
+	acknowledgedReload := a.reloadRequests.Load()
+	if reply := a.beat(ctx, bootPending, false); reply != nil {
+		bootPending = false
 		interval = paceFrom(reply.LivenessSeconds)
 	}
 
@@ -115,7 +130,10 @@ func (a *Agent) Run(ctx context.Context) {
 			cancel()
 			return
 		case <-ticker.C:
-			if reply := a.beat(ctx, false, false); reply != nil {
+			reload := a.reloadRequests.Load()
+			if reply := a.beat(ctx, bootPending || reload != acknowledgedReload, false); reply != nil {
+				bootPending = false
+				acknowledgedReload = reload
 				if next := paceFrom(reply.LivenessSeconds); next != interval {
 					interval = next
 					ticker.Reset(interval)
@@ -140,16 +158,17 @@ func paceFrom(livenessSeconds int) time.Duration {
 
 func (a *Agent) beat(ctx context.Context, booted, stopping bool) *models.NodeHeartbeatReply {
 	beat := models.NodeHeartbeat{
-		NodeID:         a.cfg.NodeID,
-		Role:           a.cfg.Role,
-		Name:           a.cfg.Name,
-		Region:         a.cfg.Region,
-		Address:        a.address,
-		CapacityTarget: a.cfg.CapacityTarget,
-		Version:        a.cfg.Version,
-		Usage:          a.sampleUsage(),
-		Booted:         booted,
-		Stopping:       stopping,
+		WarmupSendProtocol: a.cfg.WarmupSendProtocol,
+		NodeID:             a.cfg.NodeID,
+		Role:               a.cfg.Role,
+		Name:               a.cfg.Name,
+		Region:             a.cfg.Region,
+		Address:            a.address,
+		CapacityTarget:     a.cfg.CapacityTarget,
+		Version:            a.cfg.Version,
+		Usage:              a.sampleUsage(),
+		Booted:             booted,
+		Stopping:           stopping,
 	}
 	if !stopping {
 		beat.Address = a.publicAddress(ctx)
@@ -184,12 +203,12 @@ func (a *Agent) beat(ctx context.Context, booted, stopping bool) *models.NodeHea
 		return nil
 	}
 
-	var reply models.NodeHeartbeatReply
-	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil {
+	var reply *models.NodeHeartbeatReply
+	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil || reply == nil {
 		return nil
 	}
 	a.applyTarget(reply.DesiredVersion)
-	return &reply
+	return reply
 }
 
 // applyTarget records the version the control plane wants. Writing a file the

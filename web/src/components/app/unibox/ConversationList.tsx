@@ -18,7 +18,8 @@ import { SelectionBar } from "./SelectionBar";
 import { useConversationActions } from "@/hooks/useConversationActions";
 import useUniboxSearch from "@/lib/api/hooks/app/unibox/useUniboxSearch";
 import { useShortcutActions } from "@/hooks/useShortcutActions";
-import useDebouncedValue from "@/hooks/useDebouncedValue";
+import { useAccessRestricted } from "@/hooks/usePermission";
+import useInboxDebouncedValue from "@/hooks/useBrowseDebouncedValue";
 import { useScrollMemory } from "@/hooks/useScrollMemory";
 import { useAppStore } from "@/stores";
 import ComposeButton from "@/components/app/unibox/compose/ComposeButton";
@@ -92,6 +93,7 @@ export function ConversationList({
   onOpenScopeSheet,
 }: ConversationListProps) {
   const [filtersOpen, setFiltersOpen] = React.useState(false);
+  const readOnly = useAccessRestricted();
 
   const searchRef = React.useRef<HTMLInputElement>(null);
   const listRef = React.useRef<HTMLDivElement>(null);
@@ -108,14 +110,17 @@ export function ConversationList({
   // Debounced into the query, immediate in the box: the search text is part of
   // the query key, so a raw binding fires a request and parks a cached page per
   // keystroke.
-  const debouncedSearch = useDebouncedValue(search);
+  const debouncedSearch = useInboxDebouncedValue(search, scopeKey);
+  const debouncedFrom = useInboxDebouncedValue(params.from, scopeKey);
   const merged: UniboxSearchParams = React.useMemo(() => {
-    const next: UniboxSearchParams = { ...params };
+    const next: UniboxSearchParams = { ...params, from: debouncedFrom?.trim() || undefined };
     if (debouncedSearch.trim()) next.query = debouncedSearch.trim();
     return next;
-  }, [params, debouncedSearch]);
+  }, [params, debouncedSearch, debouncedFrom]);
 
-  const q = useUniboxSearch(merged, scopeKey);
+  const emptyScope = params.accountIds?.length === 0 || params.categoryIds?.length === 0;
+  const result = useUniboxSearch(merged, scopeKey, !emptyScope);
+  const q = emptyScope ? { ...result, emails: [], isPending: false, isFetching: false, hasNextPage: false } : result;
   const emails = q.emails;
   const totalShown = emails.length;
   const activeFilters = countUserFilters(params, baseParams);
@@ -379,12 +384,14 @@ export function ConversationList({
         setSelectedAccountId(null);
       },
       listToggleSelect: () => {
+        if (readOnly) return;
         const row = emails[currentIndex()];
         if (!row) return;
         const id = rowKey(row);
         toggleSelect(id, !picked.has(id), false);
       },
       listArchive: () => {
+        if (readOnly) return;
         // The ticked rows when there are any, otherwise the focused one.
         const target = selectedIds.length > 0 ? selectedIds : [];
         if (target.length === 0) {
@@ -459,7 +466,7 @@ export function ConversationList({
               <XIcon className="w-3.5 h-3.5" />
             </button>
           </span>
-        ) : (
+        ) : readOnly ? null : (
           <button
             type="button"
             onClick={() => setSelectMode(true)}
@@ -475,7 +482,7 @@ export function ConversationList({
           open={filtersOpen}
           onOpenChange={setFiltersOpen}
         />
-        <ComposeButton />
+        {!readOnly && <ComposeButton />}
       </div>
 
       <div className="px-3 pb-2 shrink-0 border-b border-slate-200">

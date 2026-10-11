@@ -220,7 +220,7 @@ func (h *Handler) SearchCampaigns(c *gin.Context) {
 	status := c.Query("status")
 	limit := c.Query("limit")
 
-	resp, err := h.CampaignService.Search(c.Request.Context(), orgID.String(), query, cursor, folder, status, limit)
+	resp, err := h.CampaignService.Search(c.Request.Context(), orgID.String(), query, cursor, folder, status, limit, middleware.AllowedCampaigns(c))
 	if err != nil {
 		errx.JSON(c, err)
 		return
@@ -264,7 +264,7 @@ func (h *Handler) GetCampaignsOverview(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.CampaignService.Overview(c.Request.Context(), orgID.String())
+	resp, err := h.CampaignService.Overview(c.Request.Context(), orgID.String(), middleware.AllowedCampaigns(c))
 	if err != nil {
 		errx.JSON(c, err)
 		return
@@ -472,6 +472,13 @@ func (h *Handler) GetCampaignLogs(c *gin.Context) {
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
+	}
+
+	if allowed := middleware.AllowedEmailAccounts(c); allowed != nil {
+		addresses := h.campaignLogAddresses(c, *orgID, result.Data, allowed)
+		for i := range result.Data {
+			result.Data[i] = scopedCampaignLog(result.Data[i], allowed, addresses)
+		}
 	}
 
 	c.JSON(http.StatusOK, result)

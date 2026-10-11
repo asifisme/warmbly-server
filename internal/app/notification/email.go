@@ -130,28 +130,16 @@ func (s *service) flushDueEmails() {
 // hold) and still inside their email budget. Dropped recipients' rows go to
 // skipped; the in-app feed remains their record.
 func (s *service) sendGroupEmail(ctx context.Context, rows []models.Notification) {
-	var stillMember map[uuid.UUID]bool
-	if s.members != nil && rows[0].OrganizationID != nil {
-		if members, err := s.members.GetMembers(ctx, *rows[0].OrganizationID); err == nil {
-			stillMember = map[uuid.UUID]bool{}
-			for _, m := range members {
-				if m.AcceptedAt != nil {
-					stillMember[m.UserID] = true
-				}
-			}
-		}
+	rows = s.keepEligibleEmailMessages(ctx, rows)
+	if len(rows) == 0 {
+		return
 	}
-
 	to := make([]string, 0, len(rows))
 	seen := map[string]bool{}
 	kept := make([]models.Notification, 0, len(rows))
 	dropped := make([]uuid.UUID, 0)
 	budgetOK := map[uuid.UUID]bool{}
 	for _, n := range rows {
-		if stillMember != nil && !stillMember[n.UserID] {
-			dropped = append(dropped, n.ID)
-			continue
-		}
 		if _, checked := budgetOK[n.UserID]; !checked {
 			budgetOK[n.UserID] = !s.overEmailBudget(ctx, n.UserID)
 		}
@@ -186,6 +174,10 @@ func (s *service) sendGroupEmail(ctx context.Context, rows []models.Notification
 // budget, non-security rows skip (the feed keeps them) and only security
 // sign-in alerts still send.
 func (s *service) sendUserEmail(ctx context.Context, userID uuid.UUID, rows []models.Notification) {
+	rows = s.keepEligibleEmailMessages(ctx, rows)
+	if len(rows) == 0 {
+		return
+	}
 	if s.overEmailBudget(ctx, userID) {
 		var capped []uuid.UUID
 		kept := rows[:0:0]
@@ -248,6 +240,31 @@ func notifIDs(rows []models.Notification) []uuid.UUID {
 		ids = append(ids, n.ID)
 	}
 	return ids
+}
+
+func (s *service) keepEligibleEmailMessages(ctx context.Context, rows []models.Notification) []models.Notification {
+	kept := rows[:0:0]
+	var skipped, retry []uuid.UUID
+	for _, n := range rows {
+		allowed, err := s.recipientEligibility(ctx, n.UserID, n.OrganizationID, n.Category)
+		if err == nil && allowed {
+			allowed, err = s.messageEligibility(ctx, n.Category, n.UniboxEmailID)
+		}
+		if err != nil {
+			retry = append(retry, n.ID)
+		} else if allowed {
+			kept = append(kept, n)
+		} else {
+			skipped = append(skipped, n.ID)
+		}
+	}
+	if len(skipped) > 0 {
+		_ = s.repo.SkipEmails(ctx, skipped)
+	}
+	if len(retry) > 0 {
+		_ = s.repo.RequeueEmails(ctx, retry, emailRetryDelay, emailMaxAttempts)
+	}
+	return kept
 }
 
 // emailBody keeps text an outside sender wrote, such as a reply's subject, out

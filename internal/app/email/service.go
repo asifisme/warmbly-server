@@ -149,6 +149,7 @@ type EmailService interface {
 	OAuthAuthorizeURL(provider models.InboxProvider, state, verifier string) (string, *errx.Error)
 	OAuthCallbackOrigin(provider models.InboxProvider) (string, *errx.Error)
 	OAuthConnectWithCode(ctx context.Context, userID string, orgID *uuid.UUID, provider models.InboxProvider, code, verifier string) (*models.Email, *errx.Error)
+	OAuthConnectWithCodeForAccount(ctx context.Context, userID string, orgID *uuid.UUID, provider models.InboxProvider, code, verifier string, accountID uuid.UUID) (*models.Email, *errx.Error)
 	// OAuthAccessToken is a live access token for an OAuth mailbox, refreshed when near expiry.
 	OAuthAccessToken(ctx context.Context, accountID uuid.UUID) (*oauth2.Token, *errx.Error)
 	// LoadAccountOntoWorker assigns a worker if needed and ships the mailbox
@@ -421,7 +422,7 @@ func (s *emailService) GetSyncState(ctx context.Context, orgID, emailID string) 
 	if xerr != nil {
 		return nil, models.SyncPolicy{}, nil, xerr
 	}
-	data, err := s.syncDataFor(ctx, acc.ID)
+	data, err := s.syncDataFor(ctx, acc.ID, true)
 	if err != nil {
 		log.Error().Err(err).Str("email_id", acc.ID.String()).Msg("sync state: policy lookup failed")
 		return nil, models.SyncPolicy{}, nil, errx.InternalError()

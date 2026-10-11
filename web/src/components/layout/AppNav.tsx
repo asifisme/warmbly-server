@@ -38,7 +38,7 @@ import { type ReactElement, type ReactNode, useId, useLayoutEffect, useMemo, use
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { useAppStore } from "@/stores";
 import useFeatureAccess from "@/hooks/useFeatureAccess";
-import { orgHasPermission, usePermission, type PermissionKey } from "@/hooks/usePermission";
+import { orgHasPermission, useAccessRestricted, usePermission, type PermissionKey } from "@/hooks/usePermission";
 import { useUpgradeDialog } from "@/hooks/context/upgrade";
 import { PLAN_ACCENT_CLASSES, getPlan, type PlanID } from "@/lib/plans";
 import AccessLockedDialog from "./AccessLockedDialog";
@@ -92,6 +92,8 @@ interface NavItem {
     requires?: "inbox" | "advanced" | "subscription";
     /** Role gate — when set, sidebar hides the row entirely for non-matching roles. */
     rolesAllowed?: "manage";
+    /** Open to a member restricted to selected resources; every other row is locked for them. */
+    scoped?: boolean;
     /** Permission gate — when the member lacks it, the row shows a lock and a
      *  click pops an access dialog instead of navigating to an empty page. */
     permission?: PermissionKey;
@@ -147,6 +149,7 @@ const topItems: NavItem[] = [
         icon: InboxIcon,
         badgeStoreKey: "unseenCount",
         requires: "inbox",
+        scoped: true,
         permission: "ACCESS_UNIBOX",
         permissionLabel: "Use unified inbox",
     },
@@ -158,10 +161,10 @@ const sections: NavSection[] = [
         label: "Email",
         items: [
             { title: "Accounts", url: "/app/emails", icon: MailIcon, indicator: "accounts", advisorSurface: "emails", permission: "MANAGE_EMAILS", permissionLabel: "Manage mailboxes" },
-            { title: "Campaigns", requires: "subscription", url: "/app/campaigns", icon: MegaphoneIcon, indicator: "campaigns", advisorSurface: "campaigns", permission: "VIEW_CAMPAIGNS", permissionLabel: "View campaigns" },
+            { title: "Campaigns", scoped: true, requires: "subscription", url: "/app/campaigns", icon: MegaphoneIcon, indicator: "campaigns", advisorSurface: "campaigns", permission: "VIEW_CAMPAIGNS", permissionLabel: "View campaigns" },
             { title: "Contacts", requires: "subscription", url: "/app/contacts", icon: UsersIcon, indicator: "contacts", advisorSurface: "contacts", permission: "VIEW_CONTACTS", permissionLabel: "View contacts" },
             { title: "Forms", requires: "subscription", url: "/app/forms", icon: ClipboardListIcon, permission: "VIEW_CONTACTS", permissionLabel: "View contacts" },
-            { title: "Analytics", requires: "subscription", url: "/app/analytics", icon: BarChart3Icon, indicator: "analytics", permission: "VIEW_ANALYTICS", permissionLabel: "View analytics" },
+            { title: "Analytics", scoped: true, requires: "subscription", url: "/app/analytics", icon: BarChart3Icon, indicator: "analytics", permission: "VIEW_ANALYTICS", permissionLabel: "View analytics" },
             { title: "Deliverability", requires: "subscription", url: "/app/deliverability", icon: ShieldCheckIcon, advisorSurface: "deliverability", permission: "VIEW_ANALYTICS", permissionLabel: "View analytics" },
             { title: "Placement tests", requires: "subscription", url: "/app/placement", icon: MailCheckIcon, permission: "VIEW_ANALYTICS", permissionLabel: "View analytics" },
         ],
@@ -250,6 +253,7 @@ function NavRow({ item, collapsed = false }: { item: NavItem; collapsed?: boolea
     const unseen = useAppStore((s) => s.unseenCount);
     const access = useFeatureAccess();
     const hasItemPermission = usePermission(item.permission ?? "VIEW_CAMPAIGNS");
+    const restricted = useAccessRestricted();
     const [deniedOpen, setDeniedOpen] = useState(false);
     const upgradeDialog = useUpgradeDialog();
     const active = isNavItemActive(pathname, item);
@@ -263,12 +267,15 @@ function NavRow({ item, collapsed = false }: { item: NavItem; collapsed?: boolea
     // Permission-gated items the member lacks: render a locked row that pops
     // an access dialog on click, so the feature is visibly unavailable (a
     // lock) rather than a blank/empty page that reads as "no data".
-    const accessDenied = !!item.permission && !hasItemPermission;
+    // A restricted member reaches only the scoped rows, whatever their role holds.
+    const outOfScope = restricted && !item.scoped;
+    const accessDenied = outOfScope || (!!item.permission && !hasItemPermission);
     if (accessDenied) {
         return (
             <>
                 <NavTip collapsed={collapsed} label={`${item.title} · no access`}>
                 <button
+                    data-tour={item.url}
                     type="button"
                     onClick={() => setDeniedOpen(true)}
                     className={cn(
@@ -290,6 +297,7 @@ function NavRow({ item, collapsed = false }: { item: NavItem; collapsed?: boolea
                     onClose={() => setDeniedOpen(false)}
                     feature={item.title}
                     permissionLabel={item.permissionLabel ?? "the required"}
+                    reason={outOfScope ? "scope" : "permission"}
                 />
             </>
         );
@@ -314,6 +322,7 @@ function NavRow({ item, collapsed = false }: { item: NavItem; collapsed?: boolea
         return (
             <NavTip collapsed={collapsed} label={`${item.title} · ${planBadge.label} plan`}>
             <button
+                data-tour={item.url}
                 type="button"
                 onClick={() => upgradeDialog.open({ feature: item.title, minPlan })}
                 className={cn(
@@ -359,6 +368,7 @@ function NavRow({ item, collapsed = false }: { item: NavItem; collapsed?: boolea
     return (
         <NavTip collapsed={collapsed} label={item.title}>
             <Link
+                data-tour={item.url}
                 to={item.url}
                 aria-current={active ? "page" : undefined}
                 title={!collapsed && planBadge ? `${item.title} · ${planBadge.label} plan` : undefined}
@@ -675,7 +685,9 @@ function TemplatesActivity() {
 // Analytics row: a live, compact tally of emails sent this period — the headline
 // throughput metric, surfaced right in the nav. From the org-wide usage overview.
 function AnalyticsActivity() {
-    const { data } = useUsageOverview("day");
+    // The usage overview counts the whole workspace, which a restricted member does not reach.
+    const restricted = useAccessRestricted();
+    const { data } = useUsageOverview("day", !restricted);
     const sent = data?.campaigns?.emails_sent ?? 0;
     return (
         <TabStat
@@ -1291,6 +1303,7 @@ export function AppNav({ open = false, onClose }: { open?: boolean; onClose?: ()
                 then none while the cursor moves between rows. */}
             <TooltipProvider delayDuration={120} skipDelayDuration={500}>
             <aside
+                data-tour-nav
                 className={cn(
                     // Mobile: off-canvas drawer that slides in from the left.
                     "fixed inset-y-0 left-0 z-50 w-64 flex flex-col text-slate-900 bg-white shadow-2xl transition-transform duration-300 ease-out",
@@ -1350,7 +1363,7 @@ export function AppNav({ open = false, onClose }: { open?: boolean; onClose?: ()
 
             <div className="border-t border-slate-200/60 py-1 shrink-0">
                 <NavRow
-                    item={{ title: "Settings", url: "/app/settings", icon: SettingsIcon }}
+                    item={{ title: "Settings", url: "/app/settings", icon: SettingsIcon, scoped: true }}
                     collapsed={iconOnly}
                 />
                 <CollapseToggle collapsed={iconOnly} onToggle={toggleSidebar} />

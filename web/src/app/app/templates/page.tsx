@@ -6,6 +6,10 @@
 // page stays accessible without a dnd lib.
 
 import React from "react";
+import useBrowseState from "@/hooks/useBrowseState";
+import { browseSearchSchema } from "@/lib/browse-other-lists";
+import { UserContext } from "@/hooks/context/user";
+import { useAppStore } from "@/stores/useAppStore";
 import {
     CopyIcon,
     FileTextIcon,
@@ -19,7 +23,7 @@ import {
     ChevronUpIcon,
     ChevronDownIcon,
 } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { AnimatePresence, motion } from "framer-motion";
 import {
     Page,
@@ -62,8 +66,14 @@ import { Checkbox } from "@/components/ui/checkbox";
 const VARIABLE_HINTS = VARIABLES;
 
 export default function TemplatesPage() {
-    const [search, setSearch] = React.useState("");
-    const [debouncedSearch, setDebouncedSearch] = React.useState("");
+    const userID = React.useContext(UserContext)?.user.id;
+    const organizationID = useAppStore((state) => state.currentOrganization?.id ?? "personal");
+    return <TemplatesList key={`${userID}:${organizationID}`} />;
+}
+
+function TemplatesList() {
+    const [search, setSearch] = useBrowseState("templates.list.search", "", browseSearchSchema);
+    const [debouncedSearch, setDebouncedSearch] = React.useState(search);
     React.useEffect(() => {
         const t = setTimeout(() => setDebouncedSearch(search), 200);
         return () => clearTimeout(t);

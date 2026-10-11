@@ -36,7 +36,7 @@ Add the server with just its URL, and the client runs the OAuth flow on first us
 ```
 
 <Callout type="info" title="What you are approving">
-The consent screen shows exactly which scopes the client will get: the ones it asks for that your role in the workspace covers, so a connected client never does more than you could yourself. Sending real mail is never one of them: `SEND_CAMPAIGNS` and API-key management are excluded from OAuth-connected MCP clients by design, and the assistant only ever drafts. You can revoke a connected client at any time from your dashboard under connected apps.
+The consent screen marks a self-registered client as **Not affiliated with Warmbly**, names where approving sends access, and shows exactly which scopes the client will get: the ones it asks for that your role in the workspace covers, so a connected client never does more than you could yourself. Sending real mail is never one of them: `SEND_CAMPAIGNS` and API-key management are excluded from OAuth-connected MCP clients by design, and the assistant only ever drafts. You can revoke a connected client at any time from your dashboard under connected apps.
 </Callout>
 
 ## Connect with an API key
@@ -109,7 +109,7 @@ Every tool is gated by its API permission. `tools/list` returns only the tools y
 | `create_campaign_draft` | Create a draft campaign | `WRITE_CAMPAIGNS` |
 | `set_campaign_status` | Start or stop a campaign | `SEND_CAMPAIGNS` |
 | `set_lead_hold` | Hold or resume one contact's flow in one campaign, without unsubscribing them | `WRITE_CAMPAIGNS` |
-| `get_dashboard_analytics` | Org-wide sending stats for a period | `READ_ANALYTICS` |
+| `get_dashboard_analytics` | Sending stats for a period, org-wide or for chosen campaigns and campaign folders | `READ_ANALYTICS` |
 | `list_mailboxes` | Sender mailboxes with health + warmup state | `READ_ANALYTICS` |
 | `list_placement_tests` / `get_placement_test` | Inbox placement tests and where each copy landed | `READ_ANALYTICS` |
 | `run_placement_test` | Send a step or template to the seed inboxes from one mailbox | `SEND_CAMPAIGNS` |

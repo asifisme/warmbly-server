@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { FlameIcon, XIcon } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { useQueryClient } from "@tanstack/react-query";
 import { Label, NumberInput, TextInput } from "@/components/ui/field";
 import { OptionSelect } from "@/components/app/campaigns/preferences/components/CampaignPreferenceBoolBox";
@@ -112,7 +112,7 @@ export default function BulkWarmupDialog({
                                 <div className="min-w-0 flex-1">
                                     <div className="text-[13px] font-medium text-slate-900">Start warmup</div>
                                     <div className="text-[11px] text-slate-400">
-                                        {n} mailbox{n > 1 ? "es" : ""} selected
+                                        {n} mailbox{n > 1 ? "es" : ""} selected. Starting authorizes disclosed automated sending; Off mailboxes also enable receiving tests. This is not organic engagement or a proven reputation benefit.
                                     </div>
                                 </div>
                                 <button

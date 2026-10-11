@@ -58,6 +58,7 @@ type UserRepository interface {
 	SetFreeTrialUsed(ctx context.Context, userID uuid.UUID) error
 	UpdateOnboarding(ctx context.Context, userID uuid.UUID, firstName, lastName, referralSource, role, teamSize string) error
 	MarkOnboarded(ctx context.Context, userID uuid.UUID) (time.Time, error)
+	MarkProductTourCompleted(ctx context.Context, userID uuid.UUID) (time.Time, error)
 	UpdateProfile(ctx context.Context, userID uuid.UUID, firstName, lastName string) error
 	UpdateAvatar(ctx context.Context, userID uuid.UUID, avatarURL *string) error
 
@@ -100,6 +101,14 @@ var ErrUserEmailTaken = errors.New("an account with this email address already e
 var ErrUserNotFound = errors.New("no such account")
 
 func (r *userRepository) CreateUser(ctx context.Context, email *mail.Address, passwordHash string) (*models.User, error) {
+	return createUser(ctx, r.DB, email, passwordHash)
+}
+
+type userCreator interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func createUser(ctx context.Context, store userCreator, email *mail.Address, passwordHash string) (*models.User, error) {
 	id := uuid.New()
 
 	// The stored form is decided here, not by the caller, because the account
@@ -132,7 +141,7 @@ func (r *userRepository) CreateUser(ctx context.Context, email *mail.Address, pa
 		now,
 	}
 
-	_, err := r.DB.Exec(
+	_, err := store.Exec(
 		ctx,
 		q,
 		params...)
@@ -162,7 +171,7 @@ func (r *userRepository) getUser(ctx context.Context, key string, value any) (*m
 	var u models.User
 
 	q := fmt.Sprintf(
-		`SELECT u.id, u.email, u.first_name, u.last_name, u.avatar_url, u.referral_source, u.onboarding_completed_at,
+		`SELECT u.id, u.email, u.first_name, u.last_name, u.avatar_url, u.referral_source, u.onboarding_completed_at, u.product_tour_completed_at,
 		   u.max_organizations, u.free_trial_used, u.admin_permissions,
 		   u.deletion_scheduled_at, u.deletion_scheduled_for, u.undo_send_seconds,
 		   u.updated_at, u.created_at,
@@ -183,7 +192,7 @@ func (r *userRepository) getUser(ctx context.Context, key string, value any) (*m
 		ctx,
 		q,
 		params...,
-	).Scan(&u.ID, &u.Email, &u.FirstName, &u.LastName, &u.AvatarURL, &u.ReferralSource, &u.OnboardingCompletedAt,
+	).Scan(&u.ID, &u.Email, &u.FirstName, &u.LastName, &u.AvatarURL, &u.ReferralSource, &u.OnboardingCompletedAt, &u.ProductTourCompletedAt,
 		&u.MaxOrganizations, &u.FreeTrialUsed, &adminPerm,
 		&u.DeletionScheduledAt, &u.DeletionScheduledFor, &u.UndoSendSeconds,
 		&u.UpdatedAt, &u.CreatedAt, &u.Roles)
@@ -233,6 +242,14 @@ func (r *userRepository) UpdateOnboarding(ctx context.Context, userID uuid.UUID,
 // keeping an earlier completion time when there is one.
 func (r *userRepository) MarkOnboarded(ctx context.Context, userID uuid.UUID) (time.Time, error) {
 	const q = `UPDATE users SET onboarding_completed_at=COALESCE(onboarding_completed_at, NOW()), updated_at=NOW() WHERE id=$1 RETURNING onboarding_completed_at`
+	var at time.Time
+	err := r.DB.QueryRow(ctx, q, userID).Scan(&at)
+	return at, err
+}
+
+// MarkProductTourCompleted records that the tour was finished or skipped, keeping the first time.
+func (r *userRepository) MarkProductTourCompleted(ctx context.Context, userID uuid.UUID) (time.Time, error) {
+	const q = `UPDATE users SET product_tour_completed_at=COALESCE(product_tour_completed_at, NOW()), updated_at=NOW() WHERE id=$1 RETURNING product_tour_completed_at`
 	var at time.Time
 	err := r.DB.QueryRow(ctx, q, userID).Scan(&at)
 	return at, err
@@ -355,10 +372,22 @@ func (r *userRepository) SetLoginCodeExempt(ctx context.Context, id uuid.UUID, e
 // likely to have been forgotten is the one that has been there longest.
 func (r *userRepository) ListLoginCodeExempt(ctx context.Context) ([]models.LoginCodeExemption, error) {
 	rows, err := r.DB.Query(ctx, `
-		SELECT id, email, login_code_exempt_reason, login_code_exempt_at, password_expires_at
-		FROM users
-		WHERE login_code_exempt
-		ORDER BY login_code_exempt_at NULLS FIRST`)
+		SELECT u.id, u.email, u.login_code_exempt_reason, u.login_code_exempt_at, u.password_expires_at,
+		       workspace.id, seeded.created_at
+		FROM users u
+		LEFT JOIN LATERAL (
+			SELECT o.id FROM organizations o
+			WHERE o.owner_user_id = u.id AND o.category = 'test'
+			ORDER BY o.created_at, o.id LIMIT 1
+		) workspace ON true
+		LEFT JOIN LATERAL (
+			SELECT a.created_at FROM admin_audit_logs a
+			WHERE a.target_type = 'organization' AND a.target_id = workspace.id
+			  AND a.action = 'seed_tester_workspace'
+			ORDER BY a.created_at LIMIT 1
+		) seeded ON true
+		WHERE u.login_code_exempt
+		ORDER BY u.login_code_exempt_at NULLS FIRST`)
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +396,7 @@ func (r *userRepository) ListLoginCodeExempt(ctx context.Context) ([]models.Logi
 	out := []models.LoginCodeExemption{}
 	for rows.Next() {
 		var e models.LoginCodeExemption
-		if err := rows.Scan(&e.UserID, &e.Email, &e.Reason, &e.GrantedAt, &e.PasswordExpiresAt); err != nil {
+		if err := rows.Scan(&e.UserID, &e.Email, &e.Reason, &e.GrantedAt, &e.PasswordExpiresAt, &e.TestWorkspaceID, &e.SampleDataSeededAt); err != nil {
 			return nil, err
 		}
 		out = append(out, e)

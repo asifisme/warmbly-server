@@ -9,6 +9,8 @@ The admin panel is the operator's view of an instance: every worker, user, organ
 
 The panel runs on `:5174` in the default stack (`http://localhost:5174` on a stock install, or the host you proxied to it). Sign in with the same account as the dashboard. The first owner holds every admin bit from the moment they claim the instance, and `warmblyctl user create --admin` creates a further account that already holds them. A page the account has no bit for says which bit it needs instead of rendering.
 
+A completed admin sign-in discards previously cached operator data and permissions before storing the new session. An unsuccessful sign-in or a pending email-code/second-factor step does not replace the session.
+
 <Callout type="warn" title="Two-factor authentication is required">
 Every admin route refuses a session that did not present a second factor. Turn on 2FA or add a passkey under **Settings > Security** in the dashboard, then sign in again; the panel says so rather than failing silently.
 
@@ -48,6 +50,12 @@ The panel is dark by default. The account menu at the bottom of the sidebar (you
 
 The landing page. Instance-wide counters and their trends, acquisition by channel, and a strip of open instance problems at the top, which is the same list as the Findings tab of [Setup and health](/development/instance-health/).
 
+**Operational monitoring** adds recorded failure evidence, unverified recovery, safety restrictions, missing telemetry and measured backlogs. Positive Kafka lag or JetStream pending/ack-pending/redelivered counts stay visible separately, even when their backend condition is unknown. These are observations, not proof of an outage or provider delivery. Counts are per metric and can overlap; the attention count is a count of signals, not customers or failed messages.
+
+The strip displays coverage gaps, stale sources and unknown/no-recent-evidence sources, rather than hiding a failed request behind an empty panel. **All operational details** opens Setup and health's Operations tab. The snapshot and each investigation link require their own admin permission; hidden sections cannot be recovered by changing tabs. See [monitoring permissions and evidence](/development/instance-health/#operational-monitoring).
+
+Relative ages use your browser's current clock when a snapshot arrives, with periodic updates between requests. A genuinely future-dated observation still has unknown age; it is not fresh evidence of sending or recovery.
+
 ## Operations
 
 | Page | What it answers |
@@ -58,10 +66,12 @@ The landing page. Instance-wide counters and their trends, acquisition by channe
 | **Sync** | The platform copy of each mailbox's backfill progress and fair-use throttle, with clear-throttle and restart-backfill. The budgets it enforces are the four `sync.*` values under [Configuration > Settings](/development/configuration/#settings-stored-in-the-database); the worker-side engine is the sync governor described under [anti-abuse layers](/development/architecture/#anti-abuse-layers) |
 | **Warmup** | The pools, the blocked list, and the block and unblock history |
 | **Warmup appeals** | Appeals from blocked mailboxes, to approve or reject |
-| **Warmup content** | The generated and reviewed warmup conversation bank, its library and generation jobs |
+| **Warmup content** | The generated and reviewed [diagnostic conversation bank](/development/warmup-generation/), effective generation controls, library and generation jobs. Changing effective controls requires `manage_settings`; existing library reads still require `view_warmup_pool` |
+
+Mailbox diagnostic participation, sender/recipient flags and shared/rolling limits are organization-scoped mailbox fields, not new admin-panel switches. Use the existing authorized mailbox PATCH; no new UI is implied. An operator-reviewed `send_recovery_resolution` binds the current held task/reason and definite repair/provider evidence, never an unknown send. See [send safety](/development/send-safety/).
 | **Seed panel** | The instance's placement seed inboxes by provider, adding and removing them, every workspace's recent [placement tests](/guides/placement-tests/) with their results, and an operator test that counts against no allowance |
 | **Campaigns** | Every campaign on the instance with its state and owner |
-| **Sends** | In-flight reservations no worker has answered, and the reclaimer that resolves them after 30 minutes; dead letters with replay; task failures; customer webhook delivery health, with reclaim |
+| **Sends** | In-flight reservations no worker has answered, and the reclaimer that resolves them after 30 minutes; dead letters with replay limited to non-sending campaign wakeups; task failures; customer webhook delivery health, with reclaim |
 
 ## Accounts
 
@@ -121,7 +131,7 @@ Reading the tabs needs `view_organizations`; every action needs `manage_organiza
 
 | Page | What it answers |
 |---|---|
-| **Setup and health** | Two tabs. **Findings** is the [instance health](/development/instance-health/) check list, and the sidebar badge counts its open findings. **Services** is the old System Status page: the per-service probes and the platform mail card with its connection check and send test |
+| **Setup and health** | Three tabs. **Findings** is the [instance health](/development/instance-health/) check list, and the sidebar badge counts its errors and warnings, not operational signals. **Services** holds scoped service reachability probes and the platform mail card. **Operations** holds read-only measurements, coverage, affected counts, evidence age, waits and permission-gated investigation links |
 | **Configuration** | Four tabs. **Settings** is the database-backed settings document; **Notifications** is the [operator notification](/development/operator-notifications/) channels; **Environment** is the read-only [configuration reference](/development/configuration/) view of what the backend resolved; **Effective limits** lists the compiled pacing constants |
 | **Transfers** | Workspace export and import for any organization, from the operator side, with the same archives as `warmblyctl org export` and `org import`. A whole-instance backup stays `warmblyctl backup` and `restore` |
 
@@ -131,7 +141,7 @@ Reading the tabs needs `view_organizations`; every action needs `manage_organiza
 |---|---|
 | Overview, Live events | none beyond signing in as an admin |
 | Workers, Fleet | `view_workers` |
-| Mailboxes, Sync, Users | `view_users` |
+| Mailboxes, Sync, Users, Testers | `view_users` |
 | Warmup, Warmup content, Seed panel | `view_warmup_pool` (changing seeds or running a test needs `manage_warmup_bans`) |
 | Warmup appeals | `review_appeals` |
 | Campaigns, Sends | `view_campaigns` |
@@ -142,6 +152,8 @@ Reading the tabs needs `view_organizations`; every action needs `manage_organiza
 | Configuration | `manage_settings` |
 
 Detail pages need the same bit as the list they open from. Actions inside a page can need more than the page itself: reading an organization's abuse posture or the Outreach list needs `view_organizations`, while changing a posture or sending outreach needs `manage_organizations`, as [accounts and access](/development/accounts-and-access/#workspace-abuse-posture) lists.
+
+On **Admins > Testers**, `manage_testers` allows creating or revoking reviewer accounts and adding [sample data](/development/accounts-and-access/#adding-sample-data) to active dedicated Test workspaces. The confirmation lists what will be added; a seeded row shows its timestamp. It never creates a mailbox or sends email, and it cannot populate a customer workspace that a tester joined.
 
 ## See also
 

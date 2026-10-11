@@ -73,7 +73,17 @@ type SyncCursor struct {
 	// PageToken is Gmail's messages.list continuation.
 	PageToken string `json:"page_token,omitempty" avro:"page_token"`
 	// Folders is the per-folder position for IMAP and Graph.
-	Folders map[string]SyncFolderCursor `json:"folders,omitempty" avro:"folders"`
+	Folders        map[string]SyncFolderCursor `json:"folders,omitempty" avro:"folders"`
+	GoogleRecovery *GoogleHistoryRecovery      `json:"google_recovery,omitempty" avro:"google_recovery"`
+}
+
+// GoogleHistoryRecovery holds a baseline until additions and stored-message state are reconciled.
+type GoogleHistoryRecovery struct {
+	HistoryID    uint64    `json:"history_id" avro:"history_id"`
+	Since        time.Time `json:"since" avro:"since"`
+	PageToken    string    `json:"page_token,omitempty" avro:"page_token"`
+	MessagesDone bool      `json:"messages_done" avro:"messages_done"`
+	StoredAfter  string    `json:"stored_after,omitempty" avro:"stored_after"`
 }
 
 // SyncState is what the platform knows about a mailbox's sync: backfill
@@ -81,8 +91,9 @@ type SyncCursor struct {
 // owns the live copy and relays every change as SYNC_STATE; the consumer
 // persists it and the loader hands it back on the next (re)assignment.
 type SyncState struct {
-	BackfillStatus SyncBackfillStatus `json:"backfill_status" avro:"backfill_status"`
-	BackfillCursor SyncCursor         `json:"backfill_cursor" avro:"backfill_cursor"`
+	TransportGeneration uuid.UUID          `json:"transport_generation,omitempty" avro:"transport_generation"`
+	BackfillStatus      SyncBackfillStatus `json:"backfill_status" avro:"backfill_status"`
+	BackfillCursor      SyncCursor         `json:"backfill_cursor" avro:"backfill_cursor"`
 	// BackfillSynced counts messages the import has stored so far.
 	BackfillSynced int `json:"backfill_synced" avro:"backfill_synced"`
 	// BackfillSince is the cutoff the running import uses; fixed at start so

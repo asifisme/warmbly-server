@@ -3,7 +3,7 @@
 // warms. Members who manage mailboxes see the link and use it for their own
 // mailboxes (`manageable`); linking it is the instance administrator's.
 
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import useAuthConfig from "@/lib/api/hooks/auth/useAuthConfig";
 import { useInstanceAdmin, usePermission } from "@/hooks/usePermission";
 import { useCloudLinkMailboxes, useCloudLinkStatus } from "@/lib/api/hooks/app/cloudlink/useCloudLink";
@@ -27,17 +27,22 @@ export default function useCloudPool() {
 
     const enrolledCount = useMemo(() => (mailboxes.data ?? []).filter((r) => r.enrolled).length, [mailboxes.data]);
     const plan: PoolLinkPlan | undefined = status.data?.info?.plan;
+    const rowFor = useCallback((id: string) => byId.get(id), [byId]);
 
     return {
         selfHosted,
         manageable,
         connected,
+        workspaceConnected: connected && !!status.data?.link?.organization_id,
         reachable: status.data?.reachable === true,
         orgName: status.data?.link?.organization_name ?? "",
         plan,
         enrolledCount,
-        rowFor: (id: string) => byId.get(id),
+        rowFor,
         isEnrolled: (id: string) => byId.get(id)?.enrolled === true,
-        loading: manageable && (status.isLoading || (connected && mailboxes.isLoading)),
+        loading: manageable && (status.isPending || (connected && mailboxes.isPending)),
+        refreshing: manageable && (status.isFetching || (connected && mailboxes.isFetching)),
+        unavailable: manageable && (status.isError || (connected && mailboxes.isError)),
+        observedAt: connected ? mailboxes.dataUpdatedAt : 0,
     };
 }

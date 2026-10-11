@@ -262,10 +262,12 @@ func (h *Handler) GetUniboxEmail(c *gin.Context) {
 		return
 	}
 
-	resp, xerr := h.UniboxService.GetByID(
-		c.Request.Context(),
-		*orgID, mid,
-	)
+	// A restricted member reads the inbox without changing its shared read state.
+	get := h.UniboxService.GetByID
+	if middleware.IsScopeRestricted(c) {
+		get = h.UniboxService.Peek
+	}
+	resp, xerr := get(c.Request.Context(), *orgID, mid)
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
@@ -328,10 +330,10 @@ func (h *Handler) GetUniboxThread(c *gin.Context) {
 	cursor := c.Query("cursor")
 	limit := c.Query("limit")
 
-	resp, xerr := h.UniboxService.GetByThread(
+	resp, xerr := h.UniboxService.GetByThreadWithin(
 		c.Request.Context(),
 		*orgID, eid,
-		threadID, limit, cursor,
+		threadID, limit, cursor, restrictedMailboxes(c),
 	)
 	if xerr != nil {
 		errx.Handle(c, xerr)
@@ -365,12 +367,7 @@ func (h *Handler) GetUniboxThreadLabels(c *gin.Context) {
 		return
 	}
 
-	if xerr := h.uniboxMessagesAllowed(c, *orgID, nil, []string{threadID}); xerr != nil {
-		errx.Handle(c, xerr)
-		return
-	}
-
-	labels, xerr := h.UniboxService.ListThreadLabels(c.Request.Context(), *orgID, threadID)
+	labels, xerr := h.UniboxService.ListThreadLabelsWithin(c.Request.Context(), *orgID, threadID, restrictedMailboxes(c))
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
@@ -612,9 +609,10 @@ func (h *Handler) UniboxReply(c *gin.Context) {
 	// The composer only knows the provider thread id, but a thread id is
 	// meaningless outside the sending mailbox: the recipient's client threads
 	// on In-Reply-To/References. Resolve the parent Message-ID here so a reply
-	// nests for them too, without needing a client change.
+	// nests for them too, without needing a client change. A forward answers
+	// nobody: it is filed into the forwarded message's conversation instead.
 	inReplyTo := req.InReplyTo
-	if len(inReplyTo) == 0 && req.ThreadID != "" {
+	if len(inReplyTo) == 0 && req.ThreadID != "" && forward == nil {
 		if parentMessageID, xerr := h.UniboxService.LatestMessageIDInThread(c.Request.Context(), *orgID, req.ThreadID); xerr == nil && mailhdr.ValidMessageID(parentMessageID) {
 			inReplyTo = []string{parentMessageID}
 		}
@@ -841,7 +839,7 @@ func (h *Handler) ListUniboxScheduled(c *gin.Context) {
 	}
 
 	if threadID := c.Query("thread_id"); threadID != "" {
-		items, xerr := h.UniboxService.ListScheduledByThread(c.Request.Context(), *orgID, threadID, middleware.GetAPIKeyAllowedEmailAccounts(c))
+		items, xerr := h.UniboxService.ListScheduledByThread(c.Request.Context(), *orgID, threadID, middleware.AllowedEmailAccounts(c))
 		if xerr != nil {
 			errx.Handle(c, xerr)
 			return
@@ -850,7 +848,7 @@ func (h *Handler) ListUniboxScheduled(c *gin.Context) {
 		return
 	}
 
-	items, xerr := h.UniboxService.ListScheduled(c.Request.Context(), *orgID, middleware.GetAPIKeyAllowedEmailAccounts(c))
+	items, xerr := h.UniboxService.ListScheduled(c.Request.Context(), *orgID, middleware.AllowedEmailAccounts(c))
 	if xerr != nil {
 		errx.Handle(c, xerr)
 		return
@@ -877,7 +875,7 @@ func (h *Handler) CancelUniboxScheduled(c *gin.Context) {
 		return
 	}
 
-	if xerr := h.UniboxService.CancelScheduled(c.Request.Context(), *orgID, taskID, middleware.GetAPIKeyAllowedEmailAccounts(c)); xerr != nil {
+	if xerr := h.UniboxService.CancelScheduled(c.Request.Context(), *orgID, taskID, middleware.AllowedEmailAccounts(c)); xerr != nil {
 		errx.Handle(c, xerr)
 		return
 	}

@@ -81,7 +81,7 @@ func stagedCap(p *campaignPass, acct models.Email) (stages [5]int, limitedBy str
 	}
 	// Graduation ceiling: a mailbox at its warmup ceiling must not reach the
 	// full cold cap the day it joins a campaign.
-	clamp(3, coldCeilingFor(p.coldRamp[acct.ID], cur), capByGraduation)
+	clamp(3, coldCeilingFor(p.coldRamp[acct.ID].WithKnownWarmup(acct.Warmup), cur), capByGraduation)
 	if m := p.risk.CapMultiplier(); m < 1 {
 		risked := int(float64(cur)*m + 0.5)
 		// A restricted organization still sends, just far less. Zeroing it
@@ -122,8 +122,8 @@ func (s *schedulerService) planMailbox(ctx context.Context, pass *campaignPass, 
 	d.byRamp = step(stages[2])
 	d.byGraduation = step(stages[3])
 	d.byRisk = step(stages[4])
-	if st, ok := pass.coldRamp[acct.ID]; ok && stages[3] < stages[2] {
-		d.graduation = warmupramp.Notice(st.WarmupStartedAt, st.ColdRampStartedAt, st.Placements, stages[2], now)
+	if st := pass.coldRamp[acct.ID].WithKnownWarmup(acct.Warmup); stages[3] < stages[2] {
+		d.graduation = warmupramp.Notice(st.WarmupStartedAt, st.ColdRampStartedAt, st.Placements, stages[2], now, st.ConfirmedReplies)
 	}
 
 	// Standing gates: authentication, cold rotation, warmup health. Asked with
@@ -144,6 +144,13 @@ func (s *schedulerService) planMailbox(ctx context.Context, pass *campaignPass, 
 			d.state = models.MailboxPlanDomainAuth
 		case gateResting:
 			d.state = models.MailboxPlanResting
+		case gateRecovery:
+			d.state = models.MailboxPlanRecovery
+		case gateCooldown:
+			d.state = models.MailboxPlanCooldown
+			d.reopensAt = gate.reopensAt
+		case gateAdmission:
+			d.state = models.MailboxPlanAdmission
 		default:
 			d.state = models.MailboxPlanHealthHold
 		}
@@ -468,6 +475,7 @@ func (s *schedulerService) PlanCampaignDay(ctx context.Context, campaignID uuid.
 		{kind: models.SendLimitCampaignDailyLimit}, {kind: models.SendLimitCampaignRamp},
 		{kind: models.SendLimitWarmupGraduation}, {kind: models.SendLimitWorkspaceRisk},
 		{kind: models.SendLimitDomainAuth}, {kind: models.SendLimitResting}, {kind: models.SendLimitHealthHold},
+		{kind: models.SendLimitRecovery}, {kind: models.SendLimitCooldown},
 		{kind: models.SendLimitOtherCampaigns}, {kind: models.SendLimitHealthPace},
 		{kind: models.SendLimitMailboxHours}, {kind: models.SendLimitSendingBehavior}, {kind: models.SendLimitSpacing},
 	}
@@ -499,6 +507,10 @@ func (s *schedulerService) PlanCampaignDay(ctx context.Context, campaignID uuid.
 			add(models.SendLimitResting, d.byGate)
 		case gateHealth:
 			add(models.SendLimitHealthHold, d.byGate)
+		case gateRecovery, gateAdmission:
+			add(models.SendLimitRecovery, d.byGate)
+		case gateCooldown:
+			add(models.SendLimitCooldown, d.byGate)
 		}
 		add(models.SendLimitOtherCampaigns, d.byOther)
 		add(models.SendLimitHealthPace, d.byHealthPace)

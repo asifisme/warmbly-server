@@ -3,7 +3,61 @@ title: Automations
 description: "A visual flow builder: a trigger event connected to action steps across your integrations."
 ---
 
+An automation does work for you when something happens: a reply arrives or a meeting is booked, and Warmbly posts to Slack, pushes to your CRM or labels a contact. You build it on a canvas, with no code.
+
+![An automation in the builder: a reply trigger, an If / else on intent, then a deal and a task on the Yes branch](/guides/automation-builder.webp)
+
+## Build an automation
+
+<Steps>
+
+<Step>
+
+Open the **Automations** tab and choose **New automation**.
+
+</Step>
+
+<Step>
+
+Pick the trigger it should run on, such as **Reply received**.
+
+</Step>
+
+<Step>
+
+Press **+** to add actions, and an **If / else** wherever the flow should branch.
+
+</Step>
+
+<Step>
+
+Press **Test** to dry-run it against sample data.
+
+</Step>
+
+<Step>
+
+Press **Save** and make sure the automation is switched on.
+
+</Step>
+
+</Steps>
+
+## Good to know
+
+- Nothing takes effect until you **Save**. **Test** saves first, then dry-runs.
+- An automation that is off never fires, even from a campaign step.
+- A test sends no messages and changes no records, but AI steps run for real and spend credits.
+- One failing step never blocks the rest. The failure is recorded in **History**.
+- Bulk file imports and sheet syncs do not fire **Contact created**.
+
+<Fold>
+
+## What an automation is
+
 An automation is a flow on a canvas: one **trigger** (a reply arrives, a meeting is booked) runs one or more **actions** (post to Slack, push to your CRM, label a contact), with **IF conditions** in between to branch. No code, though an advanced mode accepts a free-form condition.
+
+![The automations list, with starting templates underneath](/guides/automations.webp)
 
 <Mermaid
   chart={`
@@ -15,19 +69,32 @@ flowchart LR
 `}
 />
 
+</Fold>
+
+<Fold>
+
 ## The builder
 
 Open the **Automations** tab. Each automation has a name, an on/off toggle, and a canvas. **Off** never fires, even from a campaign step.
 
-- The **Trigger** node sits at the top and cannot be deleted.
-- Drag a node's dot onto another node to connect, or onto empty canvas to pick what comes next (AI step, AI switch, condition, action, or **Stop**) already connected.
-- Click a node to edit it. Click a connection and press `Delete` to remove it.
-- **Add** places a node; **Tidy up** auto-arranges.
-- Card positions save on their own, and the canvas is collaborative: teammates' cursors, live card movement, their selections outlined in their color. Press `/` to chat. See [Collaboration](/guides/collaboration/).
+The canvas lays itself out: the **Trigger** sits at the top and every step runs top to bottom below it. You never draw lines or arrange cards. Scroll with two fingers or drag empty space to move around; pinch, or hold `Ctrl`/`Cmd` and scroll, to zoom. `Shift+1` fits the whole flow and `Cmd/Ctrl+0` returns to 100%.
+
+- Hover any line and press its **+** to insert a step there, or press the **+** at the end of a path to add one after it. The picker is searchable and works from the keyboard (arrows, `Enter`, `Esc`).
+- An **If / else** splits into **Yes** and **No** columns. An **AI switch** gets one column per case. Inserting either one in the middle of a path keeps the steps that were below it on the first branch.
+- **Go to a step** (at the end of a path) continues that path at a step already in the flow, shown as a chip. Hover it to see where it leads. Only steps that cannot loop back are offered.
+- **End here** stops a path explicitly.
+- Click a step to edit it in the side panel. Adding or removing a step moves the rest of the flow into place with a short animation. Its **⋯** menu duplicates it, adds an on-error path, or deletes it. Deleting a step reconnects what was before it to what came after; deleting a branching step also removes the steps only its branches led to, after asking.
+- A step that still needs setup has an amber dot by its name (hover it for what is missing), and the **issues** button in the header lists every one. Save is refused until they are fixed.
+- `Cmd/Ctrl+Z` undoes and `Shift+Cmd+Z` (or `Ctrl+Y`) redoes any edit, `Cmd/Ctrl+S` saves, and `Delete` removes the selected step.
+- The canvas is collaborative: teammates' cursors and their selected steps, outlined in their color. Press `/` to chat. See [Collaboration](/guides/collaboration/).
 
 <Callout type="info" title="Save before it runs">
-Triggers, conditions, and actions only take effect after **Save** (card positions are the exception). **Test** saves first, then dry-runs.
+Triggers, conditions, and actions only take effect after **Save**. **Test** saves first, then dry-runs.
 </Callout>
+
+</Fold>
+
+<Fold>
 
 ## Triggers
 
@@ -59,9 +126,13 @@ Pick the trigger and **save**, and the editor shows a unique URL. Anything that 
 - The request returns immediately and the flow runs in the background, so a slow action never blocks the caller.
 - Keys starting with an underscore are stripped; the body is capped at 1 MB.
 
+</Fold>
+
+<Fold>
+
 ## IF conditions
 
-An IF node splits into a **yes** path (right dot) and a **no** path (bottom dot). Only the matching branch runs; an unconnected branch just ends, or drag it to a **Stop** node.
+An **If / else** splits into a **Yes** column and a **No** column. Only the matching branch runs; an empty branch just ends.
 
 Pick a **field**, an **operator**, and a **value**. Fields depend on the trigger, so they are always meaningful.
 
@@ -82,6 +153,10 @@ and (gtf .confidence 0.8) (eq .intent "positive")
 ```
 
 Comparisons (`eq`, `gt`, `lt`), numeric coercion (`gtf`, `ltf`, `add`, `sub`, `mul`, `div`), logic (`and`, `or`, `not`), and text helpers (`contains`, `lower`) are available. A broken or empty expression is **false**, so a malformed condition never silently passes, and it is validated on save.
+
+</Fold>
+
+<Fold>
 
 ## Actions
 
@@ -139,7 +214,7 @@ A flow that creates a contact can be the reason a **Contact created** flow runs.
 
 ### The on-error branch
 
-Every action has a red dot on its right edge. Drag from it to handle failures (a rejected Slack message, a CRM timeout).
+Choose **Add an error path** from an action's **⋯** menu to handle failures (a rejected Slack message, a CRM timeout). The action then splits into a **Then** column and an **On error** column.
 
 - **With** an on-error branch connected, a failure follows it and the run is **not** marked failed, like a try/catch. The normal path is skipped.
 - **Without** one, the failure is recorded in History and the run is marked errored, but the flow continues down the normal path best-effort, so one bad step never blocks the rest.
@@ -155,15 +230,21 @@ New reply from {{.contact_email}} on {{.campaign_name}}
 
 Unknown tokens render empty rather than failing.
 
+</Fold>
+
+<Fold>
+
 ## Testing and history
 
-**Test** saves the canvas and dry-runs it against sample data: no messages sent, no records changed. It shows the exact path taken and a preview of each action. AI steps are the exception, running for real so you see actual output, which spends one credit per AI step.
+**Test** saves the canvas and dry-runs it against sample data: no messages sent, no records changed. It shows the exact path taken, on the canvas (each step it reached is marked, the rest fade back) and as a list with a preview of each action. AI steps are the exception, running for real so you see actual output, which spends one credit per AI step.
 
 **History** shows recent real runs: success or error, start time, and per-step results (error text on failure, a short summary on success). It updates live as the automation fires.
 
 <Callout type="info" title="Best-effort by design">
 Runs are best-effort and bounded against loops, so one failing step won't block the rest. The run is still recorded as errored so you can see what went wrong.
 </Callout>
+
+</Fold>
 
 ## Related guides
 

@@ -6,11 +6,12 @@
 
 import React from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import { CheckIcon, CloudIcon, ExternalLinkIcon, Loader2Icon, RefreshCwIcon, SparklesIcon } from "lucide-react";
 import { useInstanceAdmin, usePermission } from "@/hooks/usePermission";
 import { useConfirm } from "@/hooks/context/confirm";
 import { NoAccess } from "@/components/layout/NoAccess";
+import useCurrentOrganization from "@/lib/api/hooks/app/organizations/useCurrentOrganization";
 import useAuthConfig from "@/lib/api/hooks/auth/useAuthConfig";
 import type { AppError } from "@/lib/api/client/normalizeError";
 import buildError from "@/lib/helper/buildError";
@@ -25,6 +26,7 @@ import LinkedInstances from "./LinkedInstances";
 export default function WarmblyCloudSettingsPage() {
     const canManage = usePermission("MANAGE_SETTINGS");
     const authConfig = useAuthConfig();
+    const organization = useCurrentOrganization();
     const instanceAdmin = useInstanceAdmin();
     if (!canManage) return <NoAccess feature="Warmbly Cloud" permissionLabel="Manage settings" />;
     if (authConfig.data && !authConfig.data.self_hosted) {
@@ -42,14 +44,14 @@ export default function WarmblyCloudSettingsPage() {
                 <Section eyebrow="Connection">
                     <p className="text-[12.5px] text-slate-500 leading-relaxed">
                         {instanceAdmin.holdsAdmin
-                            ? "The link covers the whole instance, so managing it needs a session with two-factor authentication. Turn on 2FA or add a passkey under Settings > Security, then sign in again."
-                            : "The link covers the whole instance, so an administrator of this instance manages it and the mailboxes it warms."}
+                            ? "Managing a workspace's Cloud connection needs a session with two-factor authentication. Turn on 2FA or add a passkey under Settings > Security, then sign in again."
+                            : "An administrator of this instance manages this workspace's Cloud connection."}
                     </p>
                 </Section>
             </SectionShell>
         );
     }
-    return <SelfHostedCloud />;
+    return <SelfHostedCloud key={organization.data?.id} />;
 }
 
 function SelfHostedCloud() {
@@ -73,6 +75,7 @@ function SelfHostedCloud() {
     }
     const st = status.data;
     const plan = st.info?.plan;
+    const serverWide = st.connected && !st.link?.organization_id;
 
     return (
         <SectionShell
@@ -124,7 +127,7 @@ function SelfHostedCloud() {
                             />
                         </Section>
                         {plan && (
-                            <Section eyebrow="Plan" description="Billed on Warmbly Cloud, for the workspace this instance is linked to.">
+                            <Section eyebrow="Plan" description="Billed on the connected Warmbly Cloud workspace. Existing connections keep their plan and mailbox history.">
                                 <PlanCard plan={plan} />
                             </Section>
                         )}
@@ -137,15 +140,15 @@ function SelfHostedCloud() {
                         <Section eyebrow="Disconnect">
                             <Row
                                 danger
-                                label="Disconnect from Warmbly Cloud"
-                                description="Every enrolled mailbox is removed from the pool and the cloud deletes its credentials. Local warmup takes over again."
+                                label={serverWide ? "Disconnect this server from Warmbly Cloud" : "Disconnect this workspace from Warmbly Cloud"}
+                                description={serverWide ? "Stops mailboxes and redirects using this connection across all local workspaces. Other connections are not affected. Managed mailbox mirrors using this connection are removed." : "Stops only mailboxes and redirects using this connection. Other connections and workspaces are not affected. Managed mailbox mirrors using this connection are removed."}
                             >
                                 <button
                                     type="button"
                                     onClick={() =>
-                                        confirm.show("Disconnect this instance from Warmbly Cloud? All enrolled mailboxes stop warming in the pool.", async () => {
+                                        confirm.show(serverWide ? "Disconnect this server from Warmbly Cloud? Mailboxes and redirects using this connection across all local workspaces will stop using Cloud. Its managed mailbox mirrors will be removed." : "Disconnect this workspace from Warmbly Cloud? Mailboxes and redirects using this connection will stop using Cloud. Its managed mailbox mirrors will be removed.", async () => {
                                             try {
-                                                await disconnect.mutateAsync();
+                                                await disconnect.mutateAsync(serverWide);
                                                 setFlow(null);
                                                 toast.success("Disconnected");
                                             } catch (e) {
@@ -158,6 +161,18 @@ function SelfHostedCloud() {
                                     Disconnect
                                 </button>
                             </Row>
+                            {st.legacy_connected && !serverWide && (
+                                <Row danger label="Disconnect the shared server connection" description="Some mailboxes or redirects may use this other connection. Disconnecting it affects all local workspaces using it, not this workspace's connection.">
+                                    <button type="button" className="h-7 px-2.5 rounded-md text-[12px] text-rose-600 hover:bg-rose-50" onClick={() => confirm.show("Disconnect the shared server connection? Mailboxes and redirects using it across all local workspaces will stop using Cloud, and its managed mailbox mirrors will be removed. This workspace's connection is not affected.", async () => {
+                                        try {
+                                            await disconnect.mutateAsync(true);
+                                            toast.success("Disconnected");
+                                        } catch (e) {
+                                            toast.error(buildError(e as AppError));
+                                        }
+                                    })}>Disconnect shared connection</button>
+                                </Row>
+                            )}
                         </Section>
                     </motion.div>
                 )}

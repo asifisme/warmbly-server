@@ -1,14 +1,16 @@
+import { DashboardImage } from "@/components/ui/dashboard-image";
+
 // Public invitation landing page (/invite?token=...).
 //
 // The token is the capability: anyone holding it can see who invited them
 // where (a safe preview, no permissions/ids), then accept. Works for both
-// brand-new users (sign up, bounce back, accept) and logged-in users.
+// brand-new users (sign up and join) and logged-in users (return to accept).
 
 import React from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useSearchParams } from "@/hooks/useSearchParams";
 import { Loader2Icon, AlertCircleIcon, MailIcon } from "lucide-react";
-import toast from "react-hot-toast";
+import toast from "react-hot-toast/headless";
 import getToken from "@/lib/helper/getToken";
 import usePreviewInvitation from "@/lib/api/hooks/app/organizations/usePreviewInvitation";
 import useAcceptInvitation from "@/lib/api/hooks/app/organizations/useAcceptInvitation";
@@ -51,7 +53,7 @@ export default function InviteAcceptPage() {
     const registerSearch = {
         invite: token ?? "",
         email: invitedEmail || undefined,
-        next: nextPath,
+        next: "/app/emails",
     };
     const signupClosed = authConfig.registration === "true";
     const signedInEmail = me.data?.email ?? "";
@@ -116,7 +118,7 @@ export default function InviteAcceptPage() {
                             <div className="flex items-center gap-3 mb-4">
                                 <div className="size-10 rounded-lg bg-sky-50 border border-sky-100 text-sky-700 flex items-center justify-center text-[14px] font-semibold overflow-hidden shrink-0">
                                     {preview.data.organization_avatar ? (
-                                        <img src={preview.data.organization_avatar} alt="" className="w-full h-full object-cover" />
+                                        <DashboardImage src={preview.data.organization_avatar} alt="" className="w-full h-full object-cover" />
                                     ) : (
                                         preview.data.organization_name.slice(0, 2).toUpperCase()
                                     )}

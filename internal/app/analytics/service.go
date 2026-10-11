@@ -19,6 +19,8 @@ type AnalyticsService interface {
 	GetWarmupAnalytics(ctx context.Context, orgID uuid.UUID, emailAccountID *uuid.UUID, from, to time.Time) (*models.WarmupAnalytics, *errx.Error)
 	// GetWarmupPlacement is where warmup mail landed, for one mailbox or the workspace.
 	GetWarmupPlacement(ctx context.Context, orgID uuid.UUID, emailAccountID *uuid.UUID, from, to time.Time) (*models.WarmupPlacementReport, *errx.Error)
+	GetWarmupStatsForAccounts(ctx context.Context, orgID uuid.UUID, ids []uuid.UUID, from, to time.Time) ([]models.WarmupDailyStats, *errx.Error)
+	GetWarmupPlacementDataForAccounts(ctx context.Context, orgID uuid.UUID, ids []uuid.UUID, from, to time.Time) (*models.WarmupPlacementData, *errx.Error)
 
 	// Campaign analytics
 	// GetCampaignAnalytics reads the performance of the sends inside period,
@@ -43,7 +45,9 @@ type AnalyticsService interface {
 	GetUsageOverview(ctx context.Context, orgID, userID uuid.UUID, period string) (*models.UsageOverview, *errx.Error)
 
 	// Dashboard analytics
-	GetDashboardAnalytics(ctx context.Context, orgID uuid.UUID, period string) (*models.DashboardAnalytics, *errx.Error)
+	// GetDashboardAnalytics narrows the campaign-derived sections to filter
+	// when it names anything; account health stays workspace-wide.
+	GetDashboardAnalytics(ctx context.Context, orgID uuid.UUID, period string, filter models.DashboardFilter) (*models.DashboardAnalytics, *errx.Error)
 	GetDirectMailAnalytics(ctx context.Context, orgID uuid.UUID, period string) (*models.DirectMailAnalytics, *errx.Error)
 	GetCampaignHourlyStats(ctx context.Context, orgID, campaignID uuid.UUID, date time.Time) ([]models.CampaignHourlyStats, *errx.Error)
 	CompareCampaigns(ctx context.Context, orgID uuid.UUID, campaignIDs []uuid.UUID, from, to time.Time) (*models.CampaignComparison, *errx.Error)
@@ -60,6 +64,7 @@ type analyticsService struct {
 	lifecycleRepo repository.SendLifecycleRepository
 	// placementRepo reads warmup placement history. Optional/nil-safe.
 	placementRepo repository.WarmupPlacementRepository
+	cloudReports  CloudWarmupReports
 }
 
 func NewService(
@@ -83,6 +88,19 @@ func (s *analyticsService) GetWarmupAnalytics(ctx context.Context, orgID uuid.UU
 	dailyStats, xerr := s.analyticsRepo.GetWarmupStats(ctx, orgID, emailAccountID, from, to)
 	if xerr != nil {
 		return nil, xerr
+	}
+
+	if s.cloudReports != nil {
+		if emailAccountID != nil {
+			if _, xerr := s.emailRepo.Get(ctx, orgID.String(), emailAccountID.String()); xerr != nil {
+				return nil, xerr
+			}
+		}
+		cloud, xerr := s.cloudReports.WarmupStats(ctx, orgID, emailAccountID, from, to)
+		if xerr != nil {
+			return nil, xerr
+		}
+		dailyStats = models.MergeWarmupStats(dailyStats, cloud)
 	}
 
 	// Calculate summary
@@ -316,7 +334,7 @@ func (s *analyticsService) assembleAccountStatus(ctx context.Context, email *mod
 			RampHold:      hold,
 			PartnerLimit:  limit,
 		}
-		if s.warmupRepo != nil && email.IsWarmingActive() {
+		if s.warmupRepo != nil && email.IsWarmingActive() && email.TestSendingAllowed() {
 			// A day of refusals is what an owner can still act on; older ones were fixed or are stale.
 			if f, err := s.warmupRepo.LastWarmupSendFailure(ctx, email.ID, time.Now().Add(-24*time.Hour)); err == nil {
 				warmupStatus.SendFailure = f
@@ -698,7 +716,7 @@ func (s *analyticsService) warmupPartnerLimit(ctx context.Context, email *models
 
 // Dashboard Analytics implementations
 
-func (s *analyticsService) GetDashboardAnalytics(ctx context.Context, orgID uuid.UUID, period string) (*models.DashboardAnalytics, *errx.Error) {
+func (s *analyticsService) GetDashboardAnalytics(ctx context.Context, orgID uuid.UUID, period string, filter models.DashboardFilter) (*models.DashboardAnalytics, *errx.Error) {
 	// Calculate date range from period
 	to := time.Now().UTC()
 	startOfToday := time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, time.UTC)
@@ -716,32 +734,49 @@ func (s *analyticsService) GetDashboardAnalytics(ctx context.Context, orgID uuid
 		period = "7d"
 	}
 
+	// The one place a filter becomes a campaign set, so every section reads the same one.
+	var view *models.DashboardScope
+	var scope *models.CampaignScope
+	if !filter.Empty() {
+		var xerr *errx.Error
+		view, scope, xerr = s.analyticsRepo.ResolveDashboardScope(ctx, orgID, filter)
+		if xerr != nil {
+			return nil, xerr
+		}
+	}
+	if filter.AllowedCampaigns != nil {
+		scope = withinCampaigns(scope, filter.AllowedCampaigns)
+		if view != nil {
+			view.CampaignCount = len(scope.CampaignIDs)
+		}
+	}
+
 	// Get overall stats
-	overallStats, xerr := s.analyticsRepo.GetDashboardOverallStats(ctx, orgID, from, to)
+	overallStats, xerr := s.analyticsRepo.GetDashboardOverallStats(ctx, orgID, from, to, scope, filter.AllowedMailboxes)
 	if xerr != nil {
 		return nil, xerr
 	}
 
 	// Get recent activity
-	recentActivity, xerr := s.analyticsRepo.GetRecentActivity(ctx, orgID, 20)
+	recentActivity, xerr := s.analyticsRepo.GetRecentActivity(ctx, orgID, 20, scope)
 	if xerr != nil {
 		recentActivity = make([]models.RecentActivityItem, 0)
 	}
 
 	// Get top campaigns
-	topCampaigns, xerr := s.analyticsRepo.GetTopCampaigns(ctx, orgID, from, to, 5, "emails_sent")
+	topCampaigns, xerr := s.analyticsRepo.GetTopCampaigns(ctx, orgID, from, to, 5, "emails_sent", scope)
 	if xerr != nil {
 		topCampaigns = make([]models.TopCampaignStats, 0)
 	}
 
 	// Get account health summary
-	accountHealth, xerr := s.analyticsRepo.GetAccountHealthSummary(ctx, orgID)
+	accountHealth, xerr := s.analyticsRepo.GetAccountHealthSummary(ctx, orgID, filter.AllowedMailboxes)
 	if xerr != nil {
 		accountHealth = &models.AccountHealthSummary{}
 	}
 
 	// Get daily trend
-	dailyTrend, xerr := s.analyticsRepo.GetDashboardDailyTrend(ctx, orgID, from, to)
+	dailyTrend, xerr := s.analyticsRepo.GetDashboardDailyTrend(ctx, orgID, from, to, scope)
 	if xerr != nil {
 		dailyTrend = make([]models.DashboardDailyStats, 0)
 	}
@@ -753,7 +788,26 @@ func (s *analyticsService) GetDashboardAnalytics(ctx context.Context, orgID uuid
 		TopCampaigns:   topCampaigns,
 		AccountHealth:  *accountHealth,
 		DailyTrend:     dailyTrend,
+		Scope:          view,
 	}, nil
+}
+
+// withinCampaigns narrows scope to allowed; a nil scope becomes allowed itself.
+func withinCampaigns(scope *models.CampaignScope, allowed []uuid.UUID) *models.CampaignScope {
+	if scope == nil {
+		return &models.CampaignScope{CampaignIDs: append([]uuid.UUID{}, allowed...)}
+	}
+	keep := make(map[uuid.UUID]bool, len(allowed))
+	for _, id := range allowed {
+		keep[id] = true
+	}
+	out := &models.CampaignScope{CampaignIDs: []uuid.UUID{}}
+	for _, id := range scope.CampaignIDs {
+		if keep[id] {
+			out.CampaignIDs = append(out.CampaignIDs, id)
+		}
+	}
+	return out
 }
 
 func (s *analyticsService) GetCampaignHourlyStats(ctx context.Context, orgID, campaignID uuid.UUID, date time.Time) ([]models.CampaignHourlyStats, *errx.Error) {
@@ -781,19 +835,19 @@ func (s *analyticsService) CompareCampaigns(ctx context.Context, orgID uuid.UUID
 // coldRampInfo explains a graduation ceiling holding this mailbox below its own
 // cold cap. Nil when nothing is holding it, so the drawer stays quiet.
 func (s *analyticsService) coldRampInfo(ctx context.Context, email *models.Email) *models.ColdRampInfo {
-	if email.Warmup == nil || s.warmupRepo == nil || email.CampaignLimit <= 0 {
+	if email.Warmup == nil || email.CampaignLimit <= 0 {
 		return nil
 	}
-	states, err := s.warmupRepo.ColdRampStateForAccounts(ctx,
-		[]uuid.UUID{email.ID}, time.Now().Add(-warmupramp.LookbackWindow))
-	if err != nil {
-		return nil
+	state := repository.ColdRampState{}
+	if s.warmupRepo != nil {
+		states, err := s.warmupRepo.ColdRampStateForAccounts(ctx,
+			[]uuid.UUID{email.ID}, time.Now().Add(-warmupramp.LookbackWindow))
+		if err == nil {
+			state = states[email.ID]
+		}
 	}
-	state, ok := states[email.ID]
-	if !ok {
-		return nil
-	}
-	info := warmupramp.Notice(state.WarmupStartedAt, state.ColdRampStartedAt, state.Placements, email.CampaignLimit, time.Now())
+	state = state.WithKnownWarmup(email.Warmup)
+	info := warmupramp.Notice(state.WarmupStartedAt, state.ColdRampStartedAt, state.Placements, email.CampaignLimit, time.Now(), state.ConfirmedReplies)
 	if info == nil || info.Ceiling >= email.CampaignLimit {
 		return nil
 	}

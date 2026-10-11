@@ -1209,6 +1209,28 @@ func (s *service) ProcessIncomingReply(ctx context.Context, emailAccountID uuid.
 		return nil
 	}
 
+	kind := inboxtag.DeterministicKind(inboxtag.Message{
+		Headers: buildReplyHeaders(msg), Subject: msg.Subject,
+		BodyText: firstNonEmpty(msg.BodyText, msg.Snippet), InReplyTo: msg.InReplyTo,
+	}, nil)
+	var verdict replyclassify.Result
+	if s.inboxTags != nil && msg.MessageID != "" {
+		stored, tagErr := s.inboxTags.GetByMessageID(ctx, *account.OrganizationID, msg.MessageID)
+		if tagErr == nil && stored != nil && stored.KindConfidence >= inboxtag.ConfFloor && stored.ReviewReason != "kind" {
+			if inboxtag.IsAutomatedKind(stored.Kind) {
+				kind = stored.Kind
+				verdict = replyclassify.Result{
+					Class:      inboxtag.ReplyClassFor(stored.Kind, stored.Intent),
+					Confidence: stored.KindConfidence, Source: replyclassify.SourceModel,
+				}
+			}
+		}
+	}
+	switch kind {
+	case inboxtag.KindNotification, inboxtag.KindBounceHard, inboxtag.KindBounceSoft:
+		return nil
+	}
+
 	settings, err := s.repo.GetOutreachSettings(ctx, *account.OrganizationID)
 	if err != nil {
 		return toErrx(err)
@@ -1233,7 +1255,6 @@ func (s *service) ProcessIncomingReply(ctx context.Context, emailAccountID uuid.
 	// only inside that block means a reply with no campaign match never spends a
 	// model call. verdict is what it decided, read after the block; held is
 	// when an out-of-office hold lifts, for the notification to name.
-	var verdict replyclassify.Result
 	replyClaimToken := uuid.Nil
 	replyClaimCompleted := false
 
@@ -1389,15 +1410,18 @@ func (s *service) ProcessIncomingReply(ctx context.Context, emailAccountID uuid.
 		}
 		replyClaimToken = claimToken
 
-		replyResult := replyclassify.ClassifyGated(ctx, replyclassify.Input{
-			Headers:  buildReplyHeaders(msg),
-			Subject:  msg.Subject,
-			BodyText: msg.Snippet,
-			// The typed layer answers from the tagger's stored verdict for
-			// this message, so a reply is judged once.
-			OrganizationID: *account.OrganizationID,
-			MessageID:      msg.MessageID,
-		}, gate)
+		replyResult := verdict
+		if replyResult.Class == "" {
+			replyResult = replyclassify.ClassifyGated(ctx, replyclassify.Input{
+				Headers:  buildReplyHeaders(msg),
+				Subject:  msg.Subject,
+				BodyText: msg.Snippet,
+				// The typed layer answers from the tagger's stored verdict for
+				// this message, so a reply is judged once.
+				OrganizationID: *account.OrganizationID,
+				MessageID:      msg.MessageID,
+			}, gate)
+		}
 
 		// Always persist the classifier verdict so reply_* branches can route on
 		// it (including reply_automated for OOO / autoresponders). Layers 1-2 run
@@ -1554,7 +1578,7 @@ func (s *service) ProcessIncomingReply(ctx context.Context, emailAccountID uuid.
 	if settings.ReplyIntent.AutoSuppressOnUnsubWord &&
 		replyOptOutEligible(verdict, referencesCampaignThread, contactID != nil, buildReplyHeaders(msg)) &&
 		replyclassify.IsOptOut(msg.Subject, firstNonEmpty(msg.BodyText, msg.Snippet)) {
-		_ = s.repo.UpsertSuppressedRecipient(ctx, &models.SuppressedRecipient{
+		if err := s.repo.UpsertSuppressedRecipient(ctx, &models.SuppressedRecipient{
 			OrganizationID: *account.OrganizationID,
 			Email:          sender,
 			Kind:           models.SuppressionKindEmail,
@@ -1564,7 +1588,9 @@ func (s *service) ProcessIncomingReply(ctx context.Context, emailAccountID uuid.
 			Metadata: map[string]interface{}{
 				"via": "reply",
 			},
-		})
+		}); err != nil {
+			return toErrx(err)
+		}
 		if err := s.contactRepo.SetSubscribedByEmail(ctx, *account.OrganizationID, sender, false); err != nil {
 			log.Warn().Err(err).Msg("reply opt-out: could not clear the contact's subscription flag")
 		}
@@ -1875,7 +1901,7 @@ func (s *service) IngestDeliverabilityEvent(ctx context.Context, organizationID 
 	if eventType == models.DeliverabilityEventBounce && s.bounceJudge != nil &&
 		strings.TrimSpace(req.Reason) != "" && !emailverify.NamesRecipient(req.Reason) {
 		// Bounded: a bounce storm must not queue behind a rate-limited judge.
-		jctx, cancel := context.WithTimeout(ctx, bounceJudgeTimeout)
+		jctx, cancel := context.WithTimeout(typesafe.WithUsage(ctx, "bounce_classification", organizationID.String()), bounceJudgeTimeout)
 		v, vErr := bounceclass.Classify(jctx, s.bounceJudge, req.Reason)
 		cancel()
 		switch {
@@ -1929,18 +1955,22 @@ func (s *service) IngestDeliverabilityEvent(ctx context.Context, organizationID 
 	}
 
 	if shouldSuppress {
-		_ = s.repo.UpsertSuppressedRecipient(ctx, &models.SuppressedRecipient{
+		if err := s.repo.UpsertSuppressedRecipient(ctx, &models.SuppressedRecipient{
 			OrganizationID: organizationID,
 			Email:          req.RecipientEmail,
 			Reason:         fmt.Sprintf("%s: %s", eventType, req.Reason),
 			Source:         eventType,
 			CampaignID:     req.CampaignID,
 			Metadata:       req.Metadata,
-		})
+		}); err != nil {
+			return toErrx(err)
+		}
 	}
 
 	if req.CampaignID != nil && req.ContactID != nil {
-		_ = s.repo.MarkVariantEvent(ctx, *req.CampaignID, *req.ContactID, string(eventType))
+		if err := s.repo.MarkVariantEvent(ctx, *req.CampaignID, *req.ContactID, string(eventType)); err != nil {
+			return toErrx(err)
+		}
 	}
 
 	// Record bounces + complaints in campaign progress so analytics and the
@@ -1955,7 +1985,9 @@ func (s *service) IngestDeliverabilityEvent(ctx context.Context, organizationID 
 				// A bounce that was not about the address does not drop the
 				// lead: the step is offered again once the mailbox recovers.
 				if !addressFine {
-					_ = s.campaignProgressRepo.RecordEmailBounced(ctx, *req.CampaignID, *req.ContactID, *campaignTask.SequenceID)
+					if err := s.campaignProgressRepo.RecordEmailBounced(ctx, *req.CampaignID, *req.ContactID, *campaignTask.SequenceID); err != nil {
+						return toErrx(err)
+					}
 				}
 				// Only a bounce that names the recipient is evidence against
 				// the address; a full mailbox or a policy block is not.
@@ -1970,7 +2002,9 @@ func (s *service) IngestDeliverabilityEvent(ctx context.Context, organizationID 
 					s.evidence.RecordEvidence(ctx, *req.ContactID, models.Step(campaignTask.CampaignID, campaignTask.SequenceID), kind, req.IdempotencyKey, req.Reason)
 				}
 			case models.DeliverabilityEventComplaint:
-				_ = s.campaignProgressRepo.RecordEmailComplained(ctx, *req.CampaignID, *req.ContactID, *campaignTask.SequenceID)
+				if err := s.campaignProgressRepo.RecordEmailComplained(ctx, *req.CampaignID, *req.ContactID, *campaignTask.SequenceID); err != nil {
+					return toErrx(err)
+				}
 			}
 		}
 	}
@@ -1986,7 +2020,9 @@ func (s *service) IngestDeliverabilityEvent(ctx context.Context, organizationID 
 		(eventType == models.DeliverabilityEventBounce || eventType == models.DeliverabilityEventComplaint) {
 		task, tErr := s.taskRepo.GetTask(ctx, *req.TaskID)
 		if tErr == nil && task != nil {
-			_, _ = s.warmupService.ApplySpamReport(ctx, uuid.Nil, task.EmailAccountID, req.IdempotencyKey, string(eventType))
+			if _, err := s.warmupService.ApplySpamReport(ctx, task.EmailAccountID, task.EmailAccountID, req.IdempotencyKey, string(eventType)); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -2035,7 +2071,12 @@ func (s *service) IngestDeliverabilityEvent(ctx context.Context, organizationID 
 					title = "Spam complaint: " + req.RecipientEmail
 				}
 				org := organizationID
-				s.notify(uid, &org, cat, title, req.Reason, "/app/deliverability", map[string]any{"provider": provider})
+				if s.notifier != nil && repository.QueueSendResultEffect(ctx, "notification:"+uid.String()+":"+string(cat), repository.SendResultEffect{Kind: "notification", OrganizationID: org, UserID: uid, Category: cat, Title: title, Body: req.Reason, Link: "/app/deliverability", Data: map[string]any{"provider": provider}}) {
+					return nil
+				}
+				repository.AfterSendResultCommit(ctx, func(context.Context) {
+					s.notify(uid, &org, cat, title, req.Reason, "/app/deliverability", map[string]any{"provider": provider})
+				})
 			}
 		}
 	}
@@ -2247,26 +2288,15 @@ func (s *service) ReplayDeadLetter(ctx context.Context, organizationID, deadLett
 	if task == nil {
 		return errx.ErrNotFound
 	}
-	if _, handled, rerr := s.replayCampaignPass(ctx, task); handled {
-		if rerr != nil {
-			return toErrx(rerr)
-		}
-		if err := s.repo.MarkTaskDeadLetterReplayed(ctx, deadLetterID); err != nil {
-			return toErrx(err)
-		}
-		return nil
+	if dlq.TaskType != "campaign" || task.TaskType != "campaign" {
+		return errx.New(errx.Conflict, "send dead letters require authoritative outcome evidence and cannot be replayed")
 	}
-
-	scheduleAt := time.Now().UTC().Add(10 * time.Second)
-	cloudTaskName, err := s.tasksClient.CreateTask(ctx, &proto.ProcessTask{TaskId: task.ID.String()}, scheduleAt)
-	if err != nil {
-		return toErrx(err)
+	_, handled, rerr := s.replayCampaignPass(ctx, task)
+	if rerr != nil {
+		return toErrx(rerr)
 	}
-	if err := s.taskRepo.UpdateTaskScheduledAt(ctx, task.ID, scheduleAt, cloudTaskName); err != nil {
-		return toErrx(err)
-	}
-	if err := s.taskRepo.UpdateTaskStatus(ctx, task.ID, "pending"); err != nil {
-		return toErrx(err)
+	if !handled {
+		return errx.New(errx.Conflict, "only non-sending campaign passes can be replayed")
 	}
 	if err := s.repo.MarkTaskDeadLetterReplayed(ctx, deadLetterID); err != nil {
 		return toErrx(err)
@@ -2281,22 +2311,27 @@ func (s *service) ReplayDeadLetter(ctx context.Context, organizationID, deadLett
 // campaign pass; replayed, that a new pass was queued. An error means nothing
 // was queued and the dead letter stays for another try.
 func (s *service) replayCampaignPass(ctx context.Context, task *repository.Task) (replayed, handled bool, err error) {
-	if task == nil || task.TaskType != "campaign" {
+	if task == nil || task.TaskType != "campaign" || task.Status != "dead_lettered" {
 		return false, false, nil
 	}
 	ct, err := s.taskRepo.GetCampaignTask(ctx, task.ID)
 	if err != nil {
 		return false, true, err
 	}
-	if ct == nil || ct.CampaignID == nil {
-		// The campaign is gone; there is nothing to replay into.
-		return false, true, nil
+	if ct == nil || ct.DispatchIntent != repository.CampaignDispatchWakeup || ct.ContactID != nil || ct.SequenceID != nil {
+		return false, false, nil
+	}
+	if ct.CampaignID == nil {
+		return false, false, nil
 	}
 	at := time.Now().UTC().Add(10 * time.Second)
 	id := uuid.New()
-	created, err := s.taskRepo.CreateTaskWithLock(ctx,
+	created, err := s.taskRepo.CreateCampaignReplayTask(ctx,
 		&repository.Task{ID: id, TaskType: "campaign", EmailAccountID: task.EmailAccountID, Status: "pending", ScheduledAt: &at},
-		&repository.CampaignTask{TaskID: id, CampaignID: ct.CampaignID})
+		&repository.CampaignTask{TaskID: id, CampaignID: ct.CampaignID}, task.ID)
+	if errors.Is(err, repository.ErrCampaignReplayUnverified) {
+		return false, false, nil
+	}
 	if err != nil {
 		return false, true, err
 	}
@@ -2639,10 +2674,14 @@ func (s *service) ProcessRetryableDeadLetters(ctx context.Context) (int, *errx.E
 
 	retried := 0
 	for _, dlq := range items {
+		if dlq.TaskType != "campaign" {
+			continue
+		}
 		task, err := s.taskRepo.GetTask(ctx, dlq.TaskID)
-		if err != nil || task == nil {
-			// Mark as exhausted if the task no longer exists
-			_ = s.repo.MarkTaskDeadLetterReplayed(ctx, dlq.ID)
+		if err != nil {
+			return retried, toErrx(err)
+		}
+		if task == nil || task.TaskType != "campaign" {
 			continue
 		}
 
@@ -2659,30 +2698,6 @@ func (s *service) ProcessRetryableDeadLetters(ctx context.Context) (int, *errx.E
 			_ = s.repo.MarkTaskDeadLetterReplayed(ctx, dlq.ID)
 			continue
 		}
-
-		// Check if attempts exceeded
-		if dlq.Attempts >= dlq.MaxAttempts {
-			_ = s.repo.IncrementDeadLetterAttempt(ctx, dlq.ID, nil)
-			continue
-		}
-
-		// Schedule retry via Cloud Tasks
-		scheduleAt := time.Now().UTC().Add(10 * time.Second)
-		cloudTaskName, err := s.tasksClient.CreateTask(ctx, &proto.ProcessTask{TaskId: task.ID.String()}, scheduleAt)
-		if err != nil {
-			// Compute next retry with exponential backoff
-			backoff := time.Duration(30*(1<<uint(dlq.Attempts+1))) * time.Second
-			nextRetry := time.Now().UTC().Add(backoff)
-			_ = s.repo.IncrementDeadLetterAttempt(ctx, dlq.ID, &nextRetry)
-			continue
-		}
-
-		if err := s.taskRepo.UpdateTaskScheduledAt(ctx, task.ID, scheduleAt, cloudTaskName); err != nil {
-			continue
-		}
-		_ = s.taskRepo.UpdateTaskStatus(ctx, task.ID, "pending")
-		_ = s.repo.MarkTaskDeadLetterReplayed(ctx, dlq.ID)
-		retried++
 	}
 
 	return retried, nil

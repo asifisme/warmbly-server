@@ -101,6 +101,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Println("Waiting for backend database migrations...")
+	if err := db.WaitForSchema(ctx, primaryDB); err != nil {
+		log.Fatal(err)
+	}
+	log.Println("Database schema ready")
 
 	// Redis
 	primaryRedis, err := cfg.LoadPrimaryRedisEndpoint(ctx)
@@ -189,10 +194,10 @@ func main() {
 			errs.CaptureFatal(err)
 			log.Fatal("Failed to provision Pub/Sub topics/subscriptions: ", err)
 		}
-		streamingPublisher = pubsub.NewStreamingPublisher(pubsubClient)
+		streamingPublisher = pubsub.NewStreamingPublisher(pubsubClient, repository.NewEventAudienceRepository(primaryDB.Pool))
 	}
 	if streamingPublisher == nil {
-		streamingPublisher = pubsub.NewStreamingPublisher(pubsub.NewRedisBus(redisCache.Client, ""))
+		streamingPublisher = pubsub.NewStreamingPublisher(pubsub.NewRedisBus(redisCache.Client, ""), repository.NewEventAudienceRepository(primaryDB.Pool))
 		log.Println("Realtime events bridged over Redis (Pub/Sub disabled)")
 	}
 
@@ -295,7 +300,7 @@ func main() {
 	// no key is configured, and every feature that reads it stays off.
 	var typeSafeClient *typesafe.Client
 	if key := config.TypeSafeAPIKey(); key != "" {
-		typeSafeClient = typesafe.NewClient(key)
+		typeSafeClient = typesafe.NewClient(key, typesafe.WithBillingRedis(redisCache.Client))
 	}
 	if aiProviderC != nil {
 		replyclassify.SetModelClassifier(func(ctx context.Context, system, user string) (string, error) {
@@ -521,12 +526,14 @@ func main() {
 		EmailHistoryIDRepository:    emailHistoryIDRepo,
 		EmailGraphDeltaRepository:   emailGraphDeltaRepo,
 		EmailSyncStateRepository:    repository.NewEmailSyncStateRepository(primaryDB),
+		ArrivalOutbox:               repository.NewDurableEmailMessageMapRepository(primaryDB, cipherService),
 		EmailAccountErrorRepository: emailAccountErrorRepo,
 		WarmupRepo:                  warmupRepo,
 		PoolLinkRepo:                repository.NewPoolLinkRepository(primaryDB.Pool),
 		CloudLink:                   cloudlink.NewService(repository.NewCloudLinkRepository(primaryDB.Pool, credEncrypter), emailRepo, nil),
 		WarmupContentRepo:           repository.NewWarmupContentRepository(primaryDB.Pool),
 		WarmupEngagementRepo:        repository.NewWarmupEngagementRepository(primaryDB.Pool),
+		WarmupRecoveryRepo:          repository.NewWarmupRecoveryRepository(primaryDB.Pool),
 		WarmupPlacementRepo:         repository.NewWarmupPlacementRepository(primaryDB),
 		PlacementRepo:               repository.NewPlacementRepository(primaryDB),
 		WarmupService:               warmupService,
@@ -584,6 +591,7 @@ func main() {
 	// effective dwell close to the requested value.
 	go jobsService.StartWarmupEngagementPoller(ctx, 30*time.Second)
 	go jobsService.StartWarmupInboxCleanup(ctx)
+	go jobsService.StartWarmupFilingRecovery(ctx)
 	// Deletes warmup mail past its retention window from the mailbox itself
 	// and prunes the per-message warmup records after theirs.
 	go jobsService.StartWarmupMailRetention(ctx)

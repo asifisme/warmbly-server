@@ -25,6 +25,39 @@ type partnerOrgFixture struct {
 	exec    func(sql string, args ...any)
 }
 
+func TestLiveWarmupAdmissionUsesRoleCurrentAuthorityAndHealth(t *testing.T) {
+	f := newPartnerOrgFixture(t)
+	ctx := context.Background()
+	r := NewWarmupRepository(f.pool)
+	assertEligible := func(sending, want bool) {
+		t.Helper()
+		got, err := r.IsPoolEligible(ctx, f.sender, "premium", sending)
+		if err != nil || got != want {
+			t.Fatalf("eligible(sending=%v) = %v, %v; want %v", sending, got, err, want)
+		}
+	}
+	assertEligible(true, true)
+	f.exec(`UPDATE warmup_pool_participants SET participant_role = 'recipient_only' WHERE email_account_id = $1`, f.sender)
+	assertEligible(true, false)
+	assertEligible(false, true)
+	f.exec(`UPDATE organizations SET risk_state = 'restricted' WHERE id = $1`, f.org)
+	assertEligible(false, false)
+	f.exec(`UPDATE organizations SET risk_state = 'watch' WHERE id = $1`, f.org)
+	assertEligible(false, true)
+	f.exec(`UPDATE email_accounts SET status = 'inactive' WHERE id = $1`, f.sender)
+	assertEligible(false, false)
+	f.exec(`UPDATE email_accounts SET status = 'active' WHERE id = $1`, f.sender)
+	f.exec(`UPDATE warmup_pool_participants SET health_state = 'quarantined', blocked_until = NULL WHERE email_account_id = $1`, f.sender)
+	assertEligible(false, false)
+	f.exec(`UPDATE warmup_pool_participants SET blocked_until = NOW() - INTERVAL '1 second' WHERE email_account_id = $1`, f.sender)
+	assertEligible(false, true)
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if allowed, err := r.IsPoolEligible(cancelCtx, f.sender, "premium", false); err == nil || allowed {
+		t.Fatalf("unavailable authority admitted recipient: %v, %v", allowed, err)
+	}
+}
+
 func newPartnerOrgFixture(t *testing.T) *partnerOrgFixture {
 	t.Helper()
 	_, pool := liveContactDB(t)
@@ -44,6 +77,7 @@ func newPartnerOrgFixture(t *testing.T) *partnerOrgFixture {
 	for _, org := range []uuid.UUID{f.org, f.other} {
 		f.exec(`INSERT INTO organizations (id, name, slug, owner_user_id) VALUES ($1, 'Org pairing', $2, $3)`,
 			org, "org-pair-"+org.String()[:8], f.user)
+		f.exec(`UPDATE organizations SET risk_state='trusted' WHERE id=$1`, org)
 	}
 	for _, m := range []struct {
 		id     uuid.UUID
@@ -58,6 +92,7 @@ func newPartnerOrgFixture(t *testing.T) *partnerOrgFixture {
 		            signature_html, provider, status, campaign_limit, min_wait_time, timezone)
 		        VALUES ($1, $2, $3, $4, 'Org pairing', '', '', 'smtp_imap', 'active', 50, 600, 'UTC')`,
 			m.id, f.user, m.org, "box-"+m.id.String()[:8]+"@"+m.domain)
+		f.exec(`UPDATE email_accounts SET test_mode=NULL WHERE id=$1`, m.id)
 	}
 	for _, id := range []uuid.UUID{f.sender, f.sibling, f.outside} {
 		f.exec(`INSERT INTO warmup_pool_participants (pool_id, email_account_id, participant_role, health_state)
@@ -414,6 +449,7 @@ func (f *partnerOrgFixture) addMember(t *testing.T, org, poolID uuid.UUID, provi
 	            signature_html, provider, status, campaign_limit, min_wait_time, timezone)
 	        VALUES ($1, $2, $3, $4, 'Pool member', '', '', $5, 'active', 50, 600, 'UTC')`,
 		id, f.user, org, "m-"+id.String()[:8]+"@"+id.String()[:8]+".test", provider)
+	f.exec(`UPDATE email_accounts SET test_mode=NULL WHERE id=$1`, id)
 	f.exec(`INSERT INTO warmup_pool_participants (pool_id, email_account_id, participant_role, health_state, joined_at)
 	        VALUES ($1, $2, 'sender_receiver', 'healthy', NOW() - make_interval(days => $3))`, poolID, id, memberForDays)
 	return id
@@ -429,17 +465,15 @@ func borrowedCount(cands []models.WarmupPartnerCandidate) int {
 	return n
 }
 
-// Mail between one workspace's own mailboxes builds nothing, so a customer
-// with more mailboxes than the floor still borrows outside partners.
-func TestLiveWarmupPartnerCandidatesSiblingsDoNotSatisfyTheFloor(t *testing.T) {
+func TestLiveWarmupPartnerCandidatesManySiblingsStillAllowProvenOutsidePartners(t *testing.T) {
 	f := newPartnerOrgFixture(t)
 	ctx := context.Background()
 	repo := &warmupRepository{db: f.pool}
-	for i := 0; i < config.WarmupPoolTierFallbackFloor; i++ {
+	for range 25 {
 		f.addMember(t, f.org, premiumPoolID, "smtp_imap", 0)
 	}
 	free := f.addMember(t, f.other, models.WarmupPoolFreeID, "smtp_imap", config.WarmupPoolFallbackMinAgeDays)
-	f.exec(`UPDATE email_accounts SET warmup_max = $2 WHERE id = $1`, f.sender, config.WarmupPoolTierFallbackFloor)
+	f.exec(`UPDATE email_accounts SET warmup_max = 25 WHERE id = $1`, f.sender)
 
 	cands, err := repo.WarmupPartnerCandidates(ctx, "premium", f.sender)
 	if err != nil {
@@ -451,27 +485,25 @@ func TestLiveWarmupPartnerCandidatesSiblingsDoNotSatisfyTheFloor(t *testing.T) {
 	}
 }
 
-// A sender ramping above the floor needs that many partners, so its warmup
-// max raises the floor.
-func TestLiveWarmupPartnerCandidatesFloorFollowsTheWarmupMax(t *testing.T) {
+func TestLiveWarmupPartnerCandidatesPremiumAccessDoesNotDependOnPoolSizeOrWarmupMax(t *testing.T) {
 	f := newPartnerOrgFixture(t)
 	ctx := context.Background()
 	repo := &warmupRepository{db: f.pool}
-	for i := 0; i < config.WarmupPoolTierFallbackFloor; i++ {
+	for range 25 {
 		f.addMember(t, f.other, premiumPoolID, "smtp_imap", 0)
 	}
 	free := f.addMember(t, f.other, models.WarmupPoolFreeID, "smtp_imap", config.WarmupPoolFallbackMinAgeDays)
 
-	f.exec(`UPDATE email_accounts SET warmup_max = $2 WHERE id = $1`, f.sender, config.WarmupPoolTierFallbackFloor)
+	f.exec(`UPDATE email_accounts SET warmup_max = 25 WHERE id = $1`, f.sender)
 	cands, err := repo.WarmupPartnerCandidates(ctx, "premium", f.sender)
 	if err != nil {
 		t.Fatalf("WarmupPartnerCandidates: %v", err)
 	}
-	if n := borrowedCount(cands); n != 0 {
-		t.Fatalf("a sender with enough outside partners for its max borrowed %d", n)
+	if n := borrowedCount(cands); n != 1 {
+		t.Fatalf("a large premium pool hid qualified free recipients: borrowed %d, want 1", n)
 	}
 
-	f.exec(`UPDATE email_accounts SET warmup_max = $2 WHERE id = $1`, f.sender, config.WarmupPoolTierFallbackFloor+10)
+	f.exec(`UPDATE email_accounts SET warmup_max = 35 WHERE id = $1`, f.sender)
 	cands, err = repo.WarmupPartnerCandidates(ctx, "premium", f.sender)
 	if err != nil {
 		t.Fatalf("WarmupPartnerCandidates: %v", err)
@@ -481,24 +513,23 @@ func TestLiveWarmupPartnerCandidatesFloorFollowsTheWarmupMax(t *testing.T) {
 	}
 }
 
-// When more free mailboxes qualify than are borrowed, the best go first.
-func TestLiveWarmupPartnerCandidatesBorrowTheBestFirst(t *testing.T) {
+func TestLiveWarmupPartnerCandidatesIncludeAllQualifiedHostsWithoutSampling(t *testing.T) {
 	f := newPartnerOrgFixture(t)
 	ctx := context.Background()
 	repo := &warmupRepository{db: f.pool}
-	for i := 0; i < config.WarmupPoolTierFallbackFloor+15; i++ {
+	for range 40 {
 		f.addMember(t, f.other, models.WarmupPoolFreeID, "smtp_imap", config.WarmupPoolFallbackMinAgeDays)
 	}
-	best := f.addMember(t, f.other, models.WarmupPoolFreeID, "gmail", config.WarmupPoolBorrowSeasonedDays)
-	f.exec(`UPDATE email_accounts SET warmup_max = $2 WHERE id = $1`, f.sender, config.WarmupPoolTierFallbackFloor)
+	best := f.addMember(t, f.other, models.WarmupPoolFreeID, "gmail", 14)
+	f.exec(`UPDATE email_accounts SET warmup_max = 25 WHERE id = $1`, f.sender)
 
 	for i := 0; i < 10; i++ {
 		cands, err := repo.WarmupPartnerCandidates(ctx, "premium", f.sender)
 		if err != nil {
 			t.Fatalf("WarmupPartnerCandidates: %v", err)
 		}
-		if n := borrowedCount(cands); n != config.WarmupPoolTierFallbackFloor {
-			t.Fatalf("borrowed %d, want %d", n, config.WarmupPoolTierFallbackFloor)
+		if n := borrowedCount(cands); n != 41 {
+			t.Fatalf("borrowed %d, want all 41 qualified recipients", n)
 		}
 		if _, ok := candidateByID(cands, best); !ok {
 			t.Fatal("a seasoned Google mailbox was left out of the borrow for newer SMTP ones")

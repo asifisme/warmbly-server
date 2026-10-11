@@ -169,8 +169,10 @@ func main() {
 		log.Println("WARNING: BOX_GOOGLE_CLIENT_ID/SECRET not set; Gmail mailbox token refresh will fail on expiry")
 	}
 
+	agent := newNodeAgent(workerID, bindIP)
 	// WorkerService
 	workerService := &worker.WorkerService{
+		OnMailboxMissing:          agent.RequestReload,
 		ID:                        workerID.String(),
 		CipherService:             cipherService,
 		Bus:                       bus,
@@ -202,7 +204,7 @@ func main() {
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		newNodeAgent(workerID, bindIP).Run(ctx)
+		agent.Run(ctx)
 	}()
 
 	// Graceful shutdown
@@ -216,7 +218,12 @@ func main() {
 	}()
 
 	log.Printf("Worker %s started, listening on topic %s", workerID, workerTopic)
-	if err := bus.Subscribe(ctx, []string{workerTopic}, "worker-"+workerID.String(), workerService.Receive); err != nil {
+	lanes := worker.CommandConcurrency()
+	if _, ok := bus.(eventbus.KeyedSubscriber); !ok {
+		lanes = 1
+	}
+	log.Printf("Worker command concurrency: %d ordered mailbox lanes", lanes)
+	if err := eventbus.SubscribeKeyed(ctx, bus, []string{workerTopic}, "worker-"+workerID.String(), lanes, workerService.ResolveCommandKey, workerService.Receive); err != nil {
 		log.Println("event bus subscribe ended:", err)
 	}
 
@@ -240,15 +247,16 @@ func newNodeAgent(workerID uuid.UUID, bindIP string) *nodeagent.Agent {
 		reportedIP = bindIP
 	}
 	return nodeagent.New(nodeagent.Config{
-		NodeID:         workerID,
-		Role:           models.NodeRoleWorker,
-		Name:           os.Getenv("WARMBLY_NODE_NAME"),
-		Region:         nodeRegion(),
-		Address:        reportedIP,
-		CapacityTarget: workerCapacityTarget(),
-		Version:        buildVersion(),
-		BaseURL:        os.Getenv("ENCRYPTED_KEYS_BACKEND_URL"),
-		Token:          config.NodeAPIToken(),
+		WarmupSendProtocol: 2,
+		NodeID:             workerID,
+		Role:               models.NodeRoleWorker,
+		Name:               os.Getenv("WARMBLY_NODE_NAME"),
+		Region:             nodeRegion(),
+		Address:            reportedIP,
+		CapacityTarget:     workerCapacityTarget(),
+		Version:            buildVersion(),
+		BaseURL:            os.Getenv("ENCRYPTED_KEYS_BACKEND_URL"),
+		Token:              config.NodeAPIToken(),
 		// Written for the host-side updater installed by `warmbly join`.
 		TargetVersionPath: os.Getenv("WARMBLY_TARGET_VERSION_PATH"),
 		Condition:         wsmtp.EgressCondition,

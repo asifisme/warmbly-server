@@ -131,6 +131,7 @@ export interface PoolLinkMailboxError {
 }
 
 export interface PoolLinkMailboxState {
+    participation?: DiagnosticParticipation;
     remote_id: string;
     email_account_id: string;
     email: string;
@@ -151,7 +152,17 @@ export interface PoolLinkMailboxState {
     settings: PoolLinkWarmupSettings;
 }
 
+export interface DiagnosticParticipation {
+    mode: "legacy" | "diagnostic" | "off";
+    send: boolean;
+    receive: boolean;
+    shared_daily_limit?: number | null;
+    rolling_recipient_limit?: number | null;
+}
+
 export interface CloudLink {
+    /** Absent on a legacy instance-wide connection. */
+    organization_id?: string | null;
     cloud_url: string;
     instance_id: string;
     organization_name: string;
@@ -161,6 +172,7 @@ export interface CloudLink {
 }
 
 export interface CloudLinkStatus {
+    legacy_connected?: boolean;
     connected: boolean;
     link?: CloudLink | null;
     info?: PoolLinkInstanceInfo | null;
@@ -184,6 +196,7 @@ export interface CloudLinkPollResult {
 }
 
 export interface CloudLinkMailboxRow {
+    legacy?: boolean;
     id: string;
     email: string;
     name: string;

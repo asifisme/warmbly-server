@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"net/mail"
 	"regexp"
 	"strconv"
 	"strings"
@@ -49,6 +51,7 @@ type OperatorNotifier interface {
 // OrganizationService defines the interface for organization management
 type OrganizationService interface {
 	CreateTesterWorkspace(ctx context.Context, userID, adminID uuid.UUID, name, reason string, until time.Time) (*models.Organization, *errx.Error)
+	SeedTesterWorkspace(ctx context.Context, orgID, adminID uuid.UUID, ip, userAgent string) (*models.TesterSampleData, *errx.Error)
 	// WireAuthPolicy attaches the deployment auth policy after construction.
 	WireAuthPolicy(p *config.AuthPolicy)
 
@@ -86,6 +89,7 @@ type OrganizationService interface {
 	// manage_testers bit plus the admin audit row the caller writes.
 	AttachTester(ctx context.Context, orgID, userID, adminID, roleID uuid.UUID) (*models.OrganizationMember, *errx.Error)
 	AcceptInvitation(ctx context.Context, token string, userID uuid.UUID, email string) (*models.OrganizationMember, *errx.Error)
+	CreateInvitedUser(ctx context.Context, token string, email *mail.Address, passwordHash string) (*models.User, *models.OrganizationMember, *errx.Error)
 	AcceptInvitationByID(ctx context.Context, invitationID, userID uuid.UUID, email string) (*models.OrganizationMember, *errx.Error)
 	PreviewInvitation(ctx context.Context, token string) (*models.InvitationPreview, *errx.Error)
 	GetInvitationToken(ctx context.Context, orgID, invitationID uuid.UUID) (string, *errx.Error)
@@ -96,6 +100,11 @@ type OrganizationService interface {
 	UpdateRole(ctx context.Context, orgID, actorID, roleID uuid.UUID, req *models.UpdateOrganizationRoleRequest) (*models.OrganizationRole, *errx.Error)
 	DeleteRole(ctx context.Context, orgID, actorID, roleID uuid.UUID) *errx.Error
 	UpdateMemberRole(ctx context.Context, orgID, actorID, memberUserID uuid.UUID, req *models.UpdateMemberRequest) (*models.OrganizationMember, *errx.Error)
+	// Resource scope: a restricted member's role applies only to the campaigns, folders and mailboxes granted to them.
+	GetMemberAccess(ctx context.Context, orgID, userID uuid.UUID) (*models.MemberAccess, *errx.Error)
+	SetMemberAccess(ctx context.Context, orgID, actorID, memberUserID uuid.UUID, access *models.MemberAccess) (*models.OrganizationMember, *errx.Error)
+	ResolveMemberScope(ctx context.Context, orgID, userID uuid.UUID) (*models.ResourceScope, *errx.Error)
+	SuggestCampaignSenders(ctx context.Context, orgID uuid.UUID, campaignIDs, folderIDs []uuid.UUID) ([]models.SuggestedSender, *errx.Error)
 	RemoveMember(ctx context.Context, orgID, actorID, memberUserID uuid.UUID) *errx.Error
 
 	// Invitations
@@ -126,6 +135,7 @@ type OrganizationService interface {
 	GetCampaignCounts(ctx context.Context, orgID uuid.UUID) (total int, active int, err *errx.Error)
 	GetOrganizationLimits(ctx context.Context, orgID uuid.UUID) (*models.OrganizationLimits, *errx.Error)
 	GetOrganizationCounts(ctx context.Context, orgID uuid.UUID) (*models.OrganizationCounts, *errx.Error)
+	GetScopedOrganizationCounts(ctx context.Context, orgID uuid.UUID, scope *models.ResourceScope) (*models.OrganizationCounts, *errx.Error)
 
 	// Enterprise inquiries
 	CreateEnterpriseInquiry(ctx context.Context, inquiry *models.EnterpriseInquiry) (*models.EnterpriseInquiry, *errx.Error)
@@ -286,6 +296,9 @@ func (s *organizationService) Create(ctx context.Context, userID uuid.UUID, name
 	if timezone != "" && !tz.Valid(timezone) {
 		return nil, errx.ErrTimezone
 	}
+	if xerr := s.requireWorkspaceCreation(ctx, userID); xerr != nil {
+		return nil, xerr
+	}
 
 	// Ban-scope enforcement (migration 000045). Block new workspace
 	// creation when the admin's set the BanScopeOrgCreate bit, even
@@ -299,7 +312,7 @@ func (s *organizationService) Create(ctx context.Context, userID uuid.UUID, name
 	// Daily creation throttle — caps "new workspaces per owner per
 	// day" so a script can't spawn 100 orgs from one user account.
 	// Scope is the owner uuid (not the org, which doesn't exist yet).
-	if s.throttle != nil {
+	if !config.SelfHosted() && s.throttle != nil {
 		if xerr := s.throttle.CheckAndIncrement(ctx, userID, dailythrottle.ResourceOrg, config.DailyThrottleNewOrgs); xerr != nil {
 			return nil, xerr
 		}
@@ -315,13 +328,15 @@ func (s *organizationService) Create(ctx context.Context, userID uuid.UUID, name
 		return nil, errx.New(errx.NotFound, "user not found")
 	}
 
-	ownedCount, countErr := s.orgRepo.GetUserOwnedOrganizationCount(ctx, userID)
-	if countErr != nil {
-		errs.CaptureException(countErr)
-		return nil, errx.New(errx.Internal, "failed to get organization count")
-	}
-	if ownedCount >= user.MaxOrganizations {
-		return nil, errx.New(errx.Forbidden, "maximum organization limit reached")
+	if !config.SelfHosted() {
+		ownedCount, countErr := s.orgRepo.GetUserOwnedOrganizationCount(ctx, userID)
+		if countErr != nil {
+			errs.CaptureException(countErr)
+			return nil, errx.New(errx.Internal, "failed to get organization count")
+		}
+		if ownedCount >= user.MaxOrganizations {
+			return nil, errx.New(errx.Forbidden, "maximum organization limit reached")
+		}
 	}
 
 	org := &models.Organization{
@@ -413,6 +428,18 @@ func (s *organizationService) CreateTesterWorkspace(ctx context.Context, userID,
 	}
 	org.Category = models.OrganizationCategoryTest
 	return org, nil
+}
+
+func (s *organizationService) SeedTesterWorkspace(ctx context.Context, orgID, adminID uuid.UUID, ip, userAgent string) (*models.TesterSampleData, *errx.Error) {
+	result, err := s.orgRepo.SeedTesterWorkspace(ctx, orgID, adminID, ip, userAgent)
+	if errors.Is(err, repository.ErrTesterWorkspaceInactive) {
+		return nil, errx.New(errx.BadRequest, "sample data requires an active dedicated Test workspace")
+	}
+	if err != nil {
+		errs.CaptureException(err)
+		return nil, errx.New(errx.Internal, "could not add sample data; retrying is safe")
+	}
+	return result, nil
 }
 
 // Get retrieves an organization by ID
@@ -512,6 +539,9 @@ func (s *organizationService) Update(ctx context.Context, orgID uuid.UUID, req *
 // Delete deletes an organization
 func (s *organizationService) Delete(ctx context.Context, orgID uuid.UUID) *errx.Error {
 	if err := s.orgRepo.Delete(ctx, orgID); err != nil {
+		if errors.Is(err, repository.ErrOrganizationCloudLinked) {
+			return errx.NewWithIdentifier(errx.Conflict, "organization_cloud_connected", "Disconnect this workspace from Warmbly Cloud before deleting it.")
+		}
 		errs.CaptureException(err)
 		return errx.New(errx.Internal, "failed to delete organization")
 	}
@@ -620,6 +650,7 @@ func (s *organizationService) GetMembers(ctx context.Context, orgID uuid.UUID) (
 	if err := s.orgRepo.HydrateMemberRoles(ctx, orgID, members); err != nil {
 		errs.CaptureException(err)
 	}
+	s.attachMemberAccess(ctx, orgID, members)
 	return members, nil
 }
 
@@ -633,11 +664,8 @@ func (s *organizationService) GetMembership(ctx context.Context, orgID, userID u
 	return member, nil
 }
 
-// requireMember is the membership gate for handlers that carry an org id in
-// the path rather than taking it from the session. GetMembership answers
-// (nil, nil) for a non-member, so callers that only test the error let
-// everyone through; this is the form that fails closed.
-func (s *organizationService) requireMember(ctx context.Context, orgID, userID uuid.UUID) *errx.Error {
+// requireWorkspaceMember authorizes workspace-wide operations against the target membership.
+func (s *organizationService) requireWorkspaceMember(ctx context.Context, orgID, userID uuid.UUID) *errx.Error {
 	member, xerr := s.GetMembership(ctx, orgID, userID)
 	if xerr != nil {
 		return xerr
@@ -645,7 +673,36 @@ func (s *organizationService) requireMember(ctx context.Context, orgID, userID u
 	if member == nil {
 		return errx.New(errx.Forbidden, "not a member of this organization")
 	}
+	if member.IsRestricted() {
+		return errx.NewWithIdentifier(errx.Forbidden, "member_access_restricted", "Your access to this workspace is limited to selected campaigns and mailboxes, and this is outside it.")
+	}
 	return nil
+}
+
+// requireWorkspaceCreation checks account memberships independently of the selected workspace or credential.
+func (s *organizationService) requireWorkspaceCreation(ctx context.Context, userID uuid.UUID) *errx.Error {
+	members, err := s.orgRepo.GetUserOrganizations(ctx, userID)
+	if err != nil {
+		errs.CaptureException(err)
+		return errx.New(errx.Internal, "failed to load workspace memberships")
+	}
+	if len(members) == 0 {
+		return nil
+	}
+	for i := range members {
+		if !members[i].IsRestricted() {
+			return nil
+		}
+	}
+	permissions, err := s.orgRepo.GetUserAdminPermissions(ctx, userID)
+	if err != nil {
+		errs.CaptureException(err)
+		return errx.New(errx.Internal, "failed to load administrator permissions")
+	}
+	if models.AdminPermission(permissions).IsAdmin() {
+		return nil
+	}
+	return errx.NewWithIdentifier(errx.Forbidden, "member_access_restricted", "Accounts with only restricted workspace memberships cannot create workspaces.")
 }
 
 // InviteMember invites a new member to the organization
@@ -681,6 +738,13 @@ func (s *organizationService) InviteMember(ctx context.Context, orgID uuid.UUID,
 	if xerr := s.validateActorHoldsPermissions(ctx, orgID, inviterID, permissions); xerr != nil {
 		return nil, xerr
 	}
+	access := req.Access
+	if access == nil {
+		access = models.WorkspaceAccess()
+	}
+	if xerr := s.validateAccess(ctx, orgID, access); xerr != nil {
+		return nil, xerr
+	}
 
 	role := roles[0].Name
 	roleID := &roles[0].ID
@@ -703,6 +767,7 @@ func (s *organizationService) InviteMember(ctx context.Context, orgID uuid.UUID,
 		Token:          crypt.SHA256(token),
 		ExpiresAt:      time.Now().Add(s.invitationTTL(ctx)),
 		CreatedAt:      time.Now(),
+		Access:         access,
 	}
 
 	if err := s.orgRepo.CreateInvitation(ctx, inv); err != nil {
@@ -752,7 +817,23 @@ func toMemberRoles(roles []models.OrganizationRole) []models.MemberRole {
 	return out
 }
 
-// AcceptInvitation accepts an invitation and adds the user as a member
+// CreateInvitedUser provisions a new account and its invitation membership atomically.
+func (s *organizationService) CreateInvitedUser(ctx context.Context, token string, email *mail.Address, passwordHash string) (*models.User, *models.OrganizationMember, *errx.Error) {
+	u, member, err := s.orgRepo.CreateInvitedUser(ctx, crypt.SHA256(token), email, passwordHash)
+	if errors.Is(err, repository.ErrInvitationInvalid) {
+		return nil, nil, errx.ErrInvitationInvalid
+	}
+	if errors.Is(err, repository.ErrUserEmailTaken) {
+		return nil, nil, errx.ErrAccountExists
+	}
+	if err != nil {
+		errs.CaptureException(err)
+		return nil, nil, errx.InternalError()
+	}
+	return u, member, nil
+}
+
+// AcceptInvitation accepts an invitation and adds the user as a member.
 func (s *organizationService) AcceptInvitation(ctx context.Context, token string, userID uuid.UUID, email string) (*models.OrganizationMember, *errx.Error) {
 	inv, err := s.orgRepo.GetInvitationByToken(ctx, crypt.SHA256(token))
 	if err != nil {
@@ -920,6 +1001,8 @@ func (s *organizationService) acceptResolved(ctx context.Context, inv *models.Or
 		InvitedBy:      &inv.InvitedBy,
 		InvitedAt:      inv.CreatedAt,
 		AcceptedAt:     &now,
+		// Grants on resources deleted since the invite are dropped by the insert.
+		Access: inv.Access,
 	}
 	if err := s.orgRepo.AddMemberWithRoles(ctx, member, liveRoleIDs); err != nil {
 		errs.CaptureException(err)
@@ -1321,6 +1404,21 @@ func (s *organizationService) GetOrganizationCounts(ctx context.Context, orgID u
 	}, nil
 }
 
+// GetScopedOrganizationCounts reports only granted campaigns, their contacts and granted mailbox sends.
+func (s *organizationService) GetScopedOrganizationCounts(ctx context.Context, orgID uuid.UUID, scope *models.ResourceScope) (*models.OrganizationCounts, *errx.Error) {
+	if scope == nil {
+		return nil, errx.New(errx.Internal, "member access was not resolved")
+	}
+	counts, err := s.orgRepo.GetScopedOrganizationCounts(ctx, orgID, scope)
+	if err != nil || counts == nil {
+		if err != nil {
+			errs.CaptureException(err)
+		}
+		return nil, errx.New(errx.Internal, "failed to get scoped organization counts")
+	}
+	return counts, nil
+}
+
 // CreateEnterpriseInquiry creates an enterprise inquiry
 func (s *organizationService) CreateEnterpriseInquiry(ctx context.Context, inquiry *models.EnterpriseInquiry) (*models.EnterpriseInquiry, *errx.Error) {
 	inquiry.ID = uuid.New()
@@ -1614,11 +1712,8 @@ func (s *organizationService) SubmitLimitIncreaseRequest(ctx context.Context, or
 		return nil, errx.New(errx.BadRequest, "requested value must be positive")
 	}
 
-	// Membership check — only members of the org can submit requests
-	// on its behalf. Owner check happens at the per-org-permission
-	// layer for org-config writes; for limit requests any active
-	// member is acceptable.
-	if xerr := s.requireMember(ctx, orgID, submitterID); xerr != nil {
+	// Limit requests require workspace-wide access to the target organization.
+	if xerr := s.requireWorkspaceMember(ctx, orgID, submitterID); xerr != nil {
 		return nil, xerr
 	}
 
@@ -1687,7 +1782,7 @@ func (s *organizationService) SubmitLimitIncreaseRequest(ctx context.Context, or
 }
 
 func (s *organizationService) ListLimitRequestsForOrg(ctx context.Context, orgID, requesterID uuid.UUID) ([]models.LimitIncreaseRequest, *errx.Error) {
-	if xerr := s.requireMember(ctx, orgID, requesterID); xerr != nil {
+	if xerr := s.requireWorkspaceMember(ctx, orgID, requesterID); xerr != nil {
 		return nil, xerr
 	}
 	rows, err := s.orgRepo.ListLimitRequestsForOrg(ctx, orgID)
@@ -1712,6 +1807,9 @@ func (s *organizationService) CancelLimitRequest(ctx context.Context, id, userID
 	}
 	if lr.SubmittedBy != userID {
 		return errx.ErrForbidden
+	}
+	if xerr := s.requireWorkspaceMember(ctx, lr.OrganizationID, userID); xerr != nil {
+		return xerr
 	}
 	if lr.Status != models.LimitRequestStatusPending {
 		return errx.New(errx.BadRequest, "only pending requests can be cancelled")

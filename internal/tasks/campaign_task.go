@@ -504,8 +504,10 @@ func (s *tasksService) HandleCampaignTask(task *proto.ProcessTask) (result *errx
 	// This allows the tracking consumer to find the correct contact/sequence when
 	// processing open/click events from the tracking pixel service
 	if err := s.taskRepo.UpdateCampaignTaskTracking(ctx, taskID, contact.ID, sequence.ID); err != nil {
-		// Log but don't fail - tracking can still work via fallback methods
-		log.Warn().Err(err).Str("campaign_id", campaign.ID.String()).Str("task_id", taskID.String()).Msg("Failed to update campaign task tracking")
+		errs.CaptureException(err)
+		s.retryCampaignTickLater(ctx, taskRecord)
+		executionStatus = "failed"
+		return errx.InternalError()
 	}
 
 	// stop_on_reply is enforced inside FindRoutedPairs (STEP 6), and it is now
@@ -815,6 +817,10 @@ func (s *tasksService) HandleCampaignTask(task *proto.ProcessTask) (result *errx
 	// It also binds the lead to this mailbox, in the same transaction, so every
 	// remaining step of this contact's sequence leaves from the address they
 	// are about to hear from (issue #401).
+	if err := s.sendAdmission(ctx, account); err != nil {
+		s.retryCampaignTickLater(ctx, taskRecord)
+		return errx.InternalError()
+	}
 	reserved, rerr := s.campaignProgressRepo.ReserveSend(ctx, campaign.ID, contact.ID, sequence.ID, taskID, account.ID, nextPair.IsNewLead)
 	if rerr != nil {
 		// The attempt could not be made durable, so it must not be made at all.
@@ -897,7 +903,7 @@ func (s *tasksService) HandleCampaignTask(task *proto.ProcessTask) (result *errx
 		//     number of tries instead of being retried every minute for ever
 		switch {
 		case errors.Is(err, ErrSendDispatchUnknown):
-		case errors.Is(err, ErrWorkerOffline), errors.Is(err, ErrWorkerUnconfirmed):
+		case errors.Is(err, ErrWorkerOffline), errors.Is(err, ErrWorkerUnconfirmed) || errors.Is(err, repository.ErrSendAdmissionDenied):
 			if relErr := s.campaignProgressRepo.ReleaseSend(ctx, campaign.ID, contact.ID, sequence.ID, nextPair.IsNewLead); relErr != nil {
 				errs.CaptureException(relErr)
 				log.Error().Err(relErr).Str("campaign_id", campaign.ID.String()).Str("task_id", taskID.String()).Msg("Failed to release the reservation for a send that never left; the reclaimer will retry it")
@@ -911,15 +917,16 @@ func (s *tasksService) HandleCampaignTask(task *proto.ProcessTask) (result *errx
 				}
 			}
 		}
+		failureCode := campaignDispatchFailureCode(err)
 		s.taskRepo.RecordTaskFailure(ctx, taskID, "Send failed", err.Error())
 		if s.campaignLogRepo != nil {
 			s.campaignLogRepo.CreateLog(ctx, &repository.CampaignLogEntry{
 				CampaignID: campaign.ID,
 				EventType:  "email_failed",
-				Message:    fmt.Sprintf("Could not hand %s's email to a sending worker, will retry: %s", contact.Email, err.Error()),
+				Message:    fmt.Sprintf("Could not dispatch %s's email, will retry: %s", contact.Email, err.Error()),
 				Metadata: map[string]interface{}{
 					"level":       "error",
-					"code":        "WORKER_UNAVAILABLE",
+					"code":        failureCode,
 					"contact_id":  contact.ID.String(),
 					"sequence_id": sequence.ID.String(),
 					"account_id":  account.ID.String(),
@@ -934,6 +941,7 @@ func (s *tasksService) HandleCampaignTask(task *proto.ProcessTask) (result *errx
 				"campaign_id": campaign.ID.String(),
 				"contact_id":  contact.ID.String(),
 				"error":       err.Error(),
+				"code":        failureCode,
 			})
 
 			s.streamingPublisher.PublishTaskProgress(ctx, s.sendProgress(ctx, campaign, taskID, contact, sequence, "failed", processedCount, totalEmails, totalContacts))
@@ -1074,6 +1082,20 @@ func (s *tasksService) HandleCampaignTask(task *proto.ProcessTask) (result *errx
 
 	executionStatus = "completed"
 	return nil
+}
+
+func campaignDispatchFailureCode(err error) string {
+	if code := repository.SendAdmissionCode(err); code != "" {
+		return code
+	}
+	switch {
+	case errors.Is(err, ErrWorkerOffline), errors.Is(err, ErrWorkerUnconfirmed):
+		return "WORKER_UNAVAILABLE"
+	case errors.Is(err, ErrSendDispatchUnknown):
+		return "SEND_DISPATCH_UNKNOWN"
+	default:
+		return "SEND_FAILED"
+	}
 }
 
 // threadParent resolves the email this step should be sent as a reply to, or

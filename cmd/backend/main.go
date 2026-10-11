@@ -30,6 +30,7 @@ import (
 	"github.com/warmbly/warmbly/internal/observability/errs"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/warmbly/warmbly/internal/app/admindevice"
 	"github.com/warmbly/warmbly/internal/app/advisor"
 	"github.com/warmbly/warmbly/internal/app/aiagent"
 	"github.com/warmbly/warmbly/internal/app/aitools"
@@ -77,7 +78,9 @@ import (
 	"github.com/warmbly/warmbly/internal/app/mailboxavatar"
 	"github.com/warmbly/warmbly/internal/app/mailboximport"
 	"github.com/warmbly/warmbly/internal/app/mcp"
+	"github.com/warmbly/warmbly/internal/app/monitoring"
 	"github.com/warmbly/warmbly/internal/app/nativeactions"
+	"github.com/warmbly/warmbly/internal/app/nodelogs"
 	"github.com/warmbly/warmbly/internal/app/notification"
 	"github.com/warmbly/warmbly/internal/app/oauth"
 	"github.com/warmbly/warmbly/internal/app/oidcauth"
@@ -288,6 +291,7 @@ func main() {
 	// authCache is the same Redis client the services use, hoisted so the
 	// middleware handler can reach it for the pre-login per-IP limiter.
 	var authCache *cache.Cache
+	var adminDevice *admindevice.Service
 
 	// Warmup
 	var warmupService warmupapp.Service
@@ -327,6 +331,7 @@ func main() {
 	var kmsForHandler kms.Provider
 	var emailMessageMapForHandler repository.EmailMessageMapRepository
 	var emailSyncStateRepository repository.EmailSyncStateRepository
+	var warmupDispatchRepository repository.WarmupDispatchRepository
 	var trackedLinkRepository repository.TrackedLinkRepository
 	var inboxTagRepository repository.InboxTagRepository
 	var typeSafeClient *typesafe.Client
@@ -340,6 +345,7 @@ func main() {
 	// deployment with no channels simply never delivers anything.
 	var opsNotifier opsnotify.Notifier
 	var instanceChecksDB *pgxpool.Pool
+	var monitoringBus eventbus.EventBus
 	var userRepoForHandler repository.UserRepository
 	var organizationRepoForHandler repository.OrganizationRepository
 	var orgRiskService orgrisk.Service
@@ -521,11 +527,11 @@ func main() {
 				errs.CaptureFatal(err)
 				log.Fatal("Failed to provision Pub/Sub topics/subscriptions: ", err)
 			}
-			streamingPublisher = pubsub.NewStreamingPublisher(pubsubClient)
+			streamingPublisher = pubsub.NewStreamingPublisher(pubsubClient, repository.NewEventAudienceRepository(primaryDB.Pool))
 			log.Println("Realtime events published to Google Pub/Sub")
 		}
 		if streamingPublisher == nil {
-			streamingPublisher = pubsub.NewStreamingPublisher(pubsub.NewRedisBus(cache.Client, ""))
+			streamingPublisher = pubsub.NewStreamingPublisher(pubsub.NewRedisBus(cache.Client, ""), repository.NewEventAudienceRepository(primaryDB.Pool))
 			log.Println("Realtime events bridged over Redis (Pub/Sub disabled)")
 		}
 
@@ -627,6 +633,7 @@ func main() {
 			errs.CaptureFatal(err)
 			log.Fatal(err)
 		}
+		monitoringBus = bus
 
 		// The captcha bypass exists only in dev and only as an explicitly set token; there is no default.
 		turnstileBypassToken := ""
@@ -672,7 +679,7 @@ func main() {
 		inboxTagRepository = repository.NewInboxTagRepository(primaryDB.Pool)
 		if key := config.TypeSafeAPIKey(); key != "" {
 			// One TypeSafe client for every typed judgment in this process.
-			typeSafeClient = typesafe.NewClient(key)
+			typeSafeClient = typesafe.NewClient(key, typesafe.WithBillingRedis(cache.Client))
 		}
 		unsubscribeLinkRepository = repository.NewUnsubscribeLinkRepository(primaryDB.Pool)
 		customDomainRepository = repository.NewCustomDomainRepository(primaryDB.Pool)
@@ -706,6 +713,7 @@ func main() {
 		organizationRepository := repository.NewOrganizationRepository(primaryDB.Pool)
 		organizationRepoForHandler = organizationRepository
 		taskRepository := repository.NewTaskRepository(primaryDB.Pool)
+		warmupDispatchRepository = taskRepository.(repository.WarmupDispatchRepository)
 		apiKeyRepository := repository.NewAPIKeyRepository(primaryDB)
 		idempotencyService = idempotencyapp.NewService(primaryDB.Pool)
 		crmRepository := repository.NewCRMRepository(primaryDB.Pool)
@@ -869,6 +877,7 @@ func main() {
 		}
 
 		tokenService = token.NewService(primaryDB, tokenRepostory, cache, geoloc, authCfg.AuthSecret)
+		adminDevice = admindevice.New(cache, tokenService, oauthPublicBaseURL(apiCfg.Hostname), authCfg.AuthSecret)
 		// A revoked session takes the user's open sockets with it.
 		if streamingPublisher != nil {
 			tokenService.WireRevocationPublisher(streamingPublisher)
@@ -1135,6 +1144,7 @@ func main() {
 		}
 
 		cipherService = cipher.NewService(kms, cache, encryptedKeys)
+		emailMessageMapForHandler = repository.NewDurableEmailMessageMapRepository(primaryDB, cipherService)
 
 		// Third-party integrations: OAuth connect flows + encrypted token
 		// storage (sealed with the connecting user's DEK) + event-driven actions.
@@ -1188,6 +1198,7 @@ func main() {
 		// point it at your own repo/registry.
 		releasesService = releases.New(
 			releases.Config{
+				BackendVersion:  version.String(),
 				Enabled:         getenvDefault("RELEASES_ENABLED", "false") == "true",
 				GithubRepo:      getenvDefault("RELEASES_GITHUB_REPO", "warmbly/warmbly"),
 				WorkerImageRepo: getenvDefault("RELEASES_WORKER_IMAGE_REPO", "ghcr.io/warmbly/warmbly/worker"),
@@ -1292,6 +1303,19 @@ func main() {
 		cloudLinkRepository := repository.NewCloudLinkRepository(primaryDB.Pool, credEncrypter)
 		emailService.WireCloudLink(cloudLinkRepository)
 		cloudLinkService = cloudlink.NewService(cloudLinkRepository, emailRepostory, emailService)
+		cloudLinkService.OnStandingChange(func(ctx context.Context, change models.CloudLinkStandingChange) {
+			state, _, err := warmupRepository.GetHealthState(ctx, change.EmailAccountID)
+			if err == nil {
+				err = workerRepository.SetEmailAccountRiskBand(ctx, change.EmailAccountID, models.RiskBandFromHealth(state))
+			}
+			if err != nil {
+				log.Printf("cloud standing refresh: risk band update failed: %v", err)
+			}
+			warmupService.PublishHealthTransition(ctx, change.EmailAccountID, change.Previous, change.Current, change.Reason)
+		})
+		if reports, ok := analyticsService.(analytics.CloudWarmupReportsAware); ok {
+			reports.WireCloudWarmupReports(cloudLinkService)
+		}
 		// Deleting a mailbox must also revoke its cloud-held credential.
 		emailService.WireCloudUnenroll(cloudLinkService)
 		emailService.WireCloudCredentials(cloudLinkService)
@@ -1374,7 +1398,9 @@ func main() {
 			}
 			tasksClient = gclient
 		} else {
-			localTasks = tasksched.NewLocal(taskRepository, localTasksPollInterval(), 0)
+			// Leave pool headroom for HTTP admission and result reconciliation.
+			localTasks = tasksched.NewLocal(taskRepository, localTasksPollInterval(), 0,
+				tasksched.WithPoolCapacity(int(primaryDB.Config().MaxConns)))
 			tasksClient = localTasks
 		}
 
@@ -1708,6 +1734,11 @@ func main() {
 			advancedService.WireBounceJudge(typeSafeClient)
 		}
 		emailSender := tasks.NewEmailSender(emailRepostory, eventsPublisher)
+		if aware, ok := emailSender.(interface {
+			WireSendAdmission(repository.OutboundAdmissionRepository)
+		}); ok {
+			aware.WireSendAdmission(taskRepository.(repository.OutboundAdmissionRepository))
+		}
 		// Never hand a send to a worker that stopped heartbeating: nothing
 		// would execute it and nothing would report it, so the step would
 		// look sent forever. The worker reconciler re-places the mailbox and
@@ -1905,10 +1936,12 @@ func main() {
 		// that fires due tasks by id. Started here, once tasksService exists to
 		// handle them. Under gcloud this stays nil (the webhook drives dispatch).
 		if localTasks != nil {
-			go localTasks.Run(ctx, func(taskID string) {
+			go localTasks.Run(ctx, func(taskID string) error {
 				if xerr := tasksService.HandleTask(&proto.ProcessTask{TaskId: taskID}); xerr != nil {
 					log.Printf("local task dispatch failed for %s: %v", taskID, xerr)
+					return xerr
 				}
+				return nil
 			})
 		}
 
@@ -1916,7 +1949,8 @@ func main() {
 		// warming or backing a live campaign (the health-check lane). This is
 		// the bootstrap — enabling warmup or starting a campaign doesn't itself
 		// enqueue the first warmup task.
-		go tasksService.StartWarmupReconciler(ctx, 10*time.Minute)
+		go tasksService.StartWarmupReconciler(ctx, time.Minute)
+		go jobs.NewWarmupOperationsJob(warmupRepository, taskRepository, cache, opsNotifier).Start(ctx)
 
 		// Tracking-domain sweep: re-resolve every custom tracking domain hourly,
 		// re-checking each at most daily. Verification used to happen once on
@@ -2248,6 +2282,11 @@ func main() {
 		}
 	}
 
+	monitoringRepo := repository.NewMonitoringRepository(instanceChecksDB)
+	monitoringSources := append(monitoringRepo.Sources(), monitoringRepo.BrokerSources(monitoringBus)...)
+	monitoringSources = append(monitoringSources, monitoring.UnobservedSources()...)
+	monitoringService := monitoring.New(monitoringSources)
+
 	// The facts only boot knows, handed to the configuration and health pages so
 	// they report what this process actually resolved rather than re-reading the
 	// environment and drifting from it.
@@ -2287,11 +2326,15 @@ func main() {
 		InstanceRuntime:  instanceRuntime,
 		InstanceChecks:   instanceChecks,
 		InstanceSettings: instanceSettings,
+		Monitoring:       monitoringService,
 		OpsNotifier:      opsNotifier,
 
-		PoolLinkService:  poolLinkService,
-		CloudLinkService: cloudLinkService,
-		CLIAuthService:   cliAuthService,
+		PoolLinkService:   poolLinkService,
+		CloudLinkService:  cloudLinkService,
+		CLIAuthService:    cliAuthService,
+		AdminDevice:       adminDevice,
+		NodeLogs:          nodelogs.New(authCache),
+		BrokerDiagnostics: monitoringBus,
 
 		TokenService:         tokenService,
 		PasskeyService:       passkeyService,
@@ -2429,6 +2472,7 @@ func main() {
 		KMS:                    kmsForHandler,
 		EmailMessageMap:        emailMessageMapForHandler,
 		EmailSyncState:         emailSyncStateRepository,
+		WarmupDispatch:         warmupDispatchRepository,
 		TrackedLinks:           trackedLinkRepository,
 		InboxTagRepo:           inboxTagRepository,
 		UnsubscribeTickets:     unsubscribeLinkRepository,
