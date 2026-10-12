@@ -24,7 +24,7 @@ export function Topbar() {
             <MobileNav open={mobileOpen} onOpenChange={setMobileOpen} />
             <div className="flex items-center gap-2 text-[13px] font-medium">
                 <Logo className="size-4" />
-                Warmbly Admin
+                Cloudsnow Admin
             </div>
             <Button
                 variant="ghost"

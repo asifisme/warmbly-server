@@ -6,7 +6,7 @@ import { useEffect } from "react";
 import { useLocation } from "react-router-dom";
 import { flatPages, NAV_GROUPS } from "@/components/layout/nav";
 
-const BRAND = "Warmbly Admin";
+const BRAND = "Admin · Cloudsnow";
 
 const NAV_TITLES: Record<string, string> = Object.fromEntries(flatPages(NAV_GROUPS).map((p) => [p.to, p.title]));
 

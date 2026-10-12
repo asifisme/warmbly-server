@@ -310,7 +310,7 @@ export default function LoginPage() {
                             {phase === "credentials" ? (
                                 <motion.div key="credentials" {...slide}>
                                     <h1 className="text-center text-[24px] leading-tight font-semibold tracking-[-0.025em]">
-                                        Sign in to Warmbly
+                                        Sign in to Cloudsnow
                                     </h1>
                                     <p className="mt-2 text-center text-[14px] text-muted-foreground">
                                         Admin access for staff only.

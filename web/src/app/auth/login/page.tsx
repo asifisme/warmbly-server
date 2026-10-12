@@ -179,6 +179,7 @@ export default function LoginPage() {
     // CAPTCHA_PROVIDER, so login silently required reaching
     // challenges.cloudflare.com even on an air-gapped install.
     const { config: authConfig, ready: authConfigReady, unreachable: authConfigUnreachable } = useAuthConfig();
+    const brand = useBrand();
 
     // A brand new instance has no account to sign in as. Send them to the
     // claim link rather than showing a form that cannot succeed.
@@ -608,7 +609,7 @@ export default function LoginPage() {
                 if (!res.code_required) {
                     invitationConsumed.current = !!inviteToken;
                     if (res.token) {
-                        toast.success("Welcome to Warmbly!");
+                        toast.success(`Welcome to ${brand.name}!`);
                         await completeSession(res.token);
                         return;
                     }
@@ -672,7 +673,7 @@ export default function LoginPage() {
                     const created = await registerConfirmMutation.mutateAsync({ session, code });
                     invitationConsumed.current = !!inviteToken;
                     if (created?.token) {
-                        toast.success("Welcome to Warmbly!");
+                        toast.success(`Welcome to ${brand.name}!`);
                         await completeSession(created.token);
                         return;
                     }
@@ -1342,6 +1343,7 @@ function LinkStep({
     onBack: () => void;
     onSubmit: (password: string) => void;
 }) {
+    const brand = useBrand();
     const { register, handleSubmit, formState: { errors } } = useForm<z.infer<typeof signInSchema>>({
         resolver: zodResolver(signInSchema),
     });
@@ -1352,7 +1354,7 @@ function LinkStep({
                 <EmailPill email={email} onEdit={onBack} />
                 <h1 className="text-[28px] font-bold text-slate-900 tracking-tight leading-tight">Confirm it's you</h1>
                 <p className="text-sm text-slate-400 mt-1.5">
-                    This address already has a Warmbly account. Enter its password to add {providerLabel} sign-in to it.
+                    This address already has a {brand.name} account. Enter its password to add {providerLabel} sign-in to it.
                 </p>
             </div>
 

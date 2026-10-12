@@ -2,23 +2,22 @@ import { useEffect } from "react";
 import { useLocation, useMatches } from "@tanstack/react-router";
 import { useCurrentOrg, useUnseenCount } from "@/stores";
 import { setFaviconBadge } from "@/lib/faviconBadge";
+import useBrand from "@/hooks/useBrand";
 
-// "Section | Warmbly" from the deepest route's `staticData.title` in router.tsx.
+// "Section | Brand" from the deepest route's `staticData.title` in router.tsx.
 
-const BRAND = "Warmbly";
-
-function titleForMatches(title: string | undefined, notFound: boolean): string {
-  if (notFound) return `Page not found | ${BRAND}`;
-  return title ? `${title} | ${BRAND}` : BRAND;
+function titleForMatches(title: string | undefined, notFound: boolean, brand: string): string {
+  if (notFound) return `Page not found | ${brand}`;
+  return title ? `${title} | ${brand}` : brand;
 }
 
 // Fold the current workspace in as context, before the brand:
-//   "Mailboxes | Warmbly"  ->  "Mailboxes · Acme | Warmbly"
-//   "Warmbly"              ->  "Acme | Warmbly"
-function withOrg(base: string, org?: string): string {
+//   "Mailboxes | Brand"  ->  "Mailboxes · Acme | Brand"
+//   "Brand"              ->  "Acme | Brand"
+function withOrg(base: string, org: string | undefined, brand: string): string {
   if (!org) return base;
-  const suffix = ` | ${BRAND}`;
-  if (base === BRAND) return `${org}${suffix}`;
+  const suffix = ` | ${brand}`;
+  if (base === brand) return `${org}${suffix}`;
   if (base.endsWith(suffix)) return `${base.slice(0, -suffix.length)} · ${org}${suffix}`;
   return `${base} · ${org}`;
 }
@@ -31,6 +30,8 @@ function withOrg(base: string, org?: string): string {
  */
 export function useDocumentTitle(override?: string) {
   const { pathname } = useLocation();
+  const brand = useBrand();
+  const brandName = brand.name || "Cloudsnow";
   // The deepest route that names itself, so a layout never titles its pages.
   const title = useMatches({
     select: (ms) => [...ms].reverse().find((m) => m.staticData?.title)?.staticData?.title,
@@ -47,13 +48,13 @@ export function useDocumentTitle(override?: string) {
     const onApp = pathname.startsWith("/app");
     const count = onApp ? unread : 0;
 
-    const base = override ? `${override} | ${BRAND}` : titleForMatches(title, notFound);
-    const titled = withOrg(base, onApp ? org?.name : undefined);
+    const base = override ? `${override} | ${brandName}` : titleForMatches(title, notFound, brandName);
+    const titled = withOrg(base, onApp ? org?.name : undefined, brandName);
     const prefix = count > 0 ? `(${count > 99 ? "99+" : count}) ` : "";
     document.title = `${prefix}${titled}`;
 
     setFaviconBadge(count);
-  }, [pathname, title, notFound, override, org?.name, unread]);
+  }, [pathname, title, notFound, override, org?.name, unread, brandName]);
 }
 
 /** Renders nothing; keeps the title hook's router subscription off the layout it sits in. */
