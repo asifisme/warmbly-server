@@ -31,8 +31,10 @@ struct SocialSignInRow: View {
                     handleApple(result)
                 }
                 .signInWithAppleButtonStyle(colorScheme == .dark ? .white : .black)
-                .frame(height: 56)
-                .clipShape(RoundedRectangle(cornerRadius: 17))
+                // The UIKit button keeps the style it was built with; rebuild it when the theme lands.
+                .id(colorScheme)
+                .frame(height: 54)
+                .clipShape(Capsule())
                 .disabled(busy)
             }
 
@@ -48,12 +50,12 @@ struct SocialSignInRow: View {
                         GoogleGlyph()
                             .frame(width: 19, height: 19)
                         Text("Continue with Google")
-                            .font(.system(size: 17, weight: .medium))
+                            .font(.system(size: 16.5, weight: .medium))
                     }
                     .frame(maxWidth: .infinity)
-                    .frame(height: 56)
-                    .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 17))
-                    .overlay(RoundedRectangle(cornerRadius: 17).strokeBorder(Color(.separator).opacity(0.7), lineWidth: 1.2))
+                    .frame(height: 54)
+                    .background(WTheme.raised, in: Capsule())
+                    .overlay(Capsule().strokeBorder(WTheme.hairlineStrong, lineWidth: 1))
                 }
                 .buttonStyle(PressableButtonStyle())
                 .disabled(busy)
@@ -156,7 +158,8 @@ final class GoogleSignInFlow: NSObject, ASWebAuthenticationPresentationContextPr
     private var activeSession: ASWebAuthenticationSession?
     private var presentationWindow: UIWindow?
 
-    func signIn(clientID: String) async throws -> String {
+    /// `nonce`, when set, is echoed in the ID token's `nonce` claim.
+    func signIn(clientID: String, nonce: String? = nil) async throws -> String {
         // Captured up front (we're on the main actor) so the presentation
         // callback never has to conjure a window of its own.
         guard let window = Self.keyWindow else { throw Failure.malformedResponse }
@@ -178,6 +181,9 @@ final class GoogleSignInFlow: NSObject, ASWebAuthenticationPresentationContextPr
             URLQueryItem(name: "code_challenge", value: challenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
         ]
+        if let nonce {
+            authorize.queryItems?.append(URLQueryItem(name: "nonce", value: nonce))
+        }
 
         let callback = try await runWebAuth(url: authorize.url!, callbackScheme: scheme)
         guard

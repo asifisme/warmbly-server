@@ -25,16 +25,16 @@ func TestLiveParticipationPreservesNullUntilExplicitActionAndStopsBothDirections
 		t.Fatal("legacy NULL changed", row, xerr)
 	}
 	row, xerr = r.SetWarmupLifecycle(ctx, f.org.String(), f.sender.String(), "start")
-	if xerr != nil || row.TestMode == nil || *row.TestMode != models.TestParticipationDiagnostic || !row.TestSendingAllowed() || !row.TestReceivingAllowed() || row.SyntheticActionsAllowed() {
+	if xerr != nil || row.TestMode == nil || *row.TestMode != models.TestParticipationDiagnostic || !row.TestSendingAllowed() || !row.TestReceivingAllowed() || !row.SyntheticActionsAllowed() {
 		t.Fatal("explicit start lacked diagnostic consent", row, xerr)
 	}
 	started := *row.Warmup
 	row, xerr = r.SetWarmupLifecycle(ctx, f.org.String(), f.sender.String(), "pause")
-	if xerr != nil || row.TestSendingAllowed() || !row.TestReceivingAllowed() || !row.Warmup.Equal(started) {
+	if xerr != nil || row.TestSendingAllowed() || !row.TestReceivingAllowed() || !row.SyntheticActionsAllowed() || !row.Warmup.Equal(started) {
 		t.Fatal("pause lost receiving/history", row, xerr)
 	}
 	row, xerr = r.SetWarmupLifecycle(ctx, f.org.String(), f.sender.String(), "stop")
-	if xerr != nil || row.TestSendingAllowed() || row.TestReceivingAllowed() || !row.Warmup.Equal(started) {
+	if xerr != nil || row.TestSendingAllowed() || row.TestReceivingAllowed() || row.SyntheticActionsAllowed() || !row.Warmup.Equal(started) {
 		t.Fatal("stop did not fence both directions", row, xerr)
 	}
 	enable := true
@@ -85,7 +85,7 @@ func TestLiveFailedProviderAttemptSurvivesRefundAndCapsOtherLanes(t *testing.T) 
 		exec(`INSERT INTO tasks(id,task_type,email_account_id,status,message_id)VALUES($1,$2,$3,'active','')`, id, lane, f.sender)
 		return OutboundReservation{TaskID: id, MailboxID: f.sender, OrganizationID: f.org, WorkerID: worker, Provider: models.InboxProviderSMTPIMAP, Recipients: []string{"recipient@example.test"}}
 	}
-	in := reservation("email")
+	in := reservation("placement")
 	nonce, err := r.ReserveOutbound(ctx, in)
 	if err != nil {
 		t.Fatal(err)
@@ -113,10 +113,12 @@ func TestLiveFailedProviderAttemptSurvivesRefundAndCapsOtherLanes(t *testing.T) 
 	if err = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM outbound_attempts WHERE task_id=$1`, in.TaskID).Scan(&attempts); err != nil || attempts != 1 {
 		t.Fatal("duplicate execution/result changed attempts", attempts, err)
 	}
-	for _, lane := range []string{"email", "placement"} {
-		if _, err = r.ReserveOutbound(ctx, reservation(lane)); !errors.Is(err, ErrSendAdmissionDenied) {
-			t.Fatal("refunded attempt escaped shared rate limit", lane, err)
-		}
+	if _, err = r.ReserveOutbound(ctx, reservation("placement")); !errors.Is(err, ErrSendAdmissionDenied) {
+		t.Fatal("refunded attempt escaped shared rate limit", err)
+	}
+	// Manual sends sit outside the shared allocation, so they are not held to it.
+	if _, err = r.ReserveOutbound(ctx, reservation("email")); err != nil {
+		t.Fatal("manual send refused by another lane's shared limit", err)
 	}
 }
 

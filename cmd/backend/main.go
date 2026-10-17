@@ -26,6 +26,7 @@ import (
 	"github.com/warmbly/warmbly/internal/app/admin"
 	"github.com/warmbly/warmbly/internal/app/adminoutreach"
 	"github.com/warmbly/warmbly/internal/app/advanced"
+	"github.com/warmbly/warmbly/internal/app/appattest"
 	"github.com/warmbly/warmbly/internal/app/unsublink"
 	"github.com/warmbly/warmbly/internal/observability/errs"
 
@@ -214,6 +215,7 @@ func main() {
 	var uniboxService unibox.UniboxService
 	var cipherService cipher.CipherService
 	var passkeyService passkey.Service
+	var appAttestService *appattest.Service
 	var encryptedKeys encryptedkeys.Store
 	var storageBackendRepo repository.StorageBackendRepository
 	var fleetNodeRepo repository.FleetNodeRepository
@@ -584,7 +586,7 @@ func main() {
 		// are present but init fails, so Apple simply stays unavailable.
 		var appleAuthClient socialauth.AppleCodeExchanger
 		if authCfg.AppleAppID != "" || authCfg.AppleKeySecret != "" {
-			appleAuthInstance, appleErr := appleauth.NewFromBase64(
+			appleAuthInstance, appleErr := appleauth.New(
 				authCfg.AppleAppID,
 				authCfg.AppleTeamID,
 				authCfg.AppleKeyID,
@@ -958,6 +960,12 @@ func main() {
 		// gate can issue a pending challenge.
 		twofaService = twofa.NewService(repository.NewTOTPRepository(primaryDB.Pool), userRepostory, tokenService, cache, twofa.DeriveKey(authCfg.TwoFASecret))
 		authService.WireTwoFA(twofaService)
+		// The native app proves itself with App Attest where a browser solves Turnstile.
+		appAttestService = appattest.New(repository.NewAppAttestRepository(primaryDB.Pool), cache, appattest.Config{
+			AppIDs:           authCfg.AppAttestAppIDs,
+			AllowDevelopment: authCfg.AppAttestAllowDevelopment,
+		})
+		authService.WireAppAttest(appAttestService)
 
 		// Deployment-level auth policy: whether an emailed code gates a login,
 		// whether signups are open, whether verification is required. Resolved
@@ -1505,6 +1513,9 @@ func main() {
 		if aware, ok := emailSendService.(emailsend.TrackedLinksAware); ok {
 			aware.WireTrackedLinks(trackedLinkRepository)
 		}
+		if aware, ok := emailSendService.(emailsend.SuppressionAware); ok {
+			aware.WireSuppression(advancedRepository)
+		}
 		composeService = compose.NewService(emailRepostory, repository.NewComposeRepository(primaryDB))
 		// uniboxService is constructed here (rather than alongside the
 		// other service constructors above) because cancel-scheduled
@@ -1760,8 +1771,9 @@ func main() {
 		}
 		// Never hand a send to a worker that stopped heartbeating: nothing
 		// would execute it and nothing would report it, so the step would
-		// look sent forever. The worker reconciler re-places the mailbox and
-		// the dead-letter retry replays the task once it has.
+		// look sent forever. The worker reconciler re-places the mailbox; a
+		// campaign retries on its next pass, and a unibox send is refused and
+		// reported to the mailbox owner.
 		if liveness, ok := emailSender.(interface{ WireWorkerLiveness(tasks.WorkerLiveness) }); ok {
 			liveness.WireWorkerLiveness(tasks.NewWorkerLiveness(workerRepository, cache))
 		}
@@ -1989,7 +2001,8 @@ func main() {
 		// snapshot instead of running the planner (lead supply, per-mailbox
 		// history) on the request. A no-op without the snapshot store or planner.
 		if campaignService != nil {
-			go campaignService.StartSendPlanSnapshotter(ctx, time.Minute)
+			interval, maxAge := sendPlanSnapshotTiming()
+			go campaignService.StartSendPlanSnapshotter(ctx, interval, maxAge)
 		}
 
 		// Segment-linked campaigns: enrol contacts that drifted into a linked
@@ -2357,6 +2370,7 @@ func main() {
 
 		TokenService:         tokenService,
 		PasskeyService:       passkeyService,
+		AppAttestService:     appAttestService,
 		UserService:          userService,
 		EmailService:         emailService,
 		MailboxImportService: mailboxImportService,
@@ -2659,6 +2673,20 @@ func localTasksPollInterval() time.Duration {
 		return time.Second
 	}
 	return d
+}
+
+// sendPlanSnapshotTiming reads SEND_PLAN_SNAPSHOT_INTERVAL (default 1m) and
+// SEND_PLAN_SNAPSHOT_MAX_AGE (default three intervals), both Go durations.
+func sendPlanSnapshotTiming() (time.Duration, time.Duration) {
+	interval, err := time.ParseDuration(getenvDefault("SEND_PLAN_SNAPSHOT_INTERVAL", "1m"))
+	if err != nil || interval <= 0 {
+		interval = time.Minute
+	}
+	maxAge, err := time.ParseDuration(os.Getenv("SEND_PLAN_SNAPSHOT_MAX_AGE"))
+	if err != nil || maxAge <= 0 {
+		maxAge = 3 * interval
+	}
+	return interval, maxAge
 }
 
 // wsHealthURL derives the realtime service's HTTP /health URL from the

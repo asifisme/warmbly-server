@@ -838,36 +838,44 @@ func (r *contactRepository) ListVerificationCandidates(ctx context.Context, limi
 	}
 	requested := len(out)
 
-	query := `
-		SELECT c.id, c.organization_id, c.email, c.verification_requested_at
-		FROM contacts c
-		WHERE c.organization_id IS NOT NULL
+	// Each reason a contact is due is its own index-bounded arm, so a pass
+	// with nothing due reads a few index pages rather than every contact.
+	const due = `
+		SELECT c.id, c.organization_id, c.email, c.verification_requested_at,
+		       c.verification_checked_at, c.created_at
+		FROM contacts c`
+	const eligible = `
+		  AND c.organization_id IS NOT NULL
 		  AND c.verification_requested_at IS NULL
 		  AND c.verification_source <> 'manual'
 		  -- Real mail seen recently excuses the address from a check.
 		  AND (c.verification_evidence_at IS NULL OR c.verification_evidence_at < NOW() - make_interval(days => $4))
-		  AND (
-		    c.verification_checked_at IS NULL
-		    OR (c.verification_status = 'unknown' AND c.verification_checked_at < NOW() - make_interval(days => $2))
-		    OR c.verification_checked_at < NOW() - make_interval(days => $3)
-		    -- A built-in verdict reached before the workspace connected a
-		    -- verifier was reached without it; re-check once rather than after
-		    -- the shelf life. Only the built-in probe's verdicts: one a paid
-		    -- verifier already produced is a real answer, and re-checking it
-		    -- because another verifier was connected spends a credit for
-		    -- nothing.
-		    OR (
-		      c.verification_provider = $6
-		      AND EXISTS (
-		        SELECT 1 FROM integration_connections ic
-		        WHERE ic.organization_id = c.organization_id
-		          AND ic.provider = ANY($5)
-		          AND ic.status <> 'disconnected'
-		          AND c.verification_checked_at < ic.created_at
-		      )
-		    )
-		  )
 		ORDER BY c.verification_checked_at ASC NULLS FIRST, c.created_at ASC
+		LIMIT $1`
+	query := `
+		SELECT id, organization_id, email, verification_requested_at FROM (
+		  (` + due + `
+		   WHERE c.verification_checked_at IS NULL` + eligible + `)
+		  UNION
+		  (` + due + `
+		   WHERE c.verification_checked_at < NOW() - make_interval(days => LEAST($2::int, $3::int))
+		     AND ((c.verification_status = 'unknown' AND c.verification_checked_at < NOW() - make_interval(days => $2))
+		          OR c.verification_checked_at < NOW() - make_interval(days => $3))` + eligible + `)
+		  UNION
+		  -- A built-in verdict reached before the workspace connected a
+		  -- verifier was reached without it; re-check once rather than after
+		  -- the shelf life. Only the built-in probe's verdicts: one a paid
+		  -- verifier already produced is a real answer, and re-checking it
+		  -- because another verifier was connected spends a credit for
+		  -- nothing.
+		  (SELECT d.* FROM integration_connections ic
+		   CROSS JOIN LATERAL (` + due + `
+		     WHERE c.organization_id = ic.organization_id
+		       AND c.verification_provider = $6
+		       AND c.verification_checked_at < ic.created_at` + eligible + `) d
+		   WHERE ic.provider = ANY($5) AND ic.status <> 'disconnected')
+		) due
+		ORDER BY verification_checked_at ASC NULLS FIRST, created_at ASC
 		LIMIT $1
 	`
 	providers := make([]string, 0, len(models.VerificationProviders))
@@ -1522,6 +1530,26 @@ type leadRowJSON struct {
 	Hold   *models.LeadHold        `json:"hold"`
 }
 
+// contactOutreachSelect is a search row's engagement across every campaign,
+// the same counts and times the contact 360 reports. One indexed aggregate per
+// returned row, so it costs a page, not the organization.
+var contactOutreachSelect = `(
+	SELECT json_build_object(
+		'sent',    COUNT(*) FILTER (WHERE a.sent_at IS NOT NULL AND ` + progressIsEmailStep("a") + `),
+		'opened',  COUNT(*) FILTER (WHERE a.opened_at IS NOT NULL AND NOT a.opened_machine),
+		'clicked', COUNT(*) FILTER (WHERE a.clicked_at IS NOT NULL),
+		'replied', COUNT(*) FILTER (WHERE a.replied_at IS NOT NULL),
+		'bounced', COUNT(*) FILTER (WHERE a.bounced_at IS NOT NULL),
+		'last_sent_at',    MAX(a.sent_at) FILTER (WHERE ` + progressIsEmailStep("a") + `),
+		'last_opened_at',  MAX(a.opened_at) FILTER (WHERE NOT a.opened_machine),
+		'last_clicked_at', MAX(a.clicked_at),
+		'last_replied_at', MAX(a.replied_at),
+		'last_bounced_at', MAX(a.bounced_at)
+	)
+	FROM campaign_contact_progress a
+	WHERE a.contact_id = c.id
+)`
+
 func (r *contactRepository) Search(
 	ctx context.Context,
 	orgID string,
@@ -1748,6 +1776,7 @@ func (r *contactRepository) Search(
 				), '[]'::json
 			) AS categories,
 			%s AS lead_progress,
+			`+contactOutreachSelect+` AS outreach,
 			%s AS sort_value
 		FROM contacts c
 		%s
@@ -1806,6 +1835,7 @@ func (r *contactRepository) Search(
 		var campaignsJSON []byte
 		var categoriesJSON []byte
 		var leadProgressJSON []byte
+		var outreachJSON []byte
 		var sortValue *string
 
 		if err := rows.Scan(
@@ -1815,7 +1845,7 @@ func (r *contactRepository) Search(
 			&c.VerificationStatus, &c.VerificationReason, &c.IsCatchAll, &c.VerificationCheckedAt,
 			&c.VerificationSource, &c.VerificationProvider, &c.VerificationSubStatus, &c.VerificationConfidence,
 			&c.VerificationRequestedAt, &c.MailHost, &c.ESPProvider,
-			&campaignsJSON, &categoriesJSON, &leadProgressJSON,
+			&campaignsJSON, &categoriesJSON, &leadProgressJSON, &outreachJSON,
 			&sortValue,
 		); err != nil {
 			db.CaptureError(err, "", nil, "scan")
@@ -1904,6 +1934,14 @@ func (r *contactRepository) Search(
 				LastActivityAt: lp.LastAt,
 				CurrentStep:    currentStep,
 				FailureReason:  failureReason,
+			}
+		}
+
+		c.Outreach = &models.ContactOutreach{}
+		if len(outreachJSON) > 0 {
+			if err := json.Unmarshal(outreachJSON, c.Outreach); err != nil {
+				errs.CaptureException(err)
+				return nil, errx.InternalError()
 			}
 		}
 
@@ -2046,9 +2084,10 @@ func (r *contactRepository) SearchCounts(ctx context.Context, orgID string) (*mo
 			COUNT(*) FILTER (WHERE COALESCE(cl.campaign_count, 0) = 0)
 		FROM contacts c
 		LEFT JOIN (
-			SELECT contact_id, COUNT(campaign_id) AS campaign_count
-			FROM campaign_leads
-			GROUP BY contact_id
+			SELECT l.contact_id, COUNT(l.campaign_id) AS campaign_count
+			FROM campaign_leads l
+			JOIN contacts lc ON lc.id = l.contact_id AND lc.organization_id = $1
+			GROUP BY l.contact_id
 		) cl ON c.id = cl.contact_id
 		WHERE c.organization_id = $1
 	`
