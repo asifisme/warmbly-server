@@ -53,15 +53,29 @@ type CloudLinkRepository interface {
 }
 
 type cloudLinkRepository struct {
-	db      *pgxpool.Pool
-	encrypt *encrypt.Encrypter
+	db             *pgxpool.Pool
+	encrypt        *encrypt.Encrypter
+	connectSession SessionConnector
 }
 
 var errNoLinkEncrypter = errors.New("credential encrypter not configured (set CREDENTIALS_ENCRYPTION_KEY)")
 
+// CloudStatusReader reads what each Cloud-warmed mailbox shows, by the rule GetCloudStandings uses.
+type CloudStatusReader interface {
+	CloudStatuses(ctx context.Context, mailboxes []models.CloudLinkMailbox) (map[uuid.UUID]*models.WarmupHealthInfo, error)
+}
+
+func (r *cloudLinkRepository) CloudStatuses(ctx context.Context, mailboxes []models.CloudLinkMailbox) (map[uuid.UUID]*models.WarmupHealthInfo, error) {
+	linked := make(map[uuid.UUID]*models.CloudLinkMailbox, len(mailboxes))
+	for i := range mailboxes {
+		linked[mailboxes[i].EmailAccountID] = &mailboxes[i]
+	}
+	return cloudStatuses(ctx, r.db, linked)
+}
+
 // NewCloudLinkRepository seals the instance token with the mailbox credential key.
-func NewCloudLinkRepository(db *pgxpool.Pool, enc *encrypt.Encrypter) CloudLinkRepository {
-	return &cloudLinkRepository{db: db, encrypt: enc}
+func NewCloudLinkRepository(db *pgxpool.Pool, enc *encrypt.Encrypter, connector SessionConnector) CloudLinkRepository {
+	return &cloudLinkRepository{db: db, encrypt: enc, connectSession: requireSessionConnector(connector)}
 }
 
 func (r *cloudLinkRepository) CanStore() error {
@@ -241,7 +255,7 @@ func (r *cloudLinkRepository) IsEnrolled(ctx context.Context, accountID uuid.UUI
 
 const cloudLinkMailboxColumns = `email_account_id, remote_id, enrolled_at, managed,
 	health_state, health_pool_type, health_reason, health_score, blocked_until, health_evaluated_at, instance_id,
-	enrollment_state, standing_observed_at`
+	enrollment_state, standing_observed_at, settings_observed_at, smtp_cloud_account_id`
 
 func scanCloudLinkMailbox(row pgx.Row) (*models.CloudLinkMailbox, error) {
 	var m models.CloudLinkMailbox
@@ -249,7 +263,7 @@ func scanCloudLinkMailbox(row pgx.Row) (*models.CloudLinkMailbox, error) {
 	var score float64
 	var blockedUntil, evaluatedAt *time.Time
 	if err := row.Scan(&m.EmailAccountID, &m.RemoteID, &m.EnrolledAt, &m.Managed,
-		&state, &poolType, &reason, &score, &blockedUntil, &evaluatedAt, &m.InstanceID, &m.EnrollmentState, &m.StandingObservedAt); err != nil {
+		&state, &poolType, &reason, &score, &blockedUntil, &evaluatedAt, &m.InstanceID, &m.EnrollmentState, &m.StandingObservedAt, &m.SettingsObservedAt, &m.SMTPCloudAccountID); err != nil {
 		return nil, err
 	}
 	if state != nil {

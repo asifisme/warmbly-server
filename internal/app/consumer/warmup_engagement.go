@@ -46,6 +46,46 @@ func (s *JobsService) getGenerationSettings(ctx context.Context) models.WarmupGe
 	return *set
 }
 
+// Floors for mail from a sender in watch or throttled, or on a consumer host: the pool replies to and rescues more of it.
+const (
+	recoveryReplyRate     = 60
+	recoveryImportantRate = 60
+	// Below 100 so the persona bias still varies it: no mailbox rescues every message.
+	recoveryRescueRate = 95
+)
+
+// senderGetsRecoveryEngagement reports whether the sender's mail gets recovery engagement:
+// its standing is watch or throttled, or it is a consumer Gmail or Outlook.com mailbox.
+func (s *JobsService) senderGetsRecoveryEngagement(ctx context.Context, senderID uuid.UUID) bool {
+	if s.WarmupRepo != nil {
+		state, _, err := s.WarmupRepo.GetHealthState(ctx, senderID)
+		if err == nil && (state == models.WarmupHealthWatch || state == models.WarmupHealthThrottled) {
+			return true
+		}
+	}
+	if s.EmailRepository == nil {
+		return false
+	}
+	sender, xerr := s.EmailRepository.GetByID(ctx, senderID)
+	return xerr == nil && sender.ConsumerMailbox()
+}
+
+// recoveryEngagement raises the positive signals for a recovering sender's mail and never lowers them.
+func recoveryEngagement(e models.WarmupEngagementSettings) models.WarmupEngagementSettings {
+	e.SpamRescueRate = max(e.SpamRescueRate, recoveryRescueRate)
+	e.MarkReadRate = max(e.MarkReadRate, 95)
+	e.MarkImportantRate = max(e.MarkImportantRate, recoveryImportantRate)
+	return e
+}
+
+// recoveryReplyChance is the recipient's reply rate, raised for a recovering sender unless the owner turned replies off.
+func recoveryReplyChance(rate int, recovering bool) int {
+	if recovering && rate > 0 {
+		return max(rate, recoveryReplyRate)
+	}
+	return rate
+}
+
 // engagementPlan decides which recipient-side warmup actions to perform and
 // how long to wait first ("dwell"). Two goals:
 //   - break the uniform "every account marks important, instantly" bot
@@ -112,6 +152,9 @@ func splitEngagementLegs(actions []string) (immediate, delayed []string) {
 	return immediate, delayed
 }
 
+// biasedRateCeiling caps a persona-biased rate, so no mailbox performs an action every time.
+const biasedRateCeiling = 98.0
+
 // rollPct rolls a biased percentage chance. The persona bias nudges a given
 // mailbox consistently above/below the configured rate so mailboxes differ.
 func rollPct(rate int, bias float64) bool {
@@ -121,7 +164,8 @@ func rollPct(rate int, bias float64) bool {
 	if rate >= 100 {
 		return true
 	}
-	effective := float64(rate) * bias
+	// A bias never turns a configured chance into a certainty; only an explicit 100 is one.
+	effective := math.Min(float64(rate)*bias, biasedRateCeiling)
 	return rand.Float64()*100 < effective
 }
 

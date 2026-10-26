@@ -3,6 +3,7 @@ package orgtransfer
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/warmbly/warmbly/internal/app/cipher"
+	"github.com/warmbly/warmbly/internal/app/mailcred"
 	"github.com/warmbly/warmbly/internal/infrastructure/storage"
 	"github.com/warmbly/warmbly/internal/models"
 	"github.com/warmbly/warmbly/internal/pkg/displayname"
@@ -521,6 +523,14 @@ func (s *service) sealSecret(ctx context.Context, sc SecretColumn, plain string,
 			return "", errors.New("destination organization key unavailable")
 		}
 		return orgCipher.Encrypt(ctx, plain)
+	case KeyDomainMailbox:
+		if s.mailSealing == mailcred.ModeOrganization {
+			return mailcred.SealOrg(ctx, orgCipher, plain)
+		}
+		if s.creds == nil {
+			return "", errors.New("this instance has no CREDENTIALS_ENCRYPTION_KEY, so mailbox credentials cannot be stored")
+		}
+		return s.creds.Encrypt(plain)
 	}
 	return "", fmt.Errorf("column %s has no key domain", sc.Column)
 }
@@ -803,7 +813,7 @@ func (s *service) restoreBlobs(ctx context.Context, tx pgx.Tx, orgID uuid.UUID, 
 		return []string{"Attachments were not restored: this instance could not confirm which objects the archive is allowed to write."}
 	}
 
-	var failed, refused int
+	var failed, refused, notImage int
 	// Keys under the two org-scoped public prefixes are rewritten to this
 	// workspace, so the rows that name them have to be repointed or the bytes
 	// are orphaned at a path nothing reads.
@@ -831,8 +841,14 @@ func (s *service) restoreBlobs(ctx context.Context, tx pgx.Tx, orgID uuid.UUID, 
 		// the avatars, form assets and email-body images that reference it by
 		// URL resolve to a 403 on an S3 backend after the move.
 		if isPublicBlobKey(destKey) {
+			body, contentType, ok := publicImage(rc, destKey)
+			if !ok {
+				_ = rc.Close()
+				notImage++
+				continue
+			}
 			var url string
-			url, err = s.blobs.PutPublic(ctx, destKey, rc, "")
+			url, err = s.blobs.PutPublic(ctx, destKey, bytes.NewReader(body), contentType)
 			if err == nil && url != "" {
 				switch {
 				case strings.HasPrefix(destKey, models.EmailImageKeyPrefix):
@@ -897,6 +913,10 @@ func (s *service) restoreBlobs(ctx context.Context, tx pgx.Tx, orgID uuid.UUID, 
 	if refused > 0 {
 		warnings = append(warnings, fmt.Sprintf(
 			"%d object(s) in the archive named a storage location this workspace does not own, so they were not written.", refused))
+	}
+	if notImage > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"%d image(s) in the archive were not a PNG, JPG, GIF or WebP matching their name, so they were not written.", notImage))
 	}
 	return warnings
 }

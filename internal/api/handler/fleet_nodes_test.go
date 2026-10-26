@@ -274,6 +274,30 @@ func TestRenderNodeEnvBrokersCredentialProviders(t *testing.T) {
 	}
 }
 
+// A node cannot tell a hosted instance from a self-host, so it is handed the
+// mail-host policy the control plane resolved for itself.
+func TestRenderNodeEnvResolvesPrivateMailHostPolicy(t *testing.T) {
+	setInstanceEnv(t)
+	for _, tc := range []struct {
+		name, mode, appEnv, flag, want string
+	}{
+		{"hosted production refuses", "cloud", "prod", "true", "false"},
+		{"self-host allows", "self_hosted", "prod", "", "true"},
+		{"self-host opted out", "self_hosted", "prod", "false", "false"},
+		{"development allows", "cloud", "dev", "", "true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DEPLOYMENT_MODE", tc.mode)
+			t.Setenv("APP_ENV", tc.appEnv)
+			t.Setenv("MAIL_ALLOW_PRIVATE_HOSTS", tc.flag)
+			env := envLines(t, renderNodeEnv(uuid.New(), models.NodeRoleWorker, ""))
+			if env["MAIL_ALLOW_PRIVATE_HOSTS"] != tc.want {
+				t.Errorf("MAIL_ALLOW_PRIVATE_HOSTS = %q, want %q", env["MAIL_ALLOW_PRIVATE_HOSTS"], tc.want)
+			}
+		})
+	}
+}
+
 // A provider that needs no credential works on a node as it stands, and
 // translating it would break a local install for nothing.
 func TestRenderNodeEnvPassesThroughLocalProviders(t *testing.T) {
@@ -425,5 +449,56 @@ func TestRenderNodeEnvSendsOnlyTheNodeToken(t *testing.T) {
 	env = envLines(t, renderNodeEnv(uuid.New(), models.NodeRoleWorker, ""))
 	if env["ENCRYPTED_KEYS_WORKER_TOKEN"] != "tok" || env["INTERNAL_API_TOKEN"] != "tok" {
 		t.Error("a single-token instance must keep sending the shared token")
+	}
+}
+
+// A rotation reaches nodes by pulling: the env endpoint and the revision in
+// the heartbeat reply must describe the same file, or the updater loops.
+func TestFleetNodeEnvMatchesHeartbeatRevision(t *testing.T) {
+	t.Setenv("WARMBLY_VERSION", "v0.6.44")
+	t.Setenv("FLEET_IMAGE_VARIANT", "")
+	t.Setenv("CREDENTIALS_ENCRYPTION_READ_KEYS", `["`+strings.Repeat("a", 64)+`"]`)
+	id := uuid.New()
+	nodes := &joinNodes{nodeID: id, role: models.NodeRoleWorker}
+	h := &Handler{FleetNodes: fleetnode.New(nodes, nil, joinSettings{})}
+
+	get := func(query string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/internal/fleet/node-env?"+query, nil)
+		h.InternalFleetNodeEnv(c)
+		return w
+	}
+	w := get("node_id=" + id.String() + "&role=worker")
+	if w.Code != http.StatusOK {
+		t.Fatalf("enrolled node was refused its env: %d", w.Code)
+	}
+	env := envLines(t, w.Body.String())
+	if env["WARMBLY_NODE_ID"] != id.String() || env["CREDENTIALS_ENCRYPTION_READ_KEYS"] == "" {
+		t.Fatal("node env must carry the node identity and the credential read keys")
+	}
+	if _, ok := env["PRIMARY_DB"]; ok {
+		t.Fatal("a worker env must never carry a database DSN")
+	}
+	rev := w.Header().Get("X-Warmbly-Env-Revision")
+	if rev == "" || rev != fleetnode.EnvRevision(w.Body.String()) {
+		t.Fatal("the revision header must name the body it came with")
+	}
+
+	for _, q := range []string{"node_id=" + id.String() + "&role=consumer", "node_id=" + uuid.NewString() + "&role=worker", "node_id=x&role=worker"} {
+		if code := get(q).Code; code == http.StatusOK {
+			t.Fatalf("%s must be refused", q)
+		}
+	}
+
+	hw := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(hw)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/internal/fleet/heartbeat",
+		strings.NewReader(`{"node_id":"`+id.String()+`","role":"worker","env_refresh":true}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	h.FleetHeartbeat(c)
+	var reply models.NodeHeartbeatReply
+	if err := json.Unmarshal(hw.Body.Bytes(), &reply); err != nil || reply.EnvRevision != rev {
+		t.Fatalf("heartbeat revision %q must match the env endpoint's %q", reply.EnvRevision, rev)
 	}
 }

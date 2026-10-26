@@ -200,6 +200,12 @@ func (s *tasksService) HandleEmailTask(task *proto.ProcessTask) *errx.Error {
 		}
 	}
 
+	// A reply whose parent expired is closed here; the gates below would only keep rescheduling it.
+	if wt, err := s.taskRepo.GetWarmupTask(ctx, taskID); err == nil && wt != nil && wt.ParentTaskID != nil {
+		if parent, err := lineage.ExactWarmupParent(ctx, taskID); err == nil && parent == nil {
+			return s.closeWarmupThread(ctx, taskID, account.ID)
+		}
+	}
 	if err := s.sendAdmission(ctx, account); err != nil {
 		if errors.Is(err, repository.ErrSendAdmissionDenied) {
 			if err := lineage.RescheduleWarmupTask(ctx, taskID, time.Now().Add(5*time.Minute)); err != nil {
@@ -239,6 +245,11 @@ func (s *tasksService) HandleEmailTask(task *proto.ProcessTask) *errx.Error {
 			return errx.InternalError()
 		}
 		if at.After(time.Now()) {
+			// The gate answers with the window's opening; spread deferred sends past it, unless that would leave a short window.
+			jittered := at.Add(time.Duration(1+rand.Intn(20*60)) * time.Second)
+			if again, gerr := gate.WarmupDispatchNotBefore(ctx, account.ID, jittered); gerr == nil && !again.After(jittered) {
+				at = jittered
+			}
 			if err := lineage.RescheduleWarmupTask(ctx, taskID, at); err != nil {
 				return errx.InternalError()
 			}
@@ -648,6 +659,7 @@ func (s *tasksService) selectWarmupPartner(ctx context.Context, account Email) (
 		starvation:      starvation,
 		filterJunk:      filterJunk,
 		arrival:         arrival,
+		warmWhereJunked: account.ConsumerMailbox(),
 	}
 
 	// A pick that fails the gate is dropped and the draw repeats; an emptied
@@ -717,6 +729,10 @@ const (
 	// weight *= 1/(1 + k*rate). Never an exclusion: a sender that stops mailing
 	// a host cannot discover it recovered there.
 	hostPlacementPenaltyK = 4.0
+	// weight *= 1 + k*rate at Google, Microsoft and Yahoo for a free Gmail or
+	// Outlook.com sender: its mail is rescued at the recovery rate, so warming
+	// where it is junked is what repairs its standing there.
+	junkedHostBoostK = 1.0
 	// Below this many verified deliveries a host's rate is noise, not a pattern.
 	hostPlacementMinDelivered = 5
 	hostPlacementWindow       = 7 * 24 * time.Hour
@@ -749,6 +765,8 @@ type partnerSignals struct {
 	// arrival is the share of the pool's mail to a candidate that verifiably
 	// arrived; absent below the sample or when nothing was lost.
 	arrival map[uuid.UUID]float64
+	// warmWhereJunked turns the major-provider host penalty into a boost.
+	warmWhereJunked bool
 }
 
 // arrivalWeight draws a recipient in proportion to the chance the mail
@@ -789,6 +807,9 @@ func (sig partnerSignals) hostPenalty(partnerID uuid.UUID) float64 {
 	stat, ok := sig.placementByHost[host]
 	if !ok || stat.Delivered < hostPlacementMinDelivered {
 		return 1.0
+	}
+	if sig.warmWhereJunked && models.WarmupRecipientGroup(host, "") != models.WarmupRecipientOther {
+		return 1.0 + junkedHostBoostK*stat.Rate()
 	}
 	return 1.0 / (1.0 + hostPlacementPenaltyK*stat.Rate())
 }
@@ -956,6 +977,59 @@ func (s *tasksService) EnsureWarmupScheduled(ctx context.Context, accountID uuid
 		return err
 	}
 	return s.createWarmupTask(ctx, accountID, nextTime)
+}
+
+// ReplaceWarmupSchedule re-places a mailbox's parked warmup wakeup under its
+// current hours, so a schedule change takes effect now and not after a slot
+// computed under the old one. A protection hold's recovery wakeup is left alone.
+func (s *tasksService) ReplaceWarmupSchedule(ctx context.Context, accountID uuid.UUID) error {
+	mover, ok := s.taskRepo.(interface {
+		ReplaceParkedWarmupTask(context.Context, uuid.UUID, time.Time) (bool, error)
+	})
+	if !ok {
+		return nil
+	}
+	account, xerr := s.emailRepo.GetByID(ctx, accountID)
+	if xerr != nil {
+		return xerr
+	}
+	if account == nil || (s.cloudLink != nil && s.cloudLink.IsEnrolled(ctx, account.ID)) {
+		return nil
+	}
+	if s.warmupRepo != nil {
+		eligible, err := s.warmupRepo.IsPoolEligible(ctx, accountID, s.resolveWarmupPoolType(ctx, account), true)
+		if err != nil || !eligible {
+			return err
+		}
+	}
+	nextTime, err := s.scheduler.CalculateNextWarmupTime(ctx, accountID)
+	if errors.Is(err, scheduler.ErrWarmupNotEnabled) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, err = mover.ReplaceParkedWarmupTask(ctx, accountID, nextTime)
+	return err
+}
+
+func (s *tasksService) ReplaceWorkspaceWarmupSchedules(ctx context.Context, orgID uuid.UUID) {
+	lister, ok := s.emailRepo.(interface {
+		WarmingOnWorkspaceClock(context.Context, uuid.UUID) ([]uuid.UUID, error)
+	})
+	if !ok {
+		return
+	}
+	ids, err := lister.WarmingOnWorkspaceClock(ctx, orgID)
+	if err != nil {
+		return
+	}
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		_ = s.ReplaceWarmupSchedule(ctx, id)
+	}
 }
 
 // createWarmupTask creates a new warmup task in GCP Cloud Tasks

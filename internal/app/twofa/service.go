@@ -92,18 +92,32 @@ type IdentityLinker interface {
 }
 
 type service struct {
-	repo    repository.TOTPRepository
-	users   repository.UserRepository
-	tokens  token.TokenService
-	cache   *cache.Cache
-	sealKey [32]byte
-	linker  IdentityLinker
+	repo     repository.TOTPRepository
+	users    repository.UserRepository
+	tokens   token.TokenService
+	cache    *cache.Cache
+	sealKey  [32]byte
+	readKeys [][32]byte
+	linker   IdentityLinker
 }
 
 func (s *service) WireIdentityLinker(l IdentityLinker) { s.linker = l }
 
-func NewService(repo repository.TOTPRepository, users repository.UserRepository, tokens token.TokenService, c *cache.Cache, sealKey [32]byte) Service {
-	return &service{repo: repo, users: users, tokens: tokens, cache: c, sealKey: sealKey}
+func NewService(repo repository.TOTPRepository, users repository.UserRepository, tokens token.TokenService, c *cache.Cache, sealKey [32]byte, readKeys ...[32]byte) Service {
+	return &service{repo: repo, users: users, tokens: tokens, cache: c, sealKey: sealKey, readKeys: readKeys}
+}
+
+func (s *service) openSecret(sealed string) (string, error) {
+	secret, err := Open(s.sealKey, sealed)
+	if err == nil {
+		return secret, nil
+	}
+	for _, key := range s.readKeys {
+		if secret, readErr := Open(key, sealed); readErr == nil {
+			return secret, nil
+		}
+	}
+	return "", err
 }
 
 func (s *service) IsEnabled(ctx context.Context, userID uuid.UUID) (bool, error) {
@@ -185,7 +199,7 @@ func (s *service) validCode(ctx context.Context, userID uuid.UUID, row *models.U
 	if isRecoveryFormat(code) {
 		return s.tryConsumeRecoveryCode(ctx, userID, code)
 	}
-	secret, err := Open(s.sealKey, row.SecretSealed)
+	secret, err := s.openSecret(row.SecretSealed)
 	if err != nil {
 		return false
 	}
@@ -244,15 +258,15 @@ func pendingTriesKey(sid uuid.UUID) string { return pendingKey(sid) + ":tries" }
 // userTriesKey counts codes tried against one account across all its challenges.
 func userTriesKey(uid uuid.UUID) string { return "2fa_verify_user:" + uid.String() }
 
-// reserveAttempt charges one try before a code is compared. Fails open on a
-// cache error, like ipAllowed, so an outage cannot lock everyone out.
-func (s *service) reserveAttempt(ctx context.Context, key string, limit int64, window time.Duration) bool {
+// reserveAttempt charges one try before a code is compared. A cache error
+// refuses with a retryable 503, so no code is compared uncharged.
+func (s *service) reserveAttempt(ctx context.Context, key string, limit int64, window time.Duration) (bool, *errx.Error) {
 	ok, err := s.cache.ReserveAttempt(ctx, key, limit, window)
 	if err != nil {
 		errs.CaptureException(err)
-		return true
+		return false, errx.ErrAttemptCheckUnavailable
 	}
-	return ok
+	return ok, nil
 }
 
 // releaseAttempt refunds a try that compared no code.
@@ -263,18 +277,10 @@ func (s *service) releaseAttempt(ctx context.Context, key string) {
 }
 
 // ipAllowed is a coarse per-IP verify limiter (RateLimitMiddleware is a no-op
-// pre-login). Fail-open on a cache error so we never lock everyone out.
-func (s *service) ipAllowed(ctx context.Context, ip string) bool {
+// pre-login). A cache error refuses like the per-account budget does.
+func (s *service) ipAllowed(ctx context.Context, ip string) (bool, *errx.Error) {
 	if ip == "" {
-		return true
+		return true, nil
 	}
-	key := "2fa_verify_ip:" + ip
-	n, err := s.cache.Incr(ctx, key).Result()
-	if err != nil {
-		return true
-	}
-	if n == 1 {
-		_ = s.cache.Expire(ctx, key, ipWindow).Err()
-	}
-	return n <= ipLimit
+	return s.reserveAttempt(ctx, "2fa_verify_ip:"+ip, ipLimit, ipWindow)
 }

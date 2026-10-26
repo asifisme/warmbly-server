@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/warmbly/warmbly/internal/app/cipher"
 	"github.com/warmbly/warmbly/internal/app/feature"
+	"github.com/warmbly/warmbly/internal/app/mailcred"
 	warmupapp "github.com/warmbly/warmbly/internal/app/warmup"
 	"github.com/warmbly/warmbly/internal/app/webhook"
 	"github.com/warmbly/warmbly/internal/app/worker"
@@ -98,6 +99,14 @@ type EmailService interface {
 	// UpdateSMTPIMAPCredentials validates replacement credentials against a
 	// live worker, stores them, and puts the mailbox back to work.
 	UpdateSMTPIMAPCredentials(ctx context.Context, orgID *uuid.UUID, accountID uuid.UUID, creds *models.SmtpImap) (*models.Email, *errx.Error)
+	// MailboxCertificates reads an SMTP/IMAP mailbox's certificate policy per server.
+	MailboxCertificates(ctx context.Context, orgID *uuid.UUID, accountID uuid.UUID) (*models.MailboxCertificates, *errx.Error)
+	// CheckMailboxCertificates runs a connection test and reports the
+	// certificate each server presents now, changing nothing.
+	CheckMailboxCertificates(ctx context.Context, orgID *uuid.UUID, accountID uuid.UUID) (*models.MailboxCertificates, *errx.Error)
+	// ConfirmMailboxCertificates pins the fingerprints the owner confirmed
+	// after a connection test against exactly those certificates.
+	ConfirmMailboxCertificates(ctx context.Context, orgID *uuid.UUID, accountID uuid.UUID, req models.ConfirmMailboxCertificates) (*models.MailboxCertificates, *models.Email, *errx.Error)
 
 	// Optional: wire in the webhook dispatcher after construction. Once
 	// set, account-lifecycle events fan out to customer webhook endpoints.
@@ -105,6 +114,8 @@ type EmailService interface {
 	// WireMailboxAllowance attaches the allowance resolver every connect path
 	// checks. Without it the feature gate's free-or-paid split stands in.
 	WireMailboxAllowance(src MailboxAllowanceSource)
+	// WireMailboxCredentials decides whether ADD_EMAIL carries credentials sealed under the organization key.
+	WireMailboxCredentials(creds *mailcred.Sealer)
 	// WireGraphDelta attaches the Graph delta-cursor repository so the worker
 	// reconciler can seed a mailbox's saved cursors when loading it.
 	WireGraphDelta(repo repository.EmailGraphDeltaRepository)
@@ -129,6 +140,8 @@ type EmailService interface {
 	WireCloudUnenroll(u CloudUnenroller)
 	// WireCloudCredentials hands Warmbly Cloud a mailbox's credential after it changes here.
 	WireCloudCredentials(r CloudCredentialRefresher)
+	// WireCloudWarmup relays warmup edits for Cloud-warmed mailboxes to Warmbly Cloud.
+	WireCloudWarmup(r CloudWarmupRelay)
 	// ConnectDelegated stores a Gmail or Outlook mailbox reached through an
 	// administrator's grant and loads it; tokens are minted per use.
 	ConnectDelegated(ctx context.Context, userID string, orgID *uuid.UUID, data models.NewDelegatedAccount) (*models.Email, *errx.Error)
@@ -178,6 +191,7 @@ type EmailService interface {
 type emailService struct {
 	emailRepository    repository.EmailRepository
 	cipherService      cipher.CipherService
+	mailCreds          *mailcred.Sealer
 	featureGate        feature.FeatureGateService
 	warmupService      warmupapp.Service
 	publisher          events.Publisher
@@ -200,6 +214,8 @@ type emailService struct {
 	cloudUnenroll CloudUnenroller
 	// cloudCredentials re-sends a changed credential to Warmbly Cloud.
 	cloudCredentials CloudCredentialRefresher
+	// cloudWarmup takes the warmup edits Warmbly Cloud owns for the mailboxes it warms.
+	cloudWarmup CloudWarmupRelay
 	// webhookService is optional. When non-nil, account lifecycle events
 	// (email_account.connected, email_account.removed) are dispatched to
 	// subscribed customer webhooks.
@@ -327,6 +343,10 @@ type MailboxAllowanceSource interface {
 
 func (s *emailService) WireMailboxAllowance(src MailboxAllowanceSource) {
 	s.allowance = src
+}
+
+func (s *emailService) WireMailboxCredentials(creds *mailcred.Sealer) {
+	s.mailCreds = creds
 }
 
 // WireWebhooks attaches the webhook dispatcher after construction. Done

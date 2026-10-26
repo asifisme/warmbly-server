@@ -150,7 +150,8 @@ export default function ReauthModal() {
         } catch (err) {
             if (attempt.current !== mine) return;
             const { code: errCode, message } = errorOf(err);
-            if (errCode === "reauth_no_factor" || errCode === "reauth_limited") {
+            // These say nothing about which factor matched, so their own words are safe to show.
+            if (errCode === "reauth_no_factor" || errCode === "reauth_limited" || errCode === "attempt_check_unavailable") {
                 setError(message ?? "That did not work. Try again.");
             } else {
                 // One message for both factors: which one matched is not something
@@ -265,8 +266,8 @@ export default function ReauthModal() {
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                     exit={{ opacity: 0 }}
-                    // Above all dialogs and confirm modals (z-[200]).
-                    className="fixed inset-0 z-[250] bg-slate-900/30 flex items-center justify-center p-4"
+                    // Confirmation dialogs can be waiting for this identity check to finish.
+                    className="fixed inset-0 z-[210] bg-slate-900/30 flex items-center justify-center p-4"
                     onMouseDown={(e) => {
                         if (e.target === e.currentTarget) cancel();
                     }}

@@ -205,6 +205,10 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 
 	h.auditOrg(c, models.AuditActionUpdate, models.AuditEntityOrganization, orgID, nil, nil)
 
+	if req.Timezone != nil {
+		go h.replaceParkedSendsForWorkspace(*orgID)
+	}
+
 	// A presence privacy change re-gates connected sockets live (re-track /
 	// untrack / strip activity) rather than waiting for members to reconnect.
 	if req.PresenceShowOnline != nil || req.PresenceShowActivity != nil {
@@ -284,7 +288,7 @@ func (h *Handler) InviteMember(c *gin.Context) {
 		subject := fmt.Sprintf("You've been invited to join %s on %s", orgName, templates.CompanyName())
 		acceptURL := config.GetInviteURL(inv.Token, config.DashboardOriginFromContext(c.Request.Context()))
 		// GenerateInvitationHTML reports its own render errors.
-		if body, gerr := templates.GenerateInvitationHTML(inviterName, orgName, acceptURL); gerr == nil {
+		if body, gerr := templates.GenerateInvitationHTML(inviterName, orgName, acceptURL, time.Until(inv.ExpiresAt).Round(time.Hour)); gerr == nil {
 			// Detached from the request context: the handler returns before the
 			// send completes, and a cancelled context aborted the send mid-dial.
 			sendCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 45*time.Second)
@@ -407,10 +411,28 @@ func (h *Handler) GetPendingInvitations(c *gin.Context) {
 		return
 	}
 
+	includeExpired := false
+	switch c.Query("include_expired") {
+	case "", "false":
+	case "true":
+		includeExpired = true
+	default:
+		errx.JSON(c, errx.New(errx.BadRequest, "include_expired must be true or false. Leave it out to list only invitations that can still be accepted."))
+		return
+	}
+
 	invitations, xerr := h.OrganizationService.GetPendingInvitations(c.Request.Context(), *orgID)
 	if xerr != nil {
 		errx.JSON(c, xerr)
 		return
+	}
+	if includeExpired {
+		expired, xerr := h.OrganizationService.GetExpiredInvitations(c.Request.Context(), *orgID)
+		if xerr != nil {
+			errx.JSON(c, xerr)
+			return
+		}
+		invitations = append(invitations, expired...)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"data": invitations})
@@ -720,4 +742,16 @@ func parseUUIDList(raw string) ([]uuid.UUID, *errx.Error) {
 		out = append(out, id)
 	}
 	return out, nil
+}
+
+// replaceParkedSendsForWorkspace moves warmup and campaign work parked under the old workspace timezone; detached so a large workspace does not hold the request.
+func (h *Handler) replaceParkedSendsForWorkspace(orgID uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if h.CampaignService != nil {
+		h.CampaignService.RescheduleForOrganization(ctx, orgID)
+	}
+	if h.TasksService != nil {
+		h.TasksService.ReplaceWorkspaceWarmupSchedules(ctx, orgID)
+	}
 }

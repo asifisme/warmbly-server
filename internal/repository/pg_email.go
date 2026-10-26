@@ -8,10 +8,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/warmbly/warmbly/internal/app/mailcred"
 	"github.com/warmbly/warmbly/internal/config"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/infrastructure/db"
@@ -35,6 +35,11 @@ type SMTPCredentials struct {
 	IMAPUser     string
 	IMAPPassword string
 	IMAPSecurity string
+	// Owner opt-outs from CA verification and the pinned SPKI SHA-256 for each server.
+	SMTPTLSUnverified bool
+	SMTPTLSPin        string
+	IMAPTLSUnverified bool
+	IMAPTLSPin        string
 }
 
 // OAuthCredentials holds OAuth token credentials
@@ -164,6 +169,8 @@ type EmailRepository interface {
 	NewManagedAccount(ctx context.Context, userID string, data models.NewOauthAccount) (*models.Email, *errx.Error)
 	NewSMTPIMAPAccount(ctx context.Context, userID string, data models.NewSMTPIMAPAccount) (*models.Email, *errx.Error)
 	RefreshBoxToken(ctx context.Context, id uuid.UUID, accessToken, refreshToken string, expiresAt time.Time) error
+	// RefreshBoxTokenSealed stores a refreshed token a worker sealed under the mailbox's organization key.
+	RefreshBoxTokenSealed(ctx context.Context, id uuid.UUID, sealed string, expiresAt time.Time) error
 	// ReplaceSMTPIMAPCredentials overwrites a mailbox's SMTP/IMAP credential
 	// row, sealed on the same terms as at connect time.
 	ReplaceSMTPIMAPCredentials(ctx context.Context, id uuid.UUID, creds *models.SmtpImap) error
@@ -190,6 +197,8 @@ type EmailRepository interface {
 	DomainsOverview(ctx context.Context, orgID uuid.UUID) ([]models.SendingDomain, *errx.Error)
 	// CountDomainMailboxes is how many of the workspace's mailboxes are on a domain.
 	CountDomainMailboxes(ctx context.Context, orgID uuid.UUID, domain string) (int, *errx.Error)
+	// OwnedDomains are the domains the workspace has a mailbox on and the tracking hosts verified on them.
+	OwnedDomains(ctx context.Context, orgID uuid.UUID) ([]string, *errx.Error)
 	// SetDomainTracking sets one tracking host on every workspace mailbox on a domain.
 	SetDomainTracking(ctx context.Context, orgID uuid.UUID, domain, host string, verified bool, verifiedAt *time.Time) (int, *errx.Error)
 	// SetVendorLink records which vendor account a mailbox came from, for automatic reconnects.
@@ -225,7 +234,7 @@ type EmailRepository interface {
 
 type emailRepository struct {
 	DB                *db.DB
-	Encrypt           *encrypt.Encrypter
+	Creds             *mailcred.Sealer
 	transportSnapshot pgx.Tx
 }
 
@@ -239,7 +248,7 @@ func (r *emailRepository) WithTransportSnapshot(ctx context.Context, read func(E
 		return err
 	}
 	defer tx.Rollback(ctx)
-	snapshot := &emailRepository{DB: r.DB, Encrypt: r.Encrypt, transportSnapshot: tx}
+	snapshot := &emailRepository{DB: r.DB, Creds: r.Creds, transportSnapshot: tx}
 	if err := read(snapshot); err != nil {
 		return err
 	}
@@ -253,45 +262,56 @@ func (r *emailRepository) transportQueryRow(ctx context.Context, query string, a
 	return r.DB.QueryRow(ctx, query, args...)
 }
 
-// NewEmailRepostory builds the email repository. enc seals SMTP/IMAP and
-// OAuth credentials at rest (CREDENTIALS_ENCRYPTION_KEY); nil is tolerated so
-// deployments without the key keep booting, but credential reads/writes then
-// fail with a captured error instead of a nil-pointer panic.
+// NewEmailRepostory builds the email repository with credentials sealed under
+// the instance key only; nil is tolerated so deployments without the key keep
+// booting, but credential reads/writes then fail with a captured error.
 func NewEmailRepostory(db *db.DB, enc *encrypt.Encrypter) EmailRepository {
+	return NewEmailRepositoryWithSealer(db, &mailcred.Sealer{Instance: enc, Mode: mailcred.ModeInstance})
+}
+
+// NewEmailRepositoryWithSealer builds the email repository over a mailbox credential sealer.
+func NewEmailRepositoryWithSealer(db *db.DB, creds *mailcred.Sealer) EmailRepository {
 	return &emailRepository{
-		DB:      db,
-		Encrypt: enc,
+		DB:    db,
+		Creds: creds,
 	}
 }
 
-// errNoCredentialEncrypter is returned when credential sealing is attempted
-// without CREDENTIALS_ENCRYPTION_KEY configured.
-var errNoCredentialEncrypter = errors.New("credential encrypter not configured (set CREDENTIALS_ENCRYPTION_KEY)")
-
-// sealCredential encrypts a credential for storage. It fails closed: without an
-// encrypter the caller must abort rather than fall back to a plaintext write.
-func (r *emailRepository) sealCredential(plain string) (string, error) {
-	if r.Encrypt == nil {
-		return "", errNoCredentialEncrypter
+// sealCredentials seals mailbox credentials for storage. It fails closed: without a key the caller aborts rather than writing plaintext.
+func (r *emailRepository) sealCredentials(ctx context.Context, orgID *uuid.UUID, plains ...string) ([]string, error) {
+	if r.Creds == nil {
+		return nil, mailcred.ErrNoKey
 	}
-	return r.Encrypt.Encrypt(plain)
+	return r.Creds.SealAll(ctx, orgID, plains...)
 }
 
 // openCredential returns the plaintext behind a stored credential, reporting
 // whether the row was still in the pre-sealing plaintext format.
 //
 // Rows written before OAuth tokens were sealed hold the provider token verbatim
-// ("ya29...", "1//0g...", a Graph JWT), none of which is valid hex, so a
-// ParseHex/AEAD failure identifies a legacy row rather than corruption. Callers
-// re-seal on the spot so the plaintext window closes on first read.
-func (r *emailRepository) openCredential(stored string) (string, bool, error) {
-	if r.Encrypt == nil {
-		return "", false, errNoCredentialEncrypter
+// ("ya29...", "1//0g...", a Graph JWT), none of which is valid hex, so only a
+// value outside the sealed format is legacy. Callers re-seal on the spot so the
+// plaintext window closes on first read.
+func (r *emailRepository) openCredential(ctx context.Context, orgID *uuid.UUID, stored string) (string, bool, error) {
+	if r.Creds == nil {
+		return "", false, mailcred.ErrNoKey
 	}
-	if plain, err := r.Encrypt.Decrypt(stored); err == nil {
-		return plain, false, nil
+	return r.Creds.OpenOrLegacy(ctx, orgID, stored)
+}
+
+// openCredentials opens sealed credentials that have no legacy plaintext form.
+func (r *emailRepository) openCredentials(ctx context.Context, orgID *uuid.UUID, stored ...*string) error {
+	if r.Creds == nil {
+		return mailcred.ErrNoKey
 	}
-	return stored, true, nil
+	for _, v := range stored {
+		plain, err := r.Creds.Open(ctx, orgID, *v)
+		if err != nil {
+			return err
+		}
+		*v = plain
+	}
+	return nil
 }
 
 func (r *emailRepository) FindInOrganization(ctx context.Context, orgID uuid.UUID, email string) (*models.EmailRef, *errx.Error) {
@@ -414,14 +434,10 @@ func (r *emailRepository) ConvertGoogleToAppPassword(ctx context.Context, orgID,
 	if creds == nil || creds.SMTP == nil || creds.IMAP == nil {
 		return false, errx.ErrInvalid
 	}
-	sealed := make([]string, 0, 6)
-	for _, plain := range []string{creds.SMTP.Host, creds.SMTP.Username, creds.SMTP.Password, creds.IMAP.Host, creds.IMAP.Username, creds.IMAP.Password} {
-		v, err := r.sealCredential(plain)
-		if err != nil {
-			db.CaptureError(err, "", nil, "encrypt-smtp-imap")
-			return false, errx.InternalError()
-		}
-		sealed = append(sealed, v)
+	sealed, err := r.sealCredentials(ctx, &orgID, creds.SMTP.Host, creds.SMTP.Username, creds.SMTP.Password, creds.IMAP.Host, creds.IMAP.Username, creds.IMAP.Password)
+	if err != nil {
+		db.CaptureError(err, "", nil, "encrypt-smtp-imap")
+		return false, errx.InternalError()
 	}
 	query := `UPDATE email_accounts ea SET provider = 'smtp_imap', auth_method = 'app_password',
 		       mail_host = CASE WHEN $3 = '' THEN mail_host ELSE $3 END, last_id = NULL, updated_at = now()
@@ -429,14 +445,18 @@ func (r *emailRepository) ConvertGoogleToAppPassword(ctx context.Context, orgID,
 	return r.convertTx(ctx, query, []any{orgID, accountID, mailHost}, []txStep{
 		{`DELETE FROM email_accounts_oauth WHERE email_account_id = $1`, []any{accountID}},
 		{`INSERT INTO email_accounts_smtp_imap (email_account_id, smtp_host, smtp_port, smtp_user, smtp_password, smtp_security,
-		      imap_host, imap_port, imap_user, imap_password, imap_security)
-		  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		      imap_host, imap_port, imap_user, imap_password, imap_security,
+		      smtp_tls_unverified, smtp_tls_pin, imap_tls_unverified, imap_tls_pin)
+		  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		  ON CONFLICT (email_account_id) DO UPDATE SET smtp_host = EXCLUDED.smtp_host, smtp_port = EXCLUDED.smtp_port,
 		      smtp_user = EXCLUDED.smtp_user, smtp_password = EXCLUDED.smtp_password, smtp_security = EXCLUDED.smtp_security,
 		      imap_host = EXCLUDED.imap_host, imap_port = EXCLUDED.imap_port, imap_user = EXCLUDED.imap_user,
-		      imap_password = EXCLUDED.imap_password, imap_security = EXCLUDED.imap_security`,
+		      imap_password = EXCLUDED.imap_password, imap_security = EXCLUDED.imap_security,
+		      smtp_tls_unverified = EXCLUDED.smtp_tls_unverified, smtp_tls_pin = EXCLUDED.smtp_tls_pin,
+		      imap_tls_unverified = EXCLUDED.imap_tls_unverified, imap_tls_pin = EXCLUDED.imap_tls_pin`,
 			[]any{accountID, sealed[0], creds.SMTP.Port, sealed[1], sealed[2], models.ResolveSMTPSecurity(creds.SMTP.Security, creds.SMTP.Port),
-				sealed[3], creds.IMAP.Port, sealed[4], sealed[5], models.ResolveIMAPSecurity(creds.IMAP.Security, creds.IMAP.Port)}},
+				sealed[3], creds.IMAP.Port, sealed[4], sealed[5], models.ResolveIMAPSecurity(creds.IMAP.Security, creds.IMAP.Port),
+				creds.SMTP.TLSUnverified, creds.SMTP.StoredTLSPin(), creds.IMAP.TLSUnverified, creds.IMAP.StoredTLSPin()}},
 		// The Gmail cursor means nothing to IMAP, and its history is already imported.
 		{`INSERT INTO email_sync_state (email_id, user_id, backfill_status, backfill_completed_at)
 		  SELECT id, user_id, 'complete', now() FROM email_accounts WHERE id = $1
@@ -605,6 +625,34 @@ func (r *emailRepository) CountDomainMailboxes(ctx context.Context, orgID uuid.U
 		return 0, errx.InternalError()
 	}
 	return n, nil
+}
+
+func (r *emailRepository) OwnedDomains(ctx context.Context, orgID uuid.UUID) ([]string, *errx.Error) {
+	query := `
+		SELECT lower(split_part(email, '@', 2)) FROM email_accounts
+		WHERE organization_id = $1 AND position('@' in email) > 0
+		UNION
+		SELECT lower(tracking_domain) FROM email_accounts
+		WHERE organization_id = $1 AND tracking_domain <> '' AND tracking_domain_verified`
+	rows, err := r.DB.Query(ctx, query, orgID)
+	if err != nil {
+		db.CaptureError(err, query, nil, "query")
+		return nil, errx.InternalError()
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			db.CaptureError(err, query, nil, "scan")
+			return nil, errx.InternalError()
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errx.InternalError()
+	}
+	return out, nil
 }
 
 func (r *emailRepository) SetDomainTracking(ctx context.Context, orgID uuid.UUID, domain, host string, verified bool, verifiedAt *time.Time) (int, *errx.Error) {
@@ -849,6 +897,20 @@ func ensureMailboxAbsentTx(ctx context.Context, tx pgx.Tx, orgID *uuid.UUID, ema
 	return nil
 }
 
+// setNewMailboxVolumeTx starts a free Gmail or Outlook.com mailbox at the consumer volume; any other keeps the column defaults.
+func setNewMailboxVolumeTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, mailHost, provider, address string) *errx.Error {
+	if !models.ConsumerMailboxHost(mailHost, provider, address) {
+		return nil
+	}
+	limit, gap, warmupMax := models.NewMailboxVolume(mailHost, provider, address)
+	query := `UPDATE email_accounts SET campaign_limit = $2, min_wait_time = $3, warmup_max = $4 WHERE id = $1`
+	if _, err := tx.Exec(ctx, query, id, limit, gap, warmupMax); err != nil {
+		db.CaptureError(err, query, nil, "exec")
+		return errx.InternalError()
+	}
+	return nil
+}
+
 func (r *emailRepository) NewOauthAccount(ctx context.Context, userID string, data models.NewOauthAccount) (*models.Email, *errx.Error) {
 	if data.Provider == models.InboxProviderSMTPIMAP {
 		errs.CaptureException(errors.New("invalid inbox provider"))
@@ -857,16 +919,12 @@ func (r *emailRepository) NewOauthAccount(ctx context.Context, userID string, da
 
 	// Seal before opening the transaction so a misconfigured encrypter aborts
 	// the connect instead of writing provider tokens in the clear.
-	encAccessToken, encErr := r.sealCredential(data.AccessToken)
+	sealedTokens, encErr := r.sealCredentials(ctx, data.OrganizationID, data.AccessToken, data.RefreshToken)
 	if encErr != nil {
-		db.CaptureError(encErr, "", nil, "encrypt-access-token")
+		db.CaptureError(encErr, "", nil, "encrypt-oauth-tokens")
 		return nil, errx.InternalError()
 	}
-	encRefreshToken, encErr := r.sealCredential(data.RefreshToken)
-	if encErr != nil {
-		db.CaptureError(encErr, "", nil, "encrypt-refresh-token")
-		return nil, errx.InternalError()
-	}
+	encAccessToken, encRefreshToken := sealedTokens[0], sealedTokens[1]
 
 	tx, err := r.DB.Begin(ctx)
 	if err != nil {
@@ -925,6 +983,9 @@ func (r *emailRepository) NewOauthAccount(ctx context.Context, userID string, da
 		db.CaptureError(err, query, nil, "queryrow")
 		return nil, errx.InternalError()
 	}
+	if xerr := setNewMailboxVolumeTx(ctx, tx, id, data.MailHost, string(data.Provider), data.Email); xerr != nil {
+		return nil, xerr
+	}
 
 	query = `
 		INSERT INTO email_accounts_oauth (email_account_id, access_token, refresh_token, expires_at)
@@ -954,6 +1015,7 @@ func (r *emailRepository) NewOauthAccount(ctx context.Context, userID string, da
 		return nil, errx.InternalError()
 	}
 
+	limit, gap, warmupMax := models.NewMailboxVolume(data.MailHost, string(data.Provider), data.Email)
 	return &models.Email{
 		ID:             id,
 		UserID:         userID,
@@ -974,11 +1036,11 @@ func (r *emailRepository) NewOauthAccount(ctx context.Context, userID string, da
 
 		LastSyncedAt: t,
 
-		CampaignLimit: config.CampaignLimitDefault,
-		MinWaitTime:   config.MinWaitTimeDefault,
+		CampaignLimit: limit,
+		MinWaitTime:   gap,
 
 		WarmupBase:      config.WarmupBaseDefault,
-		WarmupMax:       config.WarmupMaxDefault,
+		WarmupMax:       warmupMax,
 		WarmupIncrease:  config.WarmupIncreaseDefault,
 		WarmupStartTime: "08:00",
 		WarmupEndTime:   "20:00",
@@ -1001,22 +1063,39 @@ func (r *emailRepository) NewManagedAccount(ctx context.Context, userID string, 
 	if data.ID != uuid.Nil {
 		id = data.ID
 	}
+	tx, err := r.DB.Begin(ctx)
+	if err != nil {
+		return nil, errx.InternalError()
+	}
+	defer tx.Rollback(ctx)
+	if xerr := ensureMailboxAbsentTx(ctx, tx, data.OrganizationID, data.Email); xerr != nil {
+		return nil, xerr
+	}
 	query := withNewMailboxBehavior(`
 		INSERT INTO email_accounts (id, user_id, organization_id, email, name, provider, signature_plain, signature_html, tracking_domain, last_synced_at, created_at, updated_at, warmup_tag, mail_host, auth_method)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $10, $11, $12, $13)
 	`, true)
-	if _, err := r.DB.Exec(ctx, query, id, userID, data.OrganizationID, data.Email, data.Name, data.Provider, sigplain, sightml, "", t, "", data.MailHost, models.MailAuthOAuth); err != nil {
+	if _, err := tx.Exec(ctx, query, id, userID, data.OrganizationID, data.Email, data.Name, data.Provider, sigplain, sightml, "", t, "", data.MailHost, models.MailAuthOAuth); err != nil {
 		db.CaptureError(err, query, nil, "exec")
+		return nil, errx.InternalError()
+	}
+	if xerr := setNewMailboxVolumeTx(ctx, tx, id, data.MailHost, string(data.Provider), data.Email); xerr != nil {
+		return nil, xerr
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, errx.InternalError()
 	}
 	return r.GetByID(ctx, id)
 }
 
 func (r *emailRepository) NewSMTPIMAPAccount(ctx context.Context, userID string, data models.NewSMTPIMAPAccount) (*models.Email, *errx.Error) {
-	if r.Encrypt == nil {
-		errs.CaptureException(errNoCredentialEncrypter)
+	// Seal before the transaction so a key lookup never holds the organization's mailbox lock.
+	sealed, sealErr := r.sealCredentials(ctx, data.OrganizationID, data.SMTP.Host, data.SMTP.Username, data.SMTP.Password, data.IMAP.Host, data.IMAP.Username, data.IMAP.Password)
+	if sealErr != nil {
+		errs.CaptureException(sealErr)
 		return nil, errx.InternalError()
 	}
+	smtphost, smtpuser, smtppass, imaphost, imapuser, imappass := sealed[0], sealed[1], sealed[2], sealed[3], sealed[4], sealed[5]
 	tx, err := r.DB.Begin(ctx)
 	if err != nil {
 		db.CaptureError(err, "", nil, "begin")
@@ -1066,47 +1145,20 @@ func (r *emailRepository) NewSMTPIMAPAccount(ctx context.Context, userID string,
 		db.CaptureError(err, query, nil, "exec")
 		return nil, errx.InternalError()
 	}
-
-	smtphost, err := r.Encrypt.Encrypt(data.SMTP.Host)
-	if err != nil {
-		errs.CaptureException(err)
-		return nil, errx.InternalError()
-	}
-	smtpuser, err := r.Encrypt.Encrypt(data.SMTP.Username)
-	if err != nil {
-		errs.CaptureException(err)
-		return nil, errx.InternalError()
-	}
-	smtppass, err := r.Encrypt.Encrypt(data.SMTP.Password)
-	if err != nil {
-		errs.CaptureException(err)
-		return nil, errx.InternalError()
-	}
-
-	imaphost, err := r.Encrypt.Encrypt(data.IMAP.Host)
-	if err != nil {
-		errs.CaptureException(err)
-		return nil, errx.InternalError()
-	}
-	imapuser, err := r.Encrypt.Encrypt(data.IMAP.Username)
-	if err != nil {
-		errs.CaptureException(err)
-		return nil, errx.InternalError()
-	}
-	imappass, err := r.Encrypt.Encrypt(data.IMAP.Password)
-	if err != nil {
-		errs.CaptureException(err)
-		return nil, errx.InternalError()
+	if xerr := setNewMailboxVolumeTx(ctx, tx, id, data.MailHost, string(models.InboxProviderSMTPIMAP), data.Email); xerr != nil {
+		return nil, xerr
 	}
 
 	query = `
 		INSERT INTO email_accounts_smtp_imap (
 		  email_account_id,
 		  smtp_host, smtp_port, smtp_user, smtp_password, smtp_security,
-		  imap_host, imap_port, imap_user, imap_password, imap_security
+		  imap_host, imap_port, imap_user, imap_password, imap_security,
+		  smtp_tls_unverified, smtp_tls_pin, imap_tls_unverified, imap_tls_pin
 		) VALUES (
 		 $1, $2, $3, $4, $5, $6,
-		 $7, $8, $9, $10, $11)
+		 $7, $8, $9, $10, $11,
+		 $12, $13, $14, $15)
 	`
 
 	params = []any{
@@ -1114,6 +1166,7 @@ func (r *emailRepository) NewSMTPIMAPAccount(ctx context.Context, userID string,
 		models.ResolveSMTPSecurity(data.SMTP.Security, data.SMTP.Port),
 		imaphost, data.IMAP.Port, imapuser, imappass,
 		models.ResolveIMAPSecurity(data.IMAP.Security, data.IMAP.Port),
+		data.SMTP.TLSUnverified, data.SMTP.StoredTLSPin(), data.IMAP.TLSUnverified, data.IMAP.StoredTLSPin(),
 	}
 
 	_, err = tx.Exec(
@@ -1131,6 +1184,7 @@ func (r *emailRepository) NewSMTPIMAPAccount(ctx context.Context, userID string,
 		return nil, errx.InternalError()
 	}
 
+	limit, gap, warmupMax := models.NewMailboxVolume(data.MailHost, string(models.InboxProviderSMTPIMAP), data.Email)
 	return &models.Email{
 		ID:             id,
 		UserID:         userID,
@@ -1151,11 +1205,11 @@ func (r *emailRepository) NewSMTPIMAPAccount(ctx context.Context, userID string,
 
 		LastSyncedAt: t,
 
-		CampaignLimit: config.CampaignLimitDefault,
-		MinWaitTime:   config.MinWaitTimeDefault,
+		CampaignLimit: limit,
+		MinWaitTime:   gap,
 
 		WarmupBase:      config.WarmupBaseDefault,
-		WarmupMax:       config.WarmupMaxDefault,
+		WarmupMax:       warmupMax,
 		WarmupIncrease:  config.WarmupIncreaseDefault,
 		WarmupStartTime: "08:00",
 		WarmupEndTime:   "20:00",
@@ -1309,7 +1363,7 @@ func (r *emailRepository) Search(ctx context.Context, orgID, search string, curs
 func (r *emailRepository) Get(ctx context.Context, orgID, emailAccountID string) (*models.Email, *errx.Error) {
 	query := `
 		SELECT
-		ea.id, ea.email, ea.name, ea.signature_plain, ea.signature_html, ea.signature_sync, ea.signature_code, ea.send_as_email,
+		ea.id, ea.organization_id, ea.email, ea.name, ea.signature_plain, ea.signature_html, ea.signature_sync, ea.signature_code, ea.send_as_email,
 		 ea.provider, ea.mail_host, ea.auth_method, ea.domain_grant_id, ea.vendor_connection_id, COALESCE((SELECT vc.vendor FROM mailbox_vendor_connections vc WHERE vc.id = ea.vendor_connection_id), ''), ea.avatar_url, ea.status, COALESCE(ea.last_synced_at, ea.created_at) AS last_synced_at, ea.last_id, ea.campaign_limit,
 		 ea.min_wait_time, ea.reply_to, ea.tracking_domain, ea.tracking_domain_verified, ea.tracking_domain_verified_at, ea.track_direct_mail,
 		 ea.auth_state, ea.auth_spf, ea.auth_dkim, ea.auth_dmarc, ea.auth_dmarc_policy, ea.auth_reason, ea.auth_checked_at, ea.auth_failing_since,
@@ -1334,7 +1388,7 @@ func (r *emailRepository) Get(ctx context.Context, orgID, emailAccountID string)
 		query,
 		params...,
 	).Scan(
-		&i.ID, &i.Email, &i.Name, &i.SignaturePlain, &i.SignatureHTML, &i.SignatureSync, &i.SignatureCode, &i.SendAsEmail, &i.Provider, &i.MailHost, &i.AuthMethod, &i.DomainGrantID, &i.VendorConnectionID, &i.Vendor, &i.AvatarURL, &i.Status,
+		&i.ID, &i.OrganizationID, &i.Email, &i.Name, &i.SignaturePlain, &i.SignatureHTML, &i.SignatureSync, &i.SignatureCode, &i.SendAsEmail, &i.Provider, &i.MailHost, &i.AuthMethod, &i.DomainGrantID, &i.VendorConnectionID, &i.Vendor, &i.AvatarURL, &i.Status,
 		&i.LastSyncedAt, &i.LastID, &i.CampaignLimit, &i.MinWaitTime, &i.ReplyTo, &i.TrackingDomain, &i.TrackingDomainVerified, &i.TrackingDomainVerifiedAt, &i.TrackDirectMail,
 		&i.AuthState, &i.AuthSPF, &i.AuthDKIM, &i.AuthDMARC, &i.AuthDMARCPolicy, &i.AuthReason, &i.AuthCheckedAt, &i.AuthFailingSince,
 		&i.Warmup, &i.WarmupPausedAt, &i.WarmupBase, &i.WarmupMax, &i.WarmupIncrease, &i.WarmupReplyRate, &i.WarmupTag, &i.WarmupPoolType,
@@ -1365,35 +1419,21 @@ func (r *emailRepository) Update(ctx context.Context, orgID, emailAccountID stri
 	args := []any{orgID, emailAccountID}
 	argPos := 3
 	statusSQL := "status"
+	if xerr := validate.MailboxUpdate(udata); xerr != nil {
+		return nil, xerr
+	}
 
 	if udata.Name != nil {
-		if !validate.EmailName(udata.Name) {
-			return nil, errx.ErrEmailName
-		}
-		if xerr := validate.MailboxNameShown(*udata.Name); xerr != nil {
-			return nil, xerr
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "name", argPos))
 		args = append(args, *udata.Name)
 		argPos++
 	}
 	if udata.SignaturePlain != nil {
-		// Characters, not bytes: the documented limit is in characters, and
-		// len() turned a perfectly ordinary Cyrillic or CJK signature into one
-		// that is "too long" at a third of it.
-		l := utf8.RuneCountInString(*udata.SignaturePlain)
-		if l > config.SignaturePlainMax {
-			return nil, errx.ErrEmailSignaturePlain
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "signature_plain", argPos))
 		args = append(args, *udata.SignaturePlain)
 		argPos++
 	}
 	if udata.SignatureHTML != nil {
-		l := utf8.RuneCountInString(*udata.SignatureHTML)
-		if l > config.SignatureHTMLMax {
-			return nil, errx.ErrEmailSignatureHTML
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "signature_html", argPos))
 		args = append(args, *udata.SignatureHTML)
 		argPos++
@@ -1405,9 +1445,6 @@ func (r *emailRepository) Update(ctx context.Context, orgID, emailAccountID stri
 	}
 	if udata.Timezone != nil {
 		tz := strings.TrimSpace(*udata.Timezone)
-		if verr := validate.EmailTimezone(tz); verr != nil {
-			return nil, verr
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "timezone", argPos))
 		args = append(args, tz)
 		argPos++
@@ -1448,11 +1485,7 @@ func (r *emailRepository) Update(ctx context.Context, orgID, emailAccountID stri
 		argPos++
 	}
 	if udata.Status != nil {
-		// Validate status - must be one of: active, inactive, revoked
 		status := *udata.Status
-		if status != "active" && status != "inactive" && status != "revoked" {
-			return nil, errx.ErrInvalid
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "status", argPos))
 		statusSQL = fmt.Sprintf("$%d::email_status", argPos)
 		args = append(args, status)
@@ -1466,35 +1499,20 @@ func (r *emailRepository) Update(ctx context.Context, orgID, emailAccountID stri
 		}
 	}
 	if udata.CampaignLimit != nil {
-		if *udata.CampaignLimit < config.LimitMin || *udata.CampaignLimit > config.LimitMax {
-			return nil, errx.ErrEmailCampaignLimit
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "campaign_limit", argPos))
 		args = append(args, *udata.CampaignLimit)
 		argPos++
 	}
 	if udata.MinWaitTime != nil {
-		if *udata.MinWaitTime < 0 || *udata.MinWaitTime > 86400 {
-			return nil, errx.ErrEmailMinWaitTime
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "min_wait_time", argPos))
 		args = append(args, *udata.MinWaitTime)
 		argPos++
 	}
 	if udata.ReplyTo != nil {
 		*udata.ReplyTo = strings.TrimSpace(*udata.ReplyTo)
-		if *udata.ReplyTo != "" && !validate.Email(*udata.ReplyTo) {
-			return nil, errx.ErrEmail
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "reply_to", argPos))
 		args = append(args, *udata.ReplyTo)
 		argPos++
-	}
-	// Cross-field guard: starting volume must not exceed the ceiling. Only
-	// enforced when both arrive together (the warmup form always sends both);
-	// each is still independently clamped below.
-	if udata.WarmupBase != nil && udata.WarmupMax != nil && *udata.WarmupBase > *udata.WarmupMax {
-		return nil, errx.ErrEmailWarmupBase
 	}
 	if udata.Warmup != nil {
 		if udata.TestMode == nil {
@@ -1517,103 +1535,56 @@ func (r *emailRepository) Update(ctx context.Context, orgID, emailAccountID stri
 		}
 	}
 	if udata.WarmupBase != nil {
-		if *udata.WarmupBase < 0 || *udata.WarmupBase > 100 {
-			return nil, errx.ErrEmailWarmupBase
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "warmup_base", argPos))
 		args = append(args, *udata.WarmupBase)
 		argPos++
 	}
 	if udata.WarmupMax != nil {
-		if *udata.WarmupMax < 0 || *udata.WarmupMax > 100 {
-			return nil, errx.ErrEmailWarmupMax
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "warmup_max", argPos))
 		args = append(args, *udata.WarmupMax)
 		argPos++
 	}
 	if udata.WarmupIncrease != nil {
-		if *udata.WarmupIncrease < 0 || *udata.WarmupIncrease > 100 {
-			return nil, errx.ErrEmailWarmupIncrease
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "warmup_increase", argPos))
 		args = append(args, *udata.WarmupIncrease)
 		argPos++
 	}
 	if udata.WarmupReplyRate != nil {
-		if *udata.WarmupReplyRate < 0 || *udata.WarmupReplyRate > 100 {
-			return nil, errx.ErrEmailReplyRate
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "warmup_reply_rate", argPos))
 		args = append(args, *udata.WarmupReplyRate)
 		argPos++
 	}
 	if udata.WarmupTag != nil {
-		// warmup_tag is the content segment: a lowercase slug (e.g. "saas",
-		// "agency") that the segment-aware AI content bank is keyed on. Empty
-		// = generic content. Reject anything that isn't a simple slug so it
-		// can't smuggle arbitrary text into the content-selection path.
-		seg := strings.ToLower(strings.TrimSpace(*udata.WarmupTag))
-		if len(seg) > 32 {
-			return nil, errx.ErrInvalid
-		}
-		for _, r := range seg {
-			if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-') {
-				return nil, errx.ErrInvalid
-			}
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "warmup_tag", argPos))
-		args = append(args, seg)
+		args = append(args, strings.ToLower(strings.TrimSpace(*udata.WarmupTag)))
 		argPos++
 	}
 	if udata.WarmupStartTime != nil {
-		if err := validate.CampaignTime(*udata.WarmupStartTime); err != nil {
-			return nil, err
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "warmup_start_time", argPos))
 		args = append(args, *udata.WarmupStartTime)
 		argPos++
 	}
 	if udata.WarmupEndTime != nil {
-		if err := validate.CampaignTime(*udata.WarmupEndTime); err != nil {
-			return nil, err
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "warmup_end_time", argPos))
 		args = append(args, *udata.WarmupEndTime)
 		argPos++
 	}
 	if udata.WarmupDays != nil {
-		if *udata.WarmupDays < 0 || *udata.WarmupDays > 127 {
-			return nil, errx.ErrInvalid
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "warmup_days", argPos))
 		args = append(args, *udata.WarmupDays)
 		argPos++
 	}
 	if udata.WarmupPlacement != nil {
-		if !models.ValidWarmupPlacement(*udata.WarmupPlacement) {
-			return nil, errx.ErrEmailWarmupPlacement
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "warmup_placement", argPos))
 		args = append(args, *udata.WarmupPlacement)
 		argPos++
 	}
 	if udata.WarmupFolder != nil {
-		// The value becomes a mailbox name on the provider, so it stays a
-		// single-level, printable name: a separator would create a child of
-		// whatever it names, and a control character is refused by IMAP.
-		folder := strings.TrimSpace(*udata.WarmupFolder)
-		if err := validate.WarmupFolder(folder); err != nil {
-			return nil, err
-		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", "warmup_folder", argPos))
-		args = append(args, folder)
+		args = append(args, strings.TrimSpace(*udata.WarmupFolder))
 		argPos++
 	}
 	if udata.WarmupRetentionDays != nil {
-		if !models.ValidWarmupRetentionDays(*udata.WarmupRetentionDays) {
-			return nil, errx.ErrEmailWarmupRetention
-		}
 		// Zero is "follow the instance", stored as NULL so a later change to
 		// the instance setting reaches every mailbox that never chose.
 		setClauses = append(setClauses, fmt.Sprintf("%s = NULLIF($%d, 0)", "warmup_retention_days", argPos))
@@ -1628,9 +1599,6 @@ func (r *emailRepository) Update(ctx context.Context, orgID, emailAccountID stri
 		udata.TestMode = &mode
 	}
 	if udata.TestMode != nil {
-		if *udata.TestMode != "diagnostic" && *udata.TestMode != "off" {
-			return nil, errx.ErrNotEnough
-		}
 		setClauses = append(setClauses, fmt.Sprintf("test_mode = $%d", argPos))
 		modeSQL = fmt.Sprintf("$%d", argPos)
 		args = append(args, *udata.TestMode)
@@ -1663,9 +1631,6 @@ func (r *emailRepository) Update(ctx context.Context, orgID, emailAccountID stri
 		{"shared_daily_limit", udata.SharedDailyLimit}, {"rolling_recipient_limit", udata.RollingRecipientLimit},
 	} {
 		if setting.value != nil {
-			if *setting.value < 0 {
-				return nil, errx.ErrNotEnough
-			}
 			setClauses = append(setClauses, fmt.Sprintf("%s = NULLIF($%d, 0)", setting.column, argPos))
 			args = append(args, *setting.value)
 			argPos++
@@ -1707,8 +1672,10 @@ func (r *emailRepository) Update(ctx context.Context, orgID, emailAccountID stri
 		}
 		direction := ""
 		diagnostic := currentMode != nil && *currentMode == "diagnostic"
-		sendingOff := currentPaused || diagnostic && !currentSend || udata.TestSendEnabled != nil && !*udata.TestSendEnabled
-		receivingOff := diagnostic && !currentReceive || udata.TestReceiveEnabled != nil && !*udata.TestReceiveEnabled
+		// Pausing warmup stops both directions whatever participation flags the same request sends.
+		pausing := currentPaused || udata.Warmup != nil && !*udata.Warmup
+		sendingOff := pausing || diagnostic && !currentSend || udata.TestSendEnabled != nil && !*udata.TestSendEnabled
+		receivingOff := pausing || diagnostic && !currentReceive || udata.TestReceiveEnabled != nil && !*udata.TestReceiveEnabled
 		if currentStatus != "active" || udata.Status != nil && *udata.Status != "active" || currentMode != nil && *currentMode == "off" || udata.TestMode != nil && *udata.TestMode == "off" || sendingOff && receivingOff {
 			direction = "both"
 		} else if sendingOff {
@@ -1753,9 +1720,8 @@ func (r *emailRepository) Update(ctx context.Context, orgID, emailAccountID stri
 		if udata.WarmupEndTime != nil {
 			end = *udata.WarmupEndTime
 		}
-		startMinute, endMinute := models.ClockMinutes(start, -1), models.ClockMinutes(end, -1)
-		if startMinute < 0 || endMinute < 0 || endMinute <= startMinute {
-			return nil, errx.New(errx.BadRequest, "warmup end time must be later than start time on the same day")
+		if xerr := validate.WarmupWindow(start, end); xerr != nil {
+			return nil, xerr
 		}
 	}
 	if udata.SendRecoveryResolution != nil {
@@ -1777,7 +1743,7 @@ func (r *emailRepository) Update(ctx context.Context, orgID, emailAccountID stri
 		 FROM email_accounts ea LEFT JOIN tasks t ON t.id=ea.send_recovery_task_id
 		 WHERE ea.organization_id=$1 AND ea.id=$2 AND ea.status='active' AND ea.send_recovery_hold AND ea.send_recovery_task_id=$6 AND ea.send_recovery_reason=$7 AND ea.send_recovery_reason IN('authentication','permanent','conflict')
 		 AND (ea.send_cooldown_provider IS NULL OR ea.send_cooldown_provider=ea.provider::text) FOR UPDATE OF ea),
-		 valid AS(SELECT * FROM held WHERE NOT EXISTS(SELECT 1 FROM tasks u WHERE u.email_account_id=held.id AND u.send_result_state='unknown' AND u.send_result_applied_at IS NULL)
+		 valid AS(SELECT * FROM held WHERE NOT EXISTS(SELECT 1 FROM tasks u WHERE u.email_account_id=held.id AND u.send_result_state='unknown' AND u.send_result_applied_at IS NULL AND u.warmup_send_retired_at IS NULL)
 		 AND (($3='authentication_repaired' AND held.send_recovery_reason='authentication' AND $4::uuid IS NOT NULL
 		 AND EXISTS(SELECT 1 FROM tasks e WHERE e.id=$4 AND e.email_account_id=held.id AND e.send_result_state='sent' AND e.send_result_applied_at>held.completed_at AND e.send_executor_started_at>held.completed_at))
 		 OR ($3='operator_provider_confirmation' AND held.send_recovery_reason IN('authentication','permanent','conflict') AND length($5)>0 AND $4::uuid IS NOT NULL
@@ -2329,7 +2295,8 @@ func (r *emailRepository) SetWarmupLifecycle(ctx context.Context, orgID, emailAc
 	}
 	diagnostic := currentMode != nil && *currentMode == "diagnostic"
 	sendingOff := currentPaused || action == "pause" || diagnostic && !currentSend
-	receivingOff := diagnostic && !currentReceive
+	// Warmup off stops receiving as well as sending.
+	receivingOff := currentPaused || action == "pause" || diagnostic && !currentReceive
 	direction := ""
 	if action == "stop" || action == "disable" || currentStatus != "active" || currentMode != nil && *currentMode == "off" || sendingOff && receivingOff {
 		direction = "both"
@@ -2688,23 +2655,25 @@ func (r *emailRepository) GetByCampaignSenders(ctx context.Context, scope Accoun
 
 // GetSMTPCredentials retrieves SMTP/IMAP credentials for an email account
 func (r *emailRepository) GetSMTPCredentials(ctx context.Context, emailAccountID uuid.UUID) (*SMTPCredentials, *errx.Error) {
-	if r.Encrypt == nil {
-		errs.CaptureException(errNoCredentialEncrypter)
+	if r.Creds == nil {
+		errs.CaptureException(mailcred.ErrNoKey)
 		return nil, errx.InternalError()
 	}
 	query := `
-		SELECT smtp_host, smtp_port, smtp_user, smtp_password, smtp_security,
-		       imap_host, imap_port, imap_user, imap_password, imap_security
-		FROM email_accounts_smtp_imap
-		WHERE email_account_id = $1
+		SELECT ea.organization_id, s.smtp_host, s.smtp_port, s.smtp_user, s.smtp_password, s.smtp_security,
+		       s.imap_host, s.imap_port, s.imap_user, s.imap_password, s.imap_security,
+		       s.smtp_tls_unverified, COALESCE(s.smtp_tls_pin, ''), s.imap_tls_unverified, COALESCE(s.imap_tls_pin, '')
+		FROM email_accounts_smtp_imap s
+		JOIN email_accounts ea ON ea.id = s.email_account_id
+		WHERE s.email_account_id = $1
 	`
 
 	var creds SMTPCredentials
-	var smtpHost, smtpUser, smtpPassword, imapHost, imapUser, imapPassword string
-
+	var orgID *uuid.UUID
 	err := r.transportQueryRow(ctx, query, emailAccountID).Scan(
-		&smtpHost, &creds.SMTPPort, &smtpUser, &smtpPassword, &creds.SMTPSecurity,
-		&imapHost, &creds.IMAPPort, &imapUser, &imapPassword, &creds.IMAPSecurity,
+		&orgID, &creds.SMTPHost, &creds.SMTPPort, &creds.SMTPUser, &creds.SMTPPassword, &creds.SMTPSecurity,
+		&creds.IMAPHost, &creds.IMAPPort, &creds.IMAPUser, &creds.IMAPPassword, &creds.IMAPSecurity,
+		&creds.SMTPTLSUnverified, &creds.SMTPTLSPin, &creds.IMAPTLSUnverified, &creds.IMAPTLSPin,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -2714,59 +2683,33 @@ func (r *emailRepository) GetSMTPCredentials(ctx context.Context, emailAccountID
 		return nil, errx.InternalError()
 	}
 
-	// Decrypt credentials
-	var xerr error
-	creds.SMTPHost, xerr = r.Encrypt.Decrypt(smtpHost)
-	if xerr != nil {
-		errs.CaptureException(xerr)
+	if err := r.openCredentials(ctx, orgID, &creds.SMTPHost, &creds.SMTPUser, &creds.SMTPPassword,
+		&creds.IMAPHost, &creds.IMAPUser, &creds.IMAPPassword); err != nil {
+		errs.CaptureException(err)
 		return nil, errx.InternalError()
 	}
-	creds.SMTPUser, xerr = r.Encrypt.Decrypt(smtpUser)
-	if xerr != nil {
-		errs.CaptureException(xerr)
-		return nil, errx.InternalError()
-	}
-	creds.SMTPPassword, xerr = r.Encrypt.Decrypt(smtpPassword)
-	if xerr != nil {
-		errs.CaptureException(xerr)
-		return nil, errx.InternalError()
-	}
-	creds.IMAPHost, xerr = r.Encrypt.Decrypt(imapHost)
-	if xerr != nil {
-		errs.CaptureException(xerr)
-		return nil, errx.InternalError()
-	}
-	creds.IMAPUser, xerr = r.Encrypt.Decrypt(imapUser)
-	if xerr != nil {
-		errs.CaptureException(xerr)
-		return nil, errx.InternalError()
-	}
-	creds.IMAPPassword, xerr = r.Encrypt.Decrypt(imapPassword)
-	if xerr != nil {
-		errs.CaptureException(xerr)
-		return nil, errx.InternalError()
-	}
-
 	return &creds, nil
 }
 
 // GetOAuthCredentials retrieves OAuth credentials for an email account
 func (r *emailRepository) GetOAuthCredentials(ctx context.Context, emailAccountID uuid.UUID) (*OAuthCredentials, *errx.Error) {
-	if r.Encrypt == nil {
-		errs.CaptureException(errNoCredentialEncrypter)
+	if r.Creds == nil {
+		errs.CaptureException(mailcred.ErrNoKey)
 		return nil, errx.InternalError()
 	}
 	query := `
-		SELECT access_token, refresh_token, expires_at
-		FROM email_accounts_oauth
-		WHERE email_account_id = $1
+		SELECT ea.organization_id, o.access_token, o.refresh_token, o.expires_at
+		FROM email_accounts_oauth o
+		JOIN email_accounts ea ON ea.id = o.email_account_id
+		WHERE o.email_account_id = $1
 	`
 
+	var orgID *uuid.UUID
 	var accessToken, refreshToken string
 	var expiresAt time.Time
 
 	err := r.transportQueryRow(ctx, query, emailAccountID).Scan(
-		&accessToken, &refreshToken, &expiresAt,
+		&orgID, &accessToken, &refreshToken, &expiresAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -2777,18 +2720,18 @@ func (r *emailRepository) GetOAuthCredentials(ctx context.Context, emailAccountI
 	}
 
 	// Decrypt tokens, tolerating rows written before OAuth tokens were sealed.
-	decryptedAccessToken, accessLegacy, xerr := r.openCredential(accessToken)
+	decryptedAccessToken, accessLegacy, xerr := r.openCredential(ctx, orgID, accessToken)
 	if xerr != nil {
 		errs.CaptureException(xerr)
 		return nil, errx.InternalError()
 	}
-	decryptedRefreshToken, refreshLegacy, xerr := r.openCredential(refreshToken)
+	decryptedRefreshToken, refreshLegacy, xerr := r.openCredential(ctx, orgID, refreshToken)
 	if xerr != nil {
 		errs.CaptureException(xerr)
 		return nil, errx.InternalError()
 	}
 	if (accessLegacy || refreshLegacy) && r.transportSnapshot == nil {
-		r.resealOAuthCredentials(ctx, emailAccountID, decryptedAccessToken, decryptedRefreshToken)
+		r.resealOAuthCredentials(ctx, orgID, emailAccountID, accessToken, refreshToken, decryptedAccessToken, decryptedRefreshToken)
 	}
 
 	return &OAuthCredentials{
@@ -2802,14 +2745,10 @@ func (r *emailRepository) GetOAuthCredentials(ctx context.Context, emailAccountI
 // is the migration path for tokens stored before sealing existed: there is no
 // SQL-only migration for them because the key lives in the application, so the
 // upgrade happens on first read instead. Best-effort by design, a failure here
-// must not break the read that triggered it; the next read retries.
-func (r *emailRepository) resealOAuthCredentials(ctx context.Context, emailAccountID uuid.UUID, accessToken, refreshToken string) {
-	encAccessToken, err := r.sealCredential(accessToken)
-	if err != nil {
-		errs.CaptureException(err)
-		return
-	}
-	encRefreshToken, err := r.sealCredential(refreshToken)
+// must not break the read that triggered it; the next read retries. The write
+// only lands while the row still holds what was read, so a concurrent refresh wins.
+func (r *emailRepository) resealOAuthCredentials(ctx context.Context, orgID *uuid.UUID, emailAccountID uuid.UUID, storedAccess, storedRefresh, accessToken, refreshToken string) {
+	sealed, err := r.sealCredentials(ctx, orgID, accessToken, refreshToken)
 	if err != nil {
 		errs.CaptureException(err)
 		return
@@ -2818,9 +2757,9 @@ func (r *emailRepository) resealOAuthCredentials(ctx context.Context, emailAccou
 	query := `
 		UPDATE email_accounts_oauth
 		SET access_token = $1, refresh_token = $2
-		WHERE email_account_id = $3
+		WHERE email_account_id = $3 AND access_token = $4 AND refresh_token = $5
 	`
-	if _, err := r.DB.Exec(ctx, query, encAccessToken, encRefreshToken, emailAccountID); err != nil {
+	if _, err := r.DB.Exec(ctx, query, sealed[0], sealed[1], emailAccountID, storedAccess, storedRefresh); err != nil {
 		db.CaptureError(err, query, nil, "reseal-oauth-credentials")
 	}
 }
@@ -2972,4 +2911,23 @@ func (r *emailRepository) ListOrganizationIDs(ctx context.Context) ([]uuid.UUID,
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+// WarmingOnWorkspaceClock lists the workspace's warming mailboxes that read their hours in the workspace timezone.
+func (r *emailRepository) WarmingOnWorkspaceClock(ctx context.Context, orgID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := resultDB(ctx, r.DB).Query(ctx, `SELECT id FROM email_accounts
+		WHERE organization_id = $1 AND COALESCE(timezone, '') = '' AND status = 'active' AND warmup IS NOT NULL AND warmup_paused_at IS NULL`, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }

@@ -58,6 +58,8 @@ A workspace archive is a single file holding everything one workspace owns. It e
 
 Diagnostic participation, shared/rolling limits, restrictive send evidence and audited repair-resolution history travel with their registered mailbox/task/organization data. Source-worker executor handles reset; exact provider-message DKIM authorization/nonces are excluded. Portable minimal receipt proof remains historical evidence, never an execution grant. The reconciliation webhook/notification outbox is source-instance-local and excluded to prevent replay on import; drain pending effects before moving. Whole-instance database backups retain it. See [send-safety retention and rollback](/development/send-safety/#upgrade-rollback-and-portability).
 
+Permanent unknown-warmup retirement markers travel with send history. Imported retired tasks remain cancelled with their outcome recorded as unknown; they never authorize a retry. Use a destination with the compatible retirement schema and recovery code.
+
 Campaign task replay intent resets to unverified on workspace import. The destination cannot replay an imported dead letter as a verified non-sending wakeup. A contact or sequence binding remains restrictive send intent even if that record is later removed. Whole-instance backups retain the durable intent; migration rollback refuses to discard retained send intent or unverified pending campaign dead letters.
 
 <Callout title="Moving a whole self-hosted instance is a different tool">
@@ -134,6 +136,8 @@ Warmbly does not keep it on either instance. If you lose it, the credentials ins
 
 Leave the option off and the credential fields travel empty. Everything else imports normally, and each mailbox arrives marked for reconnection: open it on the destination and sign in again, exactly like connecting it the first time.
 
+Either way, an SMTP/IMAP mailbox keeps its [server certificate](/guides/mailboxes/#servers-with-their-own-certificate) choice and the fingerprints it trusts, because they are not secret and describe the same server on any instance.
+
 Webhook signing secrets follow the same rule, including the one an [OAuth app](/api/oauth/#receiving-events-as-an-app-webhooks) signs its deliveries with. Without the option, rotate the app's webhook secret on the destination before relying on its deliveries.
 
 </Fold>
@@ -172,6 +176,10 @@ Anyone in the archive without an account on the destination has their rows reass
 
 Cloud connections and mailbox enrollments never travel, including workspace-scoped connections and retained legacy links. Connect the destination workspace separately to its own Cloud workspace. Cloud-served redirects arrive served locally with their source connection association cleared.
 
+For a Google Workspace mailbox adopted from Cloud, the domain grant and Cloud warmup history remain on Cloud. Local campaigns, imported messages and local history travel with their selected archive groups. The local mirror has no mailbox credential to export, including when adoption replaced an app-password connection. An archive carries neither Cloud access tokens nor authority to use its domain grant.
+
+When two app-password copies were explicitly associated, the local mailbox still owns its SMTP/IMAP credential. That credential travels if the archive includes credentials, while the Cloud mailbox, its warmup history and the selected Cloud ID on the source enrollment remain on their original instances. No Cloud association or access is transferred by importing the archive.
+
 Some things belong to an instance rather than to a workspace, so they are not applied even when the archive contains them:
 
 | Not imported | Why |
@@ -196,7 +204,7 @@ Some things belong to an instance rather than to a workspace, so they are not ap
 | Failure and delivery counters | A webhook endpoint's failure streak and auto-disable state, and whether a notification's email already went out, describe what happened on the source. They start fresh, so an endpoint is not pre-disabled on the new instance and a notification is not re-sent |
 | Sends still in flight | A campaign step handed to a worker on the source has no worker on the destination to report back, so it arrives queued and is sent there instead of waiting forever. Steps already sent keep their history |
 | An invalid workspace name | An archive's workspace name is applied only when it passes the same [naming rules](/api/error-codes/#name-refusals) as a rename. Otherwise the destination keeps its own |
-| Invalid form settings | Each form passes the same checks as an edit. A redirect address that is not an `http` or `https` URL is cleared, a design the editor would refuse resets to the default, and an embed domain that is not a domain is dropped. A published form that lost an embed domain arrives as a draft, so review its domains and publish it again |
+| Invalid form settings | Each form passes the same checks as an edit. A redirect address that is not an `http` or `https` URL is cleared, one that is not on the destination workspace's own domains is kept but not used until it is (visitors see the success message), a design the editor would refuse resets to the default, and an embed domain that is not a domain is dropped. A published form that lost an embed domain arrives as a draft, so review its domains and publish it again |
 | Webhook endpoints the destination refuses | An endpoint whose address the destination would not accept as a new one (not `https`, or not a public host) arrives disabled. Fix its address and enable it again |
 | Personal list layouts | Which columns each member shows on the contacts list and how they sort it, and how they arrange the unibox scope rail (Favorites, row order, hidden rows), belongs to the person, not the workspace. Everyone starts from the default view on the new instance and sets it up again |
 | Salesforce links and activity | Which Salesforce record each contact is, the activity waiting to be logged and its recent results, and how far the pull loop read. The destination links contacts again by address on its first sync, and activity already logged is in Salesforce. Saved list view and Campaign imports do travel, with the records each one already brought in |
@@ -245,6 +253,8 @@ A few things belong to the instance rather than the workspace and are left out o
 [Mailbox imports](/guides/mailbox-import/) do not travel either, finished or running: an import is work the source instance is doing, and its rows hold credentials in flight. The mailboxes an import connected are ordinary mailboxes and move with the Workspace group, and the saved column mappings come too, so the same file maps itself on the destination. Let a running import finish before exporting: rows it has not connected yet are not in the archive.
 
 [Contact imports](/guides/contacts-crm/#importing) do not travel, finished or running, for the same reason: an import is work the source instance is doing. The contacts it created are ordinary contacts and move with the Contacts group, and the saved column mappings come with them. Let a running import finish before exporting, or the rows it has not reached are not in the archive.
+
+The list of past exports and imports does not travel either. Each job is a record of work the instance that ran it did, and an export's archive lives in that instance's storage until it expires. The destination lists only the exports and imports run there.
 
 A [community directory](/guides/integrations/#community-apps) listing does not travel. The OAuth app itself moves with the archive, but its listing is a publication on the source instance, featured or hidden by its team. Publish it again on the destination, where it starts as link only and is featured or not by that instance's team. An app suspended on the source arrives suspended, and so does every app imported into a workspace whose members may not build apps on the destination; the destination's operators decide whether to lift it. An import never clears a suspension the destination already applied. Each app passes the same checks as registering it: a name that breaks the [naming rules](/api/error-codes/#name-refusals) becomes "Imported app", and a website, redirect URI or webhook address the destination would refuse is dropped. Its logo arrives empty, so upload it again.
 

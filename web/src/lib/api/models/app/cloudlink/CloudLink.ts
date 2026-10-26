@@ -60,6 +60,7 @@ export interface PoolLinkRedirectOffer {
 }
 
 export interface PoolLinkInstanceInfo {
+	 smtp_association_protocol?: number;
     instance: PoolLinkInstance;
     organization: PoolLinkOrgInfo;
     plan: PoolLinkPlan;
@@ -196,6 +197,7 @@ export interface CloudLinkPollResult {
 }
 
 export interface CloudLinkMailboxRow {
+	independent_smtp?: boolean;
     legacy?: boolean;
     id: string;
     email: string;
@@ -206,6 +208,10 @@ export interface CloudLinkMailboxRow {
     enrolled_at?: Date | null;
     managed: boolean;
     cloud?: PoolLinkMailboxState | null;
+    enrollment_state?: "active" | "pending_enroll" | "pending_remove";
+    standing_observed_at?: Date | null;
+    /** When this instance last copied Warmbly Cloud's warmup settings onto the mailbox. */
+    settings_observed_at?: Date | null;
 }
 
 /** A Google or Microsoft consent started through Warmbly Cloud. */
@@ -221,4 +227,5 @@ export interface PoolLinkWorkspaceMailbox {
     name: string;
     provider: string;
     status: string;
+    mail_host?: string;
 }

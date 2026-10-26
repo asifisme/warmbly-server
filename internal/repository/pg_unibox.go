@@ -49,7 +49,8 @@ type UniboxRepository interface {
 	GetByThread(ctx context.Context, orgID, emailID uuid.UUID, threadID string, limit int, cursor string) (*models.MailSearchResult, error)
 	// GetByThreadWithin is GetByThread held to the allowed mailboxes before paging; nil allows every mailbox.
 	GetByThreadWithin(ctx context.Context, orgID, emailID uuid.UUID, threadID string, limit int, cursor string, allowed []uuid.UUID) (*models.MailSearchResult, error)
-	GetBySender(ctx context.Context, userID uuid.UUID, sender string, limit int, cursor string) (*models.MailSearchResult, error)
+	// GetBySender is the organization's mail from sender, newest first, across every mailbox.
+	GetBySender(ctx context.Context, orgID uuid.UUID, sender string, limit int, cursor string) (*models.MailSearchResult, error)
 	Search(ctx context.Context, orgID uuid.UUID, params *models.MailSearchParams) (*models.MailSearchResult, error)
 	GetUnseenCount(ctx context.Context, orgID uuid.UUID, emailAccountID *uuid.UUID) (int64, error)
 	MarkSeen(ctx context.Context, userID, id uuid.UUID, seen bool) error
@@ -221,13 +222,15 @@ func automatedThreadSQL(threadExpr, rowAutomatedExpr, orgArg string) string {
 		) END)`, threadExpr, rowAutomatedExpr, orgArg)
 }
 
-// bareAddrSQL extracts the exact address out of a raw header entry: the
-// bracketed form every provider writes ("Name <a@b.com>"), the parenthesised
-// form older IMAP rows carry, else the trimmed value. Lowercased, and never a
-// substring contains, so a@b.com matches neither xa@b.com nor a@b.com.evil.
+// bareAddrSQL extracts the exact address out of a raw header entry: the last
+// bracketed address ("Name <a@b.com>", never one quoted inside the name), a
+// bare address before a comment ("a@b.com (note)"), the parenthesised form
+// older IMAP rows carry ("Name (a@b.com)"), else the trimmed value. Lowercased,
+// and never a substring contains, so a@b.com matches neither xa@b.com nor
+// a@b.com.evil.
 func bareAddrSQL(expr string) string {
 	return fmt.Sprintf(
-		`lower(coalesce(substring(%[1]s from '<([^>]*)>'), substring(%[1]s from '\(([^()]*)\)\s*$'), btrim(%[1]s)))`,
+		`lower(coalesce(substring(%[1]s from '<([^<>]*)>[^<>]*$'), substring(%[1]s from '^[[:space:]]*([^[:space:]()<>"]+@[^[:space:]()<>"]+)[[:space:]]*\('), substring(%[1]s from '\(([^()]*)\)\s*$'), btrim(%[1]s)))`,
 		expr,
 	)
 }
@@ -663,14 +666,17 @@ func (r *uniboxRepository) annotateAnsweredMailboxes(ctx context.Context, orgID 
 	return nil
 }
 
-func (r *uniboxRepository) GetBySender(ctx context.Context, userID uuid.UUID, sender string, limit int, cursor string) (*models.MailSearchResult, error) {
+func (r *uniboxRepository) GetBySender(ctx context.Context, orgID uuid.UUID, sender string, limit int, cursor string) (*models.MailSearchResult, error) {
 	query := fmt.Sprintf(`
 		SELECT %s
 		FROM unibox_emails
-		WHERE user_id = $1 AND $2 = ANY(from_addr)
-	`, strings.Join(mailFieldsPreview, ", "))
+		WHERE email_id = ANY(ARRAY(SELECT id FROM email_accounts WHERE organization_id = $1))
+		  AND ($2 = ANY(from_addr) OR EXISTS (
+			SELECT 1 FROM unnest(from_addr) a(addr) WHERE %s = lower(btrim($2))
+		))
+	`, strings.Join(mailFieldsPreview, ", "), bareAddrSQL("a.addr"))
 
-	args := []any{userID, sender}
+	args := []any{orgID, sender}
 	argPos := 3
 
 	if cursor != "" {
@@ -678,7 +684,8 @@ func (r *uniboxRepository) GetBySender(ctx context.Context, userID uuid.UUID, se
 		if err == nil {
 			query += fmt.Sprintf(`
 				AND (internal_date, id) < (
-					SELECT internal_date, id FROM unibox_emails WHERE id = $%d AND user_id = $1
+					SELECT internal_date, id FROM unibox_emails
+					WHERE id = $%d AND email_id = ANY(ARRAY(SELECT id FROM email_accounts WHERE organization_id = $1))
 				)`, argPos)
 			args = append(args, cursorID)
 			argPos++
@@ -699,12 +706,17 @@ func (r *uniboxRepository) GetBySender(ctx context.Context, userID uuid.UUID, se
 //
 // Filter altitude:
 //   - row-level filters (snooze scope, unseen, date window, subject,
-//     sender, mailbox) run inside the windowed subquery, so the
+//     sender, mailbox) run inside the matching subquery, so the
 //     representative + counts reflect the matched messages; with no
 //     content filter (the default inbox) that's the whole thread.
 //   - thread/representative-level filters (awaiting reply, category)
 //     and keyset pagination run on the collapsed row.
 func (r *uniboxRepository) Search(ctx context.Context, orgID uuid.UUID, params *models.MailSearchParams) (*models.MailSearchResult, error) {
+	query, args := uniboxSearchQuery(orgID, params)
+	return r.queryThreadList(ctx, query, args, params.PageSize)
+}
+
+func uniboxSearchQuery(orgID uuid.UUID, params *models.MailSearchParams) (string, []any) {
 	previewCols := make([]string, len(mailFieldsPreview))
 	for i, c := range mailFieldsPreview {
 		previewCols[i] = "ue." + c
@@ -715,18 +727,10 @@ func (r *uniboxRepository) Search(ctx context.Context, orgID uuid.UUID, params *
 	args := []any{orgID}
 	argPos := 2
 
-	// ── Inner windowed subquery: row-level filters + per-thread aggs ──
-	// Partition by the thread, but treat an empty thread_id (the column
-	// default for mail with no usable threading headers) as its own
-	// singleton keyed by row id — otherwise every unthreaded message
-	// would collapse into one bogus "conversation".
 	inner := fmt.Sprintf(`
-		SELECT %s, ue.automated,
-			ROW_NUMBER() OVER (PARTITION BY COALESCE(NULLIF(ue.thread_id, ''), ue.id::text) ORDER BY ue.internal_date DESC, ue.id DESC) AS rn,
-			COUNT(*)              OVER (PARTITION BY COALESCE(NULLIF(ue.thread_id, ''), ue.id::text)) AS message_count,
-			bool_or(NOT ue.seen)  OVER (PARTITION BY COALESCE(NULLIF(ue.thread_id, ''), ue.id::text)) AS has_unread
+		SELECT %s, ue.automated
 		FROM unibox_emails ue
-		WHERE ue.email_id IN (SELECT id FROM email_accounts WHERE organization_id = $1)`, strings.Join(previewCols, ", "))
+		WHERE ue.email_id = ANY(ARRAY(SELECT id FROM email_accounts WHERE organization_id = $1))`, strings.Join(previewCols, ", "))
 
 	// Folder scoping. nil = every working folder; IncludeArchived widens that
 	// to everything except junk, which is what "All mail" means.
@@ -802,28 +806,34 @@ func (r *uniboxRepository) Search(ctx context.Context, orgID uuid.UUID, params *
 		// The body expression is written exactly as idx_unibox_emails_body_search
 		// declares it, or the index is not used.
 		q := *params.Subject
-		webPos, addrPos := argPos, argPos+1
-		args = append(args, q, escapeLikePattern(q))
-		argPos += 2
+		webPos := argPos
+		args = append(args, q)
+		argPos++
 
-		match := fmt.Sprintf(`ue.search_tsv @@ websearch_to_tsquery('english', $%d)
-				OR to_tsvector('english'::regconfig, ue.body_text) @@ websearch_to_tsquery('english', $%d)`, webPos, webPos)
+		tsQuery := fmt.Sprintf(`websearch_to_tsquery('english', $%d)`, webPos)
 
 		if prefix := prefixTSQuery(q); prefix != "" {
-			match += fmt.Sprintf(`
-				OR ue.search_tsv @@ to_tsquery('english', $%d)
-				OR to_tsvector('english'::regconfig, ue.body_text) @@ to_tsquery('english', $%d)`, argPos, argPos)
+			tsQuery += fmt.Sprintf(` || to_tsquery('english', $%d)`, argPos)
 			args = append(args, prefix)
 			argPos++
 		}
+		match := fmt.Sprintf(`ue.search_tsv @@ (%s)
+			OR to_tsvector('english'::regconfig, ue.body_text) @@ (%s)`, tsQuery, tsQuery)
 
-		// Participants. The stored header is "Display Name (addr)", so one
-		// substring match covers searching by either.
-		match += fmt.Sprintf(`
-				OR EXISTS (SELECT 1 FROM unnest(ue.from_addr) AS s(addr) WHERE s.addr ILIKE '%%' || $%d || '%%' ESCAPE '\')
-				OR EXISTS (SELECT 1 FROM unnest(ue.to_addr)   AS s(addr) WHERE s.addr ILIKE '%%' || $%d || '%%' ESCAPE '\')
-				OR EXISTS (SELECT 1 FROM unnest(ue.cc)        AS s(addr) WHERE s.addr ILIKE '%%' || $%d || '%%' ESCAPE '\')`,
-			addrPos, addrPos, addrPos)
+		// Without a literal word trigram, GIN would recheck every message body.
+		if participantSearchable(q) {
+			people := fmt.Sprintf(`public.unibox_participants(ue.from_addr, ue.to_addr, ue.cc) ILIKE '%%' || $%d || '%%' ESCAPE '\'`, argPos)
+			// A multiline query must not match across two joined header entries.
+			if strings.ContainsRune(q, '\n') {
+				people += fmt.Sprintf(` AND EXISTS (
+					SELECT 1 FROM unnest(ue.from_addr || ue.to_addr || ue.cc) AS s(addr)
+					WHERE s.addr ILIKE '%%' || $%d || '%%' ESCAPE '\'
+				)`, argPos)
+			}
+			match += ` OR (` + people + `)`
+			args = append(args, escapeLikePattern(q))
+			argPos++
+		}
 
 		inner += ` AND (` + match + `)`
 	}
@@ -865,25 +875,18 @@ func (r *uniboxRepository) Search(ctx context.Context, orgID uuid.UUID, params *
 		argPos++
 	}
 
-	// ── Outer: pick the representative row + thread-level filters ─────
-	// b.<col> exposes the preview columns; labels are aggregated per
-	// thread so the row renders its chips without a second round trip.
 	outerCols := make([]string, len(mailFieldsPreview))
 	for i, c := range mailFieldsPreview {
 		outerCols[i] = "b." + c
 	}
-	query := fmt.Sprintf(`
-		SELECT %s, b.message_count, b.has_unread,
-			COALESCE(
-				(
-					SELECT json_agg(json_build_object('id', c.id, 'title', c.title, 'color', c.color) ORDER BY c.position ASC, c.title ASC)
-					FROM unibox_thread_labels utl
-					JOIN categories c ON c.id = utl.category_id AND c.organization_id = utl.organization_id
-					WHERE utl.organization_id = $1 AND utl.thread_id = b.thread_id
-				), '[]'::json
-			) AS labels
-		FROM (%s) b
-		WHERE b.rn = 1`, strings.Join(outerCols, ", "), inner)
+	// Probe only a candidate's thread, instead of windowing every matching body.
+	query := fmt.Sprintf(`WITH matched AS NOT MATERIALIZED (%s), page AS MATERIALIZED (
+		SELECT b.* FROM matched b
+		WHERE (b.thread_id = '' OR NOT EXISTS (
+			SELECT 1 FROM matched newer
+			WHERE newer.thread_id = b.thread_id
+			  AND (newer.internal_date, newer.id) > (b.internal_date, b.id)
+		))`, inner)
 
 	// Awaiting reply: the representative (latest) message is from one of
 	// the user's own mailboxes — i.e. they're waiting on the recipient.
@@ -950,7 +953,24 @@ func (r *uniboxRepository) Search(ctx context.Context, orgID uuid.UUID, params *
 	query += fmt.Sprintf(` ORDER BY b.internal_date DESC, b.id DESC LIMIT $%d`, argPos)
 	args = append(args, params.PageSize+1)
 
-	return r.queryThreadList(ctx, query, args, params.PageSize)
+	query += fmt.Sprintf(`
+		)
+		SELECT %s, stats.message_count, stats.has_unread,
+			COALESCE((
+				SELECT json_agg(json_build_object('id', c.id, 'title', c.title, 'color', c.color) ORDER BY c.position ASC, c.title ASC)
+				FROM unibox_thread_labels utl
+				JOIN categories c ON c.id = utl.category_id AND c.organization_id = utl.organization_id
+				WHERE utl.organization_id = $1 AND utl.thread_id = b.thread_id
+			), '[]'::json) AS labels
+		FROM page b
+		CROSS JOIN LATERAL (
+			SELECT COUNT(*) AS message_count, bool_or(NOT m.seen) AS has_unread
+			FROM matched m
+			WHERE (b.thread_id <> '' AND m.thread_id = b.thread_id)
+			   OR (b.thread_id = '' AND m.id = b.id)
+		) stats
+		ORDER BY b.internal_date DESC, b.id DESC`, strings.Join(outerCols, ", "))
+	return query, args
 }
 
 func (r *uniboxRepository) GetUnseenCount(ctx context.Context, orgID uuid.UUID, emailAccountID *uuid.UUID) (int64, error) {
@@ -1338,6 +1358,9 @@ func (r *uniboxRepository) queryPreviewList(ctx context.Context, query string, a
 		e.Labels = []models.MiniCategory{}
 		emails = append(emails, e)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
 	var hasMore bool
 	var nextCursor *string
@@ -1389,6 +1412,9 @@ func (r *uniboxRepository) queryThreadList(ctx context.Context, query string, ar
 			}
 		}
 		emails = append(emails, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	var hasMore bool
@@ -1491,6 +1517,9 @@ func (r *uniboxRepository) ListThreadLabels(ctx context.Context, orgID uuid.UUID
 		}
 		out = append(out, mc)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -1519,7 +1548,7 @@ func (r *uniboxRepository) AddThreadLabels(ctx context.Context, orgID uuid.UUID,
 // "label email" action only makes sense once the contact has replied, so a
 // contact that never responded resolves to "" and the action is a clean no-op.
 // Addresses are raw header forms ("Name <a@b.com>" or a bare address); the EXACT
-// address is extracted (the text inside angle brackets, else the trimmed value)
+// address is extracted (bareAddrSQL)
 // and compared case-insensitively — never a substring contains, so a@b.com does
 // not match xa@b.com or a@b.com.evil.
 func (r *uniboxRepository) LatestThreadIDForContact(ctx context.Context, orgID uuid.UUID, email string) (string, error) {
@@ -1527,18 +1556,18 @@ func (r *uniboxRepository) LatestThreadIDForContact(ctx context.Context, orgID u
 	if email == "" {
 		return "", nil
 	}
-	rows, err := r.db.Query(ctx, `
+	rows, err := r.db.Query(ctx, fmt.Sprintf(`
 		SELECT thread_id
 		FROM unibox_emails
 		WHERE email_id IN (SELECT id FROM email_accounts WHERE organization_id = $1)
 		  AND thread_id <> ''
 		  AND EXISTS (
 			SELECT 1 FROM unnest(from_addr) a
-			WHERE lower(coalesce(substring(a from '<([^>]*)>'), substring(a from '\(([^()]*)\)\s*$'), btrim(a))) = lower($2)
+			WHERE %s = lower($2)
 		  )
 		ORDER BY internal_date DESC
 		LIMIT 1
-	`, orgID, email)
+	`, bareAddrSQL("a")), orgID, email)
 	if err != nil {
 		return "", err
 	}
@@ -1646,6 +1675,9 @@ func (r *uniboxRepository) ListSnoozes(ctx context.Context, orgID, userID uuid.U
 			return nil, err
 		}
 		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -2085,6 +2117,21 @@ func hasWebSearchSyntax(input string) bool {
 	for _, term := range strings.Fields(input) {
 		if strings.HasPrefix(term, "-") || strings.EqualFold(term, "OR") {
 			return true
+		}
+	}
+	return false
+}
+
+func participantSearchable(input string) bool {
+	consecutive := 0
+	for _, r := range input {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			consecutive++
+			if consecutive >= 3 {
+				return true
+			}
+		} else {
+			consecutive = 0
 		}
 	}
 	return false

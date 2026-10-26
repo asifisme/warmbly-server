@@ -8,6 +8,8 @@ import (
 	"errors"
 	"io"
 	"os"
+
+	"github.com/warmbly/warmbly/internal/pkg/secretset"
 )
 
 // Encrypted holds the hex-encoded ciphertext and nonce.
@@ -17,29 +19,55 @@ type Encrypted struct {
 	Nonce      string `json:"n" db:"nonce"`       // hex
 }
 
+// ErrUnreadable is a value shaped like ciphertext that no configured key opens.
+var ErrUnreadable = errors.New("sealed value does not open under any configured credential key")
+
+// ErrDecrypt is the one error a decrypt returns, whatever was wrong with the input.
+var ErrDecrypt = errors.New("encrypt: value could not be decrypted")
+
 // Encrypter performs AES-GCM encryption with a fixed 32-byte key.
 type Encrypter struct {
-	aead cipher.AEAD
+	aead     cipher.AEAD
+	readKeys []cipher.AEAD
 }
 
 // FromEnv creates an Encrypter from the CREDENTIALS_ENCRYPTION_KEY env var
 // (64 hex chars = 32 bytes). Returns (nil, nil) when the var is unset so
 // callers can keep booting without credential sealing configured.
 func FromEnv() (*Encrypter, error) {
+	keys, err := secretset.Parse(os.Getenv("CREDENTIALS_ENCRYPTION_READ_KEYS"))
+	if err != nil {
+		return nil, err
+	}
 	key := os.Getenv("CREDENTIALS_ENCRYPTION_KEY")
 	if key == "" {
+		if len(keys) > 0 {
+			return nil, errors.New("credential read keys require a primary encryption key")
+		}
 		return nil, nil
 	}
-	return NewEncrypterFromHex(key)
+	primary, err := NewEncrypterFromHex(key)
+	if err != nil {
+		return nil, err
+	}
+	for _, value := range keys {
+		if value == key {
+			continue
+		}
+		reader, err := NewEncrypterFromHex(value)
+		if err != nil {
+			return nil, errors.New("invalid additional credential read key")
+		}
+		primary.readKeys = append(primary.readKeys, reader.aead)
+	}
+	return primary, nil
 }
 
 // NewEncrypterFromHex creates an Encrypter from a 64-character hex key.
 func NewEncrypterFromHex(hexKey string) (*Encrypter, error) {
+	// A decoding error quotes the offending byte, which is key material.
 	key, err := hex.DecodeString(hexKey)
-	if err != nil {
-		return nil, err
-	}
-	if len(key) != 32 {
+	if err != nil || len(key) != 32 {
 		return nil, errors.New("key must be 32 bytes (64 hex chars)")
 	}
 	return NewEncrypter(key)
@@ -74,11 +102,11 @@ func (e *Encrypter) Encrypt(plaintext string) (string, error) {
 func (e *Encrypter) Decrypt(hexStr string) (string, error) {
 	enc, err := ParseHex(hexStr)
 	if err != nil {
-		return "", err
+		return "", ErrDecrypt
 	}
 	plain, err := e.DecryptEncrypted(enc)
 	if err != nil {
-		return "", err
+		return "", ErrDecrypt
 	}
 	return string(plain), nil
 }
@@ -104,13 +132,62 @@ func (e *Encrypter) EncryptBytes(plain []byte) (*Encrypted, error) {
 func (e *Encrypter) DecryptEncrypted(enc *Encrypted) ([]byte, error) {
 	nonce, err := hex.DecodeString(enc.Nonce)
 	if err != nil {
-		return nil, err
+		return nil, ErrDecrypt
 	}
 	ct, err := hex.DecodeString(enc.Ciphertext)
 	if err != nil {
-		return nil, err
+		return nil, ErrDecrypt
 	}
-	return e.aead.Open(nil, nonce, ct, nil)
+	if len(nonce) != e.aead.NonceSize() {
+		return nil, ErrDecrypt
+	}
+	plaintext, err := e.aead.Open(nil, nonce, ct, nil)
+	if err == nil {
+		return plaintext, nil
+	}
+	for _, reader := range e.readKeys {
+		if plaintext, readErr := reader.Open(nil, nonce, ct, nil); readErr == nil {
+			return plaintext, nil
+		}
+	}
+	return nil, ErrDecrypt
+}
+
+// Reseal returns stored sealed under the primary key when only a read key opens it; changed is false when the primary already does.
+func (e *Encrypter) Reseal(stored string) (resealed string, changed bool, err error) {
+	enc, err := ParseHex(stored)
+	if err != nil {
+		return "", false, ErrUnreadable
+	}
+	nonce, nerr := hex.DecodeString(enc.Nonce)
+	ct, cerr := hex.DecodeString(enc.Ciphertext)
+	if nerr != nil || cerr != nil {
+		return "", false, ErrUnreadable
+	}
+	if _, err := e.aead.Open(nil, nonce, ct, nil); err == nil {
+		return "", false, nil
+	}
+	for _, reader := range e.readKeys {
+		plain, err := reader.Open(nil, nonce, ct, nil)
+		if err != nil {
+			continue
+		}
+		sealed, err := e.EncryptBytes(plain)
+		if err != nil {
+			return "", false, err
+		}
+		return sealed.Hex(), true, nil
+	}
+	return "", false, ErrUnreadable
+}
+
+// LooksSealed reports whether stored has the shape Encrypt produces: hex nonce, ciphertext and a full GCM tag.
+func LooksSealed(stored string) bool {
+	if len(stored)%2 != 0 || len(stored) < 2*(12+16) {
+		return false
+	}
+	_, err := hex.DecodeString(stored)
+	return err == nil
 }
 
 // ---------------------------------------------------------------------
@@ -129,11 +206,11 @@ func (e *Encrypted) Hex() string {
 func ParseHex(hexStr string) (*Encrypted, error) {
 	data, err := hex.DecodeString(hexStr)
 	if err != nil {
-		return nil, err
+		return nil, ErrDecrypt
 	}
 	nonceSize := 12 // GCM standard nonce
 	if len(data) < nonceSize {
-		return nil, errors.New("ciphertext too short")
+		return nil, ErrDecrypt
 	}
 	return &Encrypted{
 		Nonce:      hex.EncodeToString(data[:nonceSize]),

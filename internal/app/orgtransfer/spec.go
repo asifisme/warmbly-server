@@ -9,10 +9,11 @@ import (
 // two, and an archive that confuses them produces mailboxes that authenticate
 // against nothing:
 //
-//   - the instance credential key (CREDENTIALS_ENCRYPTION_KEY) seals mailbox
-//     credentials, because the worker reads them without an org context
-//   - the per-organization DEK seals everything else, because those values are
-//     org assets and the DEK is what the KMS actually wraps
+//   - the instance credential key (CREDENTIALS_ENCRYPTION_KEY) seals webhook
+//     secrets and the instance's own credentials
+//   - the per-organization DEK seals org assets, because the DEK is what the
+//     KMS actually wraps
+//   - mailbox credentials are sealed under either, per value (KeyDomainMailbox)
 //
 // Both are instance-local, so both have to be opened at export and re-sealed
 // against the destination's own keys at import.
@@ -25,6 +26,8 @@ const (
 	KeyDomainInstance
 	// KeyDomainOrgDEK is the per-organization data encryption key.
 	KeyDomainOrgDEK
+	// KeyDomainMailbox is a mailbox credential: org DEK when prefixed mailcred.OrgPrefix, else the instance key.
+	KeyDomainMailbox
 )
 
 // BlobKind says how to get an object key out of a column's value.
@@ -273,12 +276,12 @@ var Tables = []Table{
 		Scope:              `email_account_id IN ` + orgMailboxes,
 		InvalidateOnImport: mailboxCredentialInvalidations(),
 		Secrets: []SecretColumn{
-			{Column: "smtp_host", Domain: KeyDomainInstance},
-			{Column: "smtp_user", Domain: KeyDomainInstance},
-			{Column: "smtp_password", Domain: KeyDomainInstance},
-			{Column: "imap_host", Domain: KeyDomainInstance},
-			{Column: "imap_user", Domain: KeyDomainInstance},
-			{Column: "imap_password", Domain: KeyDomainInstance},
+			{Column: "smtp_host", Domain: KeyDomainMailbox},
+			{Column: "smtp_user", Domain: KeyDomainMailbox},
+			{Column: "smtp_password", Domain: KeyDomainMailbox},
+			{Column: "imap_host", Domain: KeyDomainMailbox},
+			{Column: "imap_user", Domain: KeyDomainMailbox},
+			{Column: "imap_password", Domain: KeyDomainMailbox},
 		},
 	},
 	{
@@ -286,8 +289,8 @@ var Tables = []Table{
 		Scope:              `email_account_id IN ` + orgMailboxes,
 		InvalidateOnImport: mailboxCredentialInvalidations(),
 		Secrets: []SecretColumn{
-			{Column: "access_token", Domain: KeyDomainInstance},
-			{Column: "refresh_token", Domain: KeyDomainInstance},
+			{Column: "access_token", Domain: KeyDomainMailbox},
+			{Column: "refresh_token", Domain: KeyDomainMailbox},
 		},
 	},
 	{
@@ -1109,6 +1112,8 @@ var ExcludedTables = map[string]string{
 	"slack_inbox_threads":              "Which Slack thread mirrors which inbox conversation. The Slack install and its channel do not travel; the conversations themselves do, with the unified inbox.",
 	"user_view_preferences":            "Each member's own column layout and sort for the dashboard's lists, and their unibox scope rail arrangement. It belongs to the person rather than the workspace: members are matched by account on import and a layout names custom fields the destination may not hold yet, so everyone starts from the default view and picks their columns again.",
 	"campaign_send_plan_snapshots":     "Today's precomputed send plan for a campaign, derived from the campaign, its leads, its mailboxes and this instance's limits, which all travel. Keyed to this instance's budget day, and naming mailboxes and workers. The destination's own background snapshotter recomputes it.",
+	"org_export_jobs":                  "The exports this instance ran for the workspace, each naming an archive in this instance's object storage that expires after 7 days. The archive is the export; the destination keeps its own list.",
+	"org_import_jobs":                  "The imports this instance ran into the workspace, with their progress and the uploaded archive's storage key here. An import is work the instance doing it records for itself.",
 }
 
 // TableByName indexes Tables for lookup during import.

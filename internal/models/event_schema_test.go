@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -78,7 +79,11 @@ func TestEventAvroReadsPreUpgradeEnvelopes(t *testing.T) {
 		}
 		want := sample(WorkerEventBodies[WorkerEventTypeAddEmail]).(*AddWorkerEmail)
 		want.TransportGeneration = [16]byte{}
+		want.SealedSecrets = ""
 		want.Sync.State.TransportGeneration = [16]byte{}
+		for _, svc := range []*Service{want.SmtpImap.Credentials.SMTP, want.SmtpImap.Credentials.IMAP} {
+			svc.TLSUnverified, svc.TLSPin = false, ""
+		}
 		assertBody(t, got.Body, want)
 	})
 	t.Run("job", func(t *testing.T) {
@@ -100,6 +105,12 @@ func TestEventAvroReadsPreUpgradeEnvelopes(t *testing.T) {
 }
 
 // Unframed fixtures need their writer schema, just as registry decoding does.
+// branchesAfterFixtures are union branches added after the fixtures were written.
+var branchesAfterFixtures = []any{"warmbly.events.JobEventWarmupRescued"}
+
+// fieldsAfterFixtures are record fields added after the fixtures were written.
+var fieldsAfterFixtures = []any{"transport_generation", "sealed_secrets", "tls_unverified", "tls_pin"}
+
 func preTransportSchema(t *testing.T, schema avro.Schema) avro.Schema {
 	t.Helper()
 	doc, err := SchemaDocument(schema)
@@ -118,7 +129,7 @@ func preTransportSchema(t *testing.T, schema avro.Schema) avro.Schema {
 				kept := fields[:0]
 				for _, f := range fields {
 					field := f.(map[string]any)
-					if field["name"] == "transport_generation" || x["name"] == "EmailErrorEvent" && field["name"] == "operation" {
+					if slices.Contains(fieldsAfterFixtures, field["name"]) || x["name"] == "EmailErrorEvent" && field["name"] == "operation" {
 						continue
 					}
 					strip(f)
@@ -127,9 +138,17 @@ func preTransportSchema(t *testing.T, schema avro.Schema) avro.Schema {
 				x["fields"] = kept
 			}
 			for k, value := range x {
-				if k != "fields" {
-					strip(value)
+				if k == "fields" {
+					continue
 				}
+				if branches, ok := value.([]any); ok {
+					value = slices.DeleteFunc(branches, func(b any) bool {
+						m, ok := b.(map[string]any)
+						return ok && slices.Contains(branchesAfterFixtures, m["name"])
+					})
+					x[k] = value
+				}
+				strip(value)
 			}
 		case []any:
 			for _, value := range x {

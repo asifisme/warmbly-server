@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 	"github.com/warmbly/warmbly/internal/app/instancesettings"
+	"github.com/warmbly/warmbly/internal/app/mailcred"
 	"github.com/warmbly/warmbly/internal/config"
 	"github.com/warmbly/warmbly/internal/errx"
 	"github.com/warmbly/warmbly/internal/models"
@@ -506,8 +507,8 @@ func (s *emailService) buildAddWorkerEmailSnapshot(ctx context.Context, acc *mod
 		out.ImapSync = true
 		out.SmtpImap = &models.AddWorkerEmailSmtpImapData{
 			Credentials: &models.SmtpImap{
-				SMTP: &models.Service{Host: creds.SMTPHost, Port: creds.SMTPPort, Username: creds.SMTPUser, Password: creds.SMTPPassword, Security: creds.SMTPSecurity},
-				IMAP: &models.Service{Host: creds.IMAPHost, Port: creds.IMAPPort, Username: creds.IMAPUser, Password: creds.IMAPPassword, Security: creds.IMAPSecurity},
+				SMTP: &models.Service{Host: creds.SMTPHost, Port: creds.SMTPPort, Username: creds.SMTPUser, Password: creds.SMTPPassword, Security: creds.SMTPSecurity, TLSUnverified: creds.SMTPTLSUnverified, TLSPin: creds.SMTPTLSPin},
+				IMAP: &models.Service{Host: creds.IMAPHost, Port: creds.IMAPPort, Username: creds.IMAPUser, Password: creds.IMAPPassword, Security: creds.IMAPSecurity, TLSUnverified: creds.IMAPTLSUnverified, TLSPin: creds.IMAPTLSPin},
 			},
 			Mailboxes: s.workerMailboxes(ctx, userID, acc, preload),
 		}
@@ -515,7 +516,22 @@ func (s *emailService) buildAddWorkerEmailSnapshot(ctx context.Context, acc *mod
 		return nil, nil
 	}
 
+	if err := s.sealForWorker(ctx, out); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// sealForWorker seals the payload's credentials under the organization key once every worker can open them.
+func (s *emailService) sealForWorker(ctx context.Context, out *models.AddWorkerEmail) error {
+	if !s.mailCreds.SealsForOrganizations() || out.OrganizationID == nil || *out.OrganizationID == uuid.Nil {
+		return nil
+	}
+	c, err := s.mailCreds.Cipher(ctx, *out.OrganizationID)
+	if err != nil {
+		return fmt.Errorf("organization key for worker payload: %w", err)
+	}
+	return mailcred.SealAddEmail(ctx, c, out)
 }
 
 func (s *emailService) workerHistoryID(ctx context.Context, userID uuid.UUID, acc *models.Email, preload *addWorkerEmailPreload) uint64 {
